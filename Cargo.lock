@@ -1729,6 +1729,7 @@ version = "0.0.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "object_store",
  "predicates",
  "rpassword",
  "sluice-core",
@@ -1738,6 +1739,7 @@ dependencies = [
  "sluice-store",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]

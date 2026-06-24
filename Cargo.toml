@@ -33,6 +33,7 @@ rpassword = "7"
 filetime = "0.2"
 globset = "0.4"
 futures = "0.3"
+url = "2"
 blake3 = "1"
 zstd = "0.13"                # bundled libzstd via the `cc` toolchain (no system lib)
 ciborium = "0.2"

@@ -21,6 +21,8 @@ sluice-store = { path = "../sluice-store" }
 clap = { workspace = true }
 tokio = { workspace = true }
 rpassword = { workspace = true }
+object_store = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
