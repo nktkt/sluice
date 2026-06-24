@@ -13,8 +13,8 @@ use sluice_core::{
     Tree, from_cbor, to_cbor,
 };
 use sluice_crypto::{
-    KdfParams, KeyError, KeySet, fill_random, hash, keyed_hash, open, random_key, seal,
-    unwrap_master, wrap_master,
+    KdfParams, KeyError, KeySet, compress, decompress, fill_random, hash, keyed_hash, open,
+    random_key, seal, unwrap_master, wrap_master,
 };
 use sluice_store::{BlobEntry, FileType, PackBuilder, PackReader, StorageBackend, StoreError};
 
@@ -180,7 +180,8 @@ impl<B: StorageBackend> Repository<B> {
             return Ok(id);
         }
 
-        let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), plaintext);
+        let frame = compress(plaintext);
+        let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), &frame);
         let mut builder = PackBuilder::new();
         builder.add(id, kind, &sealed);
         let (bytes, directory) = builder.finish()?;
@@ -205,7 +206,9 @@ impl<B: StorageBackend> Repository<B> {
         let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
         let reader = PackReader::parse(&bytes)?;
         let sealed = reader.blob(id).ok_or(RepoError::BlobNotFound(*id))?;
-        open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed).map_err(|_| RepoError::Blob)
+        let frame = open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed)
+            .map_err(|_| RepoError::Blob)?;
+        decompress(&frame).map_err(|_| RepoError::Blob)
     }
 
     /// Split `data` into content-defined chunks, store each as a `Data` blob,
@@ -592,5 +595,30 @@ mod tests {
         assert_eq!(repo.list_snapshots().await.unwrap(), vec![id]);
         // Re-committing the same snapshot is idempotent.
         assert_eq!(repo.commit_snapshot(&snap).await.unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn blobs_are_compressed_at_rest() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let data = vec![0u8; 100_000]; // highly compressible
+        let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
+
+        let mut stored = 0usize;
+        for pid in repo.backend().list(FileType::Pack).await.unwrap() {
+            stored += repo
+                .backend()
+                .get(FileType::Pack, &pid)
+                .await
+                .unwrap()
+                .len();
+        }
+        assert!(
+            stored < data.len() / 2,
+            "expected compression: stored {stored} bytes for {} of plaintext",
+            data.len()
+        );
+        assert_eq!(repo.load_blob(&id).await.unwrap(), data);
     }
 }
