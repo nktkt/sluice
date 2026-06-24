@@ -40,6 +40,9 @@ pub enum EngineError {
     /// A requested path was not found in the snapshot.
     #[error("path not found in snapshot: {0}")]
     NotInSnapshot(String),
+    /// The backup source is not an existing directory.
+    #[error("backup source is not a directory: {0}")]
+    NotADirectory(String),
 }
 
 /// Convenience alias for fallible engine operations.
@@ -68,6 +71,9 @@ pub async fn backup_excluding<B: StorageBackend>(
     exclude_globs: &[String],
     tags: &[String],
 ) -> Result<Id> {
+    if !source.is_dir() {
+        return Err(EngineError::NotADirectory(source.display().to_string()));
+    }
     let excludes = build_globset(exclude_globs)?;
     let parent = latest_snapshot(repo).await?;
     let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
@@ -1272,5 +1278,24 @@ mod tests {
                 "tree mismatch for seed {seed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn backup_of_non_directory_errors_clearly() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // A path that does not exist.
+        let missing = std::path::Path::new("/no/such/path/sluice-xyz");
+        assert!(matches!(
+            backup(&mut repo, missing).await,
+            Err(EngineError::NotADirectory(_))
+        ));
+        // A file is not a directory.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(matches!(
+            backup(&mut repo, file.path()).await,
+            Err(EngineError::NotADirectory(_))
+        ));
     }
 }
