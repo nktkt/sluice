@@ -291,6 +291,20 @@ pub async fn copy_snapshot<S: StorageBackend, D: StorageBackend>(
     result
 }
 
+/// Copy every snapshot from `src` into `dst` (see [`copy_snapshot`]), returning
+/// the new ids in `dst`. Re-running is safe: a snapshot already copied commits
+/// to the same id and is a no-op, and shared blobs are deduplicated in `dst`.
+pub async fn copy_all<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+) -> Result<Vec<Id>> {
+    let mut ids = Vec::new();
+    for snapshot in src.list_snapshots().await? {
+        ids.push(copy_snapshot(src, dst, &snapshot).await?);
+    }
+    Ok(ids)
+}
+
 /// The body of [`copy_snapshot`], run while holding `dst`'s shared lock.
 async fn copy_snapshot_inner<S: StorageBackend, D: StorageBackend>(
     src: &Repository<S>,
@@ -2269,6 +2283,31 @@ mod tests {
             std::fs::read(out.path().join("sub/b.bin")).unwrap(),
             vec![7u8; 3000]
         );
+    }
+
+    #[tokio::test]
+    async fn copy_all_replicates_every_snapshot() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("f");
+        let mut src = Repository::init(MemoryBackend::new(), b"src-pw", fast())
+            .await
+            .unwrap();
+        std::fs::write(&f, b"v1").unwrap();
+        backup(&mut src, src_dir.path()).await.unwrap();
+        std::fs::write(&f, b"v2").unwrap();
+        backup(&mut src, src_dir.path()).await.unwrap();
+
+        let mut dst = Repository::init(MemoryBackend::new(), b"dst-pw", fast())
+            .await
+            .unwrap();
+        let ids = copy_all(&src, &mut dst).await.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(dst.list_snapshots().await.unwrap().len(), 2);
+        assert!(verify(&dst).await.is_ok());
+
+        // Re-running copies nothing new (idempotent at the snapshot level).
+        copy_all(&src, &mut dst).await.unwrap();
+        assert_eq!(dst.list_snapshots().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

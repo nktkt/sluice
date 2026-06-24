@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, RetentionPolicy, backup_sources, check, copy_snapshot, diff, dump, find,
-    forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
-    restore_subpath, retag, verify,
+    DiffKind, EngineError, RetentionPolicy, backup_sources, check, copy_all, copy_snapshot, diff,
+    dump, find, forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
+    rebuild_index, restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -66,14 +66,14 @@ enum Command {
         #[arg(long)]
         path: Option<String>,
     },
-    /// Copy a snapshot to another repository, re-encrypting under its keys.
+    /// Copy snapshots to another repository, re-encrypting under its keys.
     Copy {
         /// Source repository path or object-store URL.
         src: String,
         /// Destination repository path or object-store URL.
         dst: String,
-        /// Snapshot id in the source (a unique hex prefix is accepted).
-        snapshot: String,
+        /// Snapshot id to copy (a unique hex prefix); omit to copy every snapshot.
+        snapshot: Option<String>,
     },
     /// List the snapshots in a repository.
     Snapshots {
@@ -373,9 +373,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone());
             let mut dest =
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
-            let id = resolve_snapshot(&source, &snapshot).await?;
-            let new_id = copy_snapshot(&source, &mut dest, &id).await?;
-            println!("{new_id}");
+            match snapshot {
+                Some(snapshot) => {
+                    let id = resolve_snapshot(&source, &snapshot).await?;
+                    let new_id = copy_snapshot(&source, &mut dest, &id).await?;
+                    println!("{new_id}");
+                }
+                None => {
+                    let ids = copy_all(&source, &mut dest).await?;
+                    println!("copied {} snapshot(s)", ids.len());
+                }
+            }
         }
         Command::Snapshots { repo, tag, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
