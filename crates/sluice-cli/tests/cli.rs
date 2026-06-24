@@ -220,3 +220,62 @@ fn snapshots_and_stats_emit_json() {
     assert_eq!(v["snapshots"], 1);
     assert!(v["packs"].as_u64().unwrap() >= 1);
 }
+
+#[test]
+fn ls_and_find_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("top.txt"), b"t").unwrap();
+    std::fs::write(src.join("sub/needle.log"), b"n").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // ls --json: the directory entry is "dir", and both files are listed.
+    let out = sluice()
+        .arg("ls")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    let entries = v.as_array().unwrap();
+    let paths: Vec<&str> = entries
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"top.txt"));
+    assert!(paths.contains(&"sub/needle.log"));
+    let subdir = entries.iter().find(|e| e["path"] == "sub").unwrap();
+    assert_eq!(subdir["kind"], "dir");
+
+    // find --json: one log file, kind "file", with a full-length snapshot id.
+    let out = sluice()
+        .arg("find")
+        .arg(&repo)
+        .arg("**/*.log")
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["path"], "sub/needle.log");
+    assert_eq!(arr[0]["kind"], "file");
+    assert_eq!(arr[0]["snapshot"].as_str().unwrap().len(), 64);
+}

@@ -143,6 +143,9 @@ enum Command {
         repo: String,
         /// Snapshot id (a unique hex prefix is accepted).
         snapshot: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Find entries matching a glob across all snapshots.
     Find {
@@ -150,6 +153,9 @@ enum Command {
         repo: String,
         /// Glob matched against full paths (use ** to cross directories).
         pattern: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Show the changes between two snapshots.
     Diff {
@@ -490,32 +496,67 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 report.deleted, report.repacked, report.reclaimed_bytes
             );
         }
-        Command::Ls { repo, snapshot } => {
+        Command::Ls {
+            repo,
+            snapshot,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
-            for entry in list_files(&repository, &id).await? {
-                let tag = match entry.kind {
-                    EntryKind::Dir => "d",
-                    EntryKind::Symlink => "l",
-                    _ => "-",
-                };
-                println!("{tag} {:>12} {}", entry.size, entry.path);
+            let entries = list_files(&repository, &id).await?;
+            if json {
+                let arr: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({ "path": e.path, "kind": kind_str(e.kind), "size": e.size })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for entry in &entries {
+                    let tag = match entry.kind {
+                        EntryKind::Dir => "d",
+                        EntryKind::Symlink => "l",
+                        _ => "-",
+                    };
+                    println!("{tag} {:>12} {}", entry.size, entry.path);
+                }
             }
         }
-        Command::Find { repo, pattern } => {
+        Command::Find {
+            repo,
+            pattern,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            for m in find(&repository, &pattern).await? {
-                let tag = match m.kind {
-                    EntryKind::Dir => "d",
-                    EntryKind::Symlink => "l",
-                    _ => "-",
-                };
-                println!(
-                    "{}  {tag} {:>12} {}",
-                    &m.snapshot.to_string()[..16],
-                    m.size,
-                    m.path
-                );
+            let matches = find(&repository, &pattern).await?;
+            if json {
+                let arr: Vec<serde_json::Value> = matches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "snapshot": m.snapshot.to_string(),
+                            "path": m.path,
+                            "kind": kind_str(m.kind),
+                            "size": m.size,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for m in &matches {
+                    let tag = match m.kind {
+                        EntryKind::Dir => "d",
+                        EntryKind::Symlink => "l",
+                        _ => "-",
+                    };
+                    println!(
+                        "{}  {tag} {:>12} {}",
+                        &m.snapshot.to_string()[..16],
+                        m.size,
+                        m.path
+                    );
+                }
             }
         }
         Command::Diff { repo, from, to } => {
@@ -733,6 +774,16 @@ fn read_new_passphrase() -> Result<String, Box<dyn Error>> {
 }
 
 /// Format epoch-nanoseconds as `YYYY-MM-DD HH:MM:SS UTC` (no dependencies).
+/// Stable lowercase name for an entry kind, used in JSON output.
+fn kind_str(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Dir => "dir",
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+        _ => "other",
+    }
+}
+
 fn format_utc(ns: i64) -> String {
     let secs = ns.div_euclid(1_000_000_000);
     let days = secs.div_euclid(86_400);
