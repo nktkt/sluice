@@ -8,9 +8,9 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use sluice_core::Id;
+use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
-use sluice_engine::{backup, forget, prune, restore, verify};
+use sluice_engine::{backup, forget, list_files, prune, restore, verify};
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
 
@@ -66,6 +66,13 @@ enum Command {
     Prune {
         /// Path of the repository.
         repo: PathBuf,
+    },
+    /// List the contents of a snapshot without restoring.
+    Ls {
+        /// Path of the repository.
+        repo: PathBuf,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
     },
 }
 
@@ -140,6 +147,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
             let removed = prune(&repository).await?;
             println!("pruned {removed} packs");
+        }
+        Command::Ls { repo, snapshot } => {
+            let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
+            let id = resolve_snapshot(&repository, &snapshot).await?;
+            for entry in list_files(&repository, &id).await? {
+                let tag = match entry.kind {
+                    EntryKind::Dir => "d",
+                    EntryKind::Symlink => "l",
+                    _ => "-",
+                };
+                println!("{tag} {:>12} {}", entry.size, entry.path);
+            }
         }
     }
     Ok(())

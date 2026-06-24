@@ -228,6 +228,57 @@ fn mark_tree<'a, B: StorageBackend>(
     })
 }
 
+/// An entry returned by [`list_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntry {
+    /// Path relative to the backup root.
+    pub path: String,
+    /// The kind of entry.
+    pub kind: EntryKind,
+    /// Logical size in bytes (0 for directories).
+    pub size: u64,
+}
+
+/// List a snapshot's entries (path, kind, size) without restoring any data.
+pub async fn list_files<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+) -> Result<Vec<ListEntry>> {
+    let snap = repo.load_snapshot(snapshot).await?;
+    let mut out = Vec::new();
+    list_tree(repo, snap.tree, String::new(), &mut out).await?;
+    Ok(out)
+}
+
+/// Recursively append the entries of tree `tree_id` (under `prefix`) to `out`.
+fn list_tree<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    prefix: String,
+    out: &'a mut Vec<ListEntry>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        for node in &tree.nodes {
+            let name = String::from_utf8_lossy(&node.name);
+            let path = if prefix.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            out.push(ListEntry {
+                path: path.clone(),
+                kind: node.kind,
+                size: node.size,
+            });
+            if let (EntryKind::Dir, Some(subtree)) = (node.kind, node.subtree) {
+                list_tree(repo, subtree, path, out).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Recursively back up `dir`, returning the id of its `Tree` object. `parent`
 /// is the id of the same directory's tree in the previous snapshot, if any, and
 /// `stats` accumulates new/changed/unmodified counters.
@@ -578,5 +629,27 @@ mod tests {
         assert_eq!(before - after, removed);
         // The surviving snapshot still verifies.
         assert!(verify(&repo).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_files_walks_the_snapshot() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"12345").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b"), b"xy").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let entries = list_files(&repo, &snap).await.unwrap();
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"));
+        assert!(paths.contains(&"sub"));
+        assert!(paths.contains(&"sub/b"));
+
+        let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
+        assert_eq!(a.kind, EntryKind::File);
+        assert_eq!(a.size, 5);
     }
 }
