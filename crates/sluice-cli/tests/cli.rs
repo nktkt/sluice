@@ -222,6 +222,60 @@ fn snapshots_and_stats_emit_json() {
 }
 
 #[test]
+fn forget_and_prune_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    std::fs::write(src.join("f"), vec![1u8; 4000]).unwrap();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    std::fs::write(src.join("f"), vec![2u8; 4000]).unwrap();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // Forget the older snapshot and prune, as JSON.
+    let out = sluice()
+        .arg("forget")
+        .arg(&repo)
+        .arg("--keep-last")
+        .arg("1")
+        .arg("--prune")
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["forgotten"].as_array().unwrap().len(), 1);
+    assert!(v["pruned"]["reclaimed_bytes"].as_u64().unwrap() > 0);
+
+    // Prune again as JSON: nothing left to reclaim.
+    let out = sluice()
+        .arg("prune")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    assert_eq!(v["dry_run"], false);
+    assert!(v["reclaimed_bytes"].is_number());
+}
+
+#[test]
 fn ls_and_find_emit_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

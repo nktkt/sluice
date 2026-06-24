@@ -128,6 +128,9 @@ enum Command {
         /// After forgetting, run prune to reclaim the freed storage.
         #[arg(long)]
         prune: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Reclaim storage no longer referenced by any snapshot.
     Prune {
@@ -136,6 +139,9 @@ enum Command {
         /// Show what would be reclaimed without deleting anything.
         #[arg(long)]
         dry_run: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List the contents of a snapshot without restoring.
     Ls {
@@ -430,6 +436,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             tag,
             dry_run,
             prune: do_prune,
+            json,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let policy = RetentionPolicy {
@@ -446,17 +453,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     if !dry_run {
                         forget(&repository, &id).await?;
                     }
-                    println!("{verb} {id}");
+                    if !json {
+                        println!("{verb} {id}");
+                    }
                     vec![id]
                 }
                 (None, Some(tag), true) => {
                     let forgotten = forget_tagged(&repository, &tag, dry_run).await?;
-                    println!("{verb} {} snapshot(s)", forgotten.len());
+                    if !json {
+                        println!("{verb} {} snapshot(s)", forgotten.len());
+                    }
                     forgotten
                 }
                 (None, None, false) => {
                     let forgotten = forget_with_policy(&repository, policy, dry_run).await?;
-                    println!("{verb} {} snapshot(s)", forgotten.len());
+                    if !json {
+                        println!("{verb} {} snapshot(s)", forgotten.len());
+                    }
                     forgotten
                 }
                 _ => {
@@ -467,34 +480,70 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     );
                 }
             };
-            if do_prune {
+            let pruned = if do_prune {
                 // Under --dry-run the snapshots are still present, so treat the
                 // would-be-forgotten ones as excluded to preview the reclamation.
                 let report = if dry_run {
-                    let excluded: HashSet<Id> = forgotten.into_iter().collect();
+                    let excluded: HashSet<Id> = forgotten.iter().copied().collect();
                     prune_excluding(&mut repository, true, &excluded).await?
                 } else {
                     prune(&mut repository, false).await?
                 };
-                let pverb = if dry_run {
-                    "would reclaim"
-                } else {
-                    "reclaimed"
-                };
-                println!(
-                    "{pverb} {} bytes ({} packs deleted, {} repacked)",
-                    report.reclaimed_bytes, report.deleted, report.repacked
-                );
+                if !json {
+                    let pverb = if dry_run {
+                        "would reclaim"
+                    } else {
+                        "reclaimed"
+                    };
+                    println!(
+                        "{pverb} {} bytes ({} packs deleted, {} repacked)",
+                        report.reclaimed_bytes, report.deleted, report.repacked
+                    );
+                }
+                Some(report)
+            } else {
+                None
+            };
+            if json {
+                let mut obj = serde_json::json!({
+                    "dry_run": dry_run,
+                    "count": forgotten.len(),
+                    "forgotten": forgotten.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                });
+                if let Some(report) = pruned {
+                    obj["pruned"] = serde_json::json!({
+                        "deleted": report.deleted,
+                        "repacked": report.repacked,
+                        "reclaimed_bytes": report.reclaimed_bytes,
+                    });
+                }
+                println!("{}", serde_json::to_string_pretty(&obj)?);
             }
         }
-        Command::Prune { repo, dry_run } => {
+        Command::Prune {
+            repo,
+            dry_run,
+            json,
+        } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let report = prune(&mut repository, dry_run).await?;
-            let verb = if dry_run { "would prune" } else { "pruned" };
-            println!(
-                "{verb} {} packs, {} repacked ({} bytes reclaimed)",
-                report.deleted, report.repacked, report.reclaimed_bytes
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "dry_run": dry_run,
+                        "deleted": report.deleted,
+                        "repacked": report.repacked,
+                        "reclaimed_bytes": report.reclaimed_bytes,
+                    }))?
+                );
+            } else {
+                let verb = if dry_run { "would prune" } else { "pruned" };
+                println!(
+                    "{verb} {} packs, {} repacked ({} bytes reclaimed)",
+                    report.deleted, report.repacked, report.reclaimed_bytes
+                );
+            }
         }
         Command::Ls {
             repo,
