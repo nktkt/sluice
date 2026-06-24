@@ -6,12 +6,13 @@
 deduplicated, compressed, **incremental** backups and restores — of files,
 directories, and symlinks, with mode and mtime preserved — to a local path **or
 any S3-compatible object store**. It offers point-in-time snapshots (of one or
-many source directories), full and partial restore, two tiers of integrity
+many source files and/or directories), full and partial restore, two tiers of
+integrity
 checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 158 tests across
+machine-readable JSON output, and stable exit codes. Backed by 164 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -54,23 +55,23 @@ work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 ### Inspect and restore
 
 ```sh
-sluice snapshots ./repo [--tag daily]          # <id> <time> <N files> <paths>
+sluice snapshots ./repo [--tag daily] [--last 5]   # chronological; --last keeps the newest N
 sluice ls        ./repo <snapshot> [path]      # list a snapshot's entries (or just a subpath)
 sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
 sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes between snapshots
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
 sluice tag       ./repo <snapshot> --add keep --remove daily   # edit a snapshot's tags
-sluice info      ./repo                         # repository metadata
+sluice info      ./repo                         # repository overview (counts, cipher, chunker)
 sluice stats     ./repo                         # logical vs stored bytes, dedup %
 sluice cat       ./repo snapshot <id>           # decrypted object as JSON (config|snapshot|tree)
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
-sluice restore   ./repo <snapshot> ./out --path sub/dir   # restore a subtree only
+sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
+sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 ```
 
-The listing and result commands (`snapshots`, `stats`, `ls`, `find`, `diff`,
-`prune`, `forget`) accept `--json` for machine-readable output, and commands
-return stable exit codes (10 repo not found, 11 wrong passphrase, 12 lock held,
-13 corruption) for scripting.
+Every listing and result command accepts `--json` for machine-readable output,
+and commands return stable exit codes (10 repo not found, 11 wrong passphrase,
+12 lock held, 13 corruption) for scripting.
 
 ### Integrity
 
@@ -248,7 +249,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 158 tests
+cargo test     # 164 tests
 ```
 
 ## Caveats
