@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 sluice-core = { path = "../sluice-core" }
+serde = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

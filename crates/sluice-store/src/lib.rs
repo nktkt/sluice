@@ -7,7 +7,8 @@
 //! create-only semantics.
 //!
 //! [`MemoryBackend`] is an in-memory implementation used by the fast,
-//! deterministic test lane.
+//! deterministic test lane; [`LocalBackend`] is the on-disk one. The
+//! [`PackBuilder`]/[`PackReader`] pair implements the pack-file container.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,7 +18,9 @@ use bytes::Bytes;
 use sluice_core::Id;
 
 mod local;
+mod pack;
 pub use local::LocalBackend;
+pub use pack::{BlobEntry, PackBuilder, PackReader};
 
 /// The category of object stored in a repository; determines its path prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,7 +39,7 @@ pub enum FileType {
     Lock,
 }
 
-/// Errors produced by a [`StorageBackend`].
+/// Errors produced by a [`StorageBackend`] or pack codec.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     /// The requested object does not exist.
@@ -58,6 +61,9 @@ pub enum StoreError {
     /// A backend-specific failure (I/O, network, etc.).
     #[error("backend error: {0}")]
     Backend(String),
+    /// A pack file's structure or trailing directory is invalid.
+    #[error("malformed pack: {0}")]
+    MalformedPack(String),
 }
 
 /// Convenience alias for fallible store operations.
