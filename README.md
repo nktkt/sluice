@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 174 tests across
+machine-readable JSON output, and stable exit codes. Backed by 175 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -47,8 +47,9 @@ sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
 stored chunks without being re-read. Changed files are **streamed** through the
-chunker with a bounded buffer, so a file larger than memory backs up without
-being loaded whole. `--exclude` (glob, by entry name) and `--tag`
+chunker with a bounded buffer, and restored the same way — chunks written as they
+arrive — so a file larger than memory backs up and restores without being loaded
+whole. `--exclude` (glob, by entry name) and `--tag`
 are repeatable, and `--exclude-from` reads exclude globs from a file (one per
 line; `#` comments and blank lines ignored). A source may be a directory or a
 single file, and several sources (files and/or directories) go into one snapshot
@@ -255,7 +256,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 174 tests
+cargo test     # 175 tests
 ```
 
 ## Caveats

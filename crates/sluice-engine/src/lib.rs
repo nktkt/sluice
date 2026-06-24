@@ -517,8 +517,7 @@ pub async fn restore_subpath<B: StorageBackend>(
                 apply_metadata(&dest, &node, &reporter);
             }
             EntryKind::File => {
-                let data = repo.load_file(&node.content).await?;
-                write_file_content(&dest, &data, node.sparse)?;
+                restore_file_streaming(repo, &dest, &node.content, node.sparse).await?;
                 apply_metadata(&dest, &node, &reporter);
             }
             EntryKind::Symlink => {
@@ -1525,8 +1524,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 .map(|node| {
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
-                        let data = repo.load_file(&node.content).await?;
-                        write_file_content(&path, &data, node.sparse)?;
+                        restore_file_streaming(repo, &path, &node.content, node.sparse).await?;
                         apply_metadata(&path, node, reporter);
                         Ok::<(), EngineError>(())
                     }
@@ -1561,8 +1559,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     std::fs::hard_link(&existing, &path).map_err(|e| io_err(&path, e))?;
                 }
                 None => {
-                    let data = repo.load_file(&node.content).await?;
-                    write_file_content(&path, &data, node.sparse)?;
+                    restore_file_streaming(repo, &path, &node.content, node.sparse).await?;
                     apply_metadata(&path, node, reporter);
                 }
             }
@@ -1578,30 +1575,51 @@ fn osstring_from_bytes(bytes: &[u8]) -> OsString {
     unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) }
 }
 
-/// Write a restored file's contents, recreating holes when `sparse` is set: each
-/// all-zero block is skipped rather than written, so the filesystem leaves it
-/// unallocated. The restored bytes are identical either way (holes read back as
-/// zeros); only the on-disk allocation differs.
-fn write_file_content(path: &Path, data: &[u8], sparse: bool) -> Result<()> {
-    if !sparse {
-        return std::fs::write(path, data).map_err(|e| io_err(path, e));
-    }
+/// Concurrent chunk reads while streaming a single file's content to disk.
+const RESTORE_FILE_CONCURRENCY: usize = 4;
+
+/// Stream a file's content from the repository straight to `path`, holding only a
+/// few chunks in memory regardless of the file's size — the restore counterpart
+/// to streaming backup. Chunks are read with bounded look-ahead concurrency
+/// (helpful on a high-latency object store) and written in order.
+///
+/// When `sparse`, each all-zero 4 KiB block is skipped so the filesystem leaves
+/// it unallocated; the written bytes are identical either way (holes read back as
+/// zeros). Blocks are aligned to each chunk rather than the absolute file grid,
+/// so a chunk straddling a hole edge may allocate one extra block — negligible,
+/// since a hole's interior chunks are wholly zero and skipped entirely.
+async fn restore_file_streaming<B: StorageBackend>(
+    repo: &Repository<B>,
+    path: &Path,
+    content: &[Id],
+    sparse: bool,
+) -> Result<()> {
+    use futures::stream::{StreamExt, TryStreamExt};
     use std::io::{Seek, SeekFrom, Write};
-    // A hole granularity at the common filesystem block size.
     const BLOCK: usize = 4096;
+
     let mut file = std::fs::File::create(path).map_err(|e| io_err(path, e))?;
     let mut offset: u64 = 0;
-    for block in data.chunks(BLOCK) {
-        if block.iter().any(|&b| b != 0) {
-            file.seek(SeekFrom::Start(offset))
-                .map_err(|e| io_err(path, e))?;
-            file.write_all(block).map_err(|e| io_err(path, e))?;
+    let mut chunks = futures::stream::iter(content.iter().map(|id| repo.load_blob(id)))
+        .buffered(RESTORE_FILE_CONCURRENCY);
+    while let Some(chunk) = chunks.try_next().await? {
+        if sparse {
+            for (i, block) in chunk.chunks(BLOCK).enumerate() {
+                if block.iter().any(|&b| b != 0) {
+                    file.seek(SeekFrom::Start(offset + (i * BLOCK) as u64))
+                        .map_err(|e| io_err(path, e))?;
+                    file.write_all(block).map_err(|e| io_err(path, e))?;
+                }
+            }
+        } else {
+            file.write_all(&chunk).map_err(|e| io_err(path, e))?;
         }
-        offset += block.len() as u64;
+        offset += chunk.len() as u64;
     }
-    // Extend to the full length so a trailing hole is reflected in the size.
-    file.set_len(data.len() as u64)
-        .map_err(|e| io_err(path, e))?;
+    if sparse {
+        // Reflect the exact length (and any trailing hole) in the file size.
+        file.set_len(offset).map_err(|e| io_err(path, e))?;
+    }
     Ok(())
 }
 
@@ -2025,6 +2043,29 @@ mod tests {
                 vec![i; 100 + i as usize]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn backup_restore_streams_a_large_multichunk_file() {
+        // Larger than the 4 MiB max chunk and incompressible, so it spans several
+        // content-defined chunks and exercises the streaming restore writer across
+        // chunk boundaries.
+        let mut data = vec![0u8; 5 * 1024 * 1024 + 777];
+        let mut state = 0x9E37_79B9u32;
+        for b in data.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+        }
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("big"), &data).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("big")).unwrap(), data);
     }
 
     #[tokio::test]
