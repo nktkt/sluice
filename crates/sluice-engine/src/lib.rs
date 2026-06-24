@@ -262,6 +262,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     link_target: None,
                     dev: 0,
                     ino: 0,
+                    xattrs: read_xattrs(&source),
                 });
             }
         }
@@ -495,6 +496,7 @@ pub async fn restore_subpath<B: StorageBackend>(
             if let Some(link_target) = &node.link_target {
                 symlink(&osstring_from_bytes(link_target), &dest)?;
                 set_owner(&dest, node.uid, node.gid, false);
+                write_xattrs(&dest, &node.xattrs);
             }
         }
         EntryKind::Fifo => {
@@ -1278,6 +1280,7 @@ async fn backup_file<B: StorageBackend>(
         link_target: None,
         dev,
         ino,
+        xattrs: read_xattrs(path),
     })
 }
 
@@ -1346,6 +1349,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     link_target: None,
                     dev: 0,
                     ino: 0,
+                    xattrs: read_xattrs(&path),
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
@@ -1366,6 +1370,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     link_target: Some(target.into_os_string().into_encoded_bytes()),
                     dev: 0,
                     ino: 0,
+                    xattrs: read_xattrs(&path),
                 }
             } else if let Some(special) = special_kind(&kind) {
                 // FIFO / socket / device: record the node (no content) so the
@@ -1385,6 +1390,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     link_target: None,
                     dev: 0,
                     ino: 0,
+                    xattrs: read_xattrs(&path),
                 }
             } else {
                 continue; // unknown entry type
@@ -1432,6 +1438,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     if let Some(target) = &node.link_target {
                         symlink(&osstring_from_bytes(target), &path)?;
                         set_owner(&path, node.uid, node.gid, false);
+                        write_xattrs(&path, &node.xattrs);
                     }
                 }
                 EntryKind::Fifo => {
@@ -1573,6 +1580,7 @@ fn apply_metadata(path: &Path, node: &Node) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode));
     }
+    write_xattrs(path, &node.xattrs);
     let mtime = filetime::FileTime::from_unix_time(
         node.mtime_ns.div_euclid(1_000_000_000),
         node.mtime_ns.rem_euclid(1_000_000_000) as u32,
@@ -1594,6 +1602,7 @@ fn apply_special_metadata(path: &Path, node: &Node) {
     // chown before chmod: chown can clear setuid/setgid bits.
     set_owner(path, node.uid, node.gid, true);
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode & 0o7777));
+    write_xattrs(path, &node.xattrs);
     let times = Timestamps {
         last_access: Timespec {
             tv_sec: 0,
@@ -1698,6 +1707,68 @@ fn set_owner(path: &Path, uid: u32, gid: u32, follow: bool) {
 
 #[cfg(not(unix))]
 fn set_owner(_path: &Path, _uid: u32, _gid: u32, _follow: bool) {}
+
+/// Read all extended attributes of `path` without following symlinks, as a
+/// list of `(name, value)` byte pairs sorted by name. Best-effort: returns
+/// empty on any error (including filesystems without xattr support) so a backup
+/// is never blocked by xattrs.
+#[cfg(unix)]
+fn read_xattrs(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use rustix::fs::{lgetxattr, llistxattr};
+    // List names (NUL-separated): query the size with an empty buffer, then fetch.
+    let list_len = match llistxattr(path, &mut Vec::<u8>::new()) {
+        Ok(n) if n > 0 => n,
+        _ => return Vec::new(),
+    };
+    let mut names = vec![0u8; list_len];
+    let n = match llistxattr(path, &mut names) {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    names.truncate(n);
+
+    let mut out = Vec::new();
+    for name in names.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        let Ok(cname) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let value_len = match lgetxattr(path, cname.as_c_str(), &mut Vec::<u8>::new()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let mut value = vec![0u8; value_len];
+        match lgetxattr(path, cname.as_c_str(), &mut value) {
+            Ok(n) => {
+                value.truncate(n);
+                out.push((name.to_vec(), value));
+            }
+            Err(_) => continue,
+        }
+    }
+    out.sort();
+    out
+}
+
+#[cfg(not(unix))]
+fn read_xattrs(_path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    Vec::new()
+}
+
+/// Replay extended attributes onto a restored `path` without following symlinks.
+/// Best-effort: `security.*`/`trusted.*` may need privilege, so failures are
+/// ignored, matching restic/borg.
+#[cfg(unix)]
+fn write_xattrs(path: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) {
+    use rustix::fs::{XattrFlags, lsetxattr};
+    for (name, value) in xattrs {
+        if let Ok(cname) = std::ffi::CString::new(name.clone()) {
+            let _ = lsetxattr(path, cname.as_c_str(), value, XattrFlags::empty());
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn write_xattrs(_path: &Path, _xattrs: &[(Vec<u8>, Vec<u8>)]) {}
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -1938,6 +2009,7 @@ mod tests {
             link_target: None,
             dev: 0,
             ino: 0,
+            xattrs: Vec::new(),
         };
         let tree = repo
             .save_tree(&Tree {
@@ -2476,6 +2548,47 @@ mod tests {
         assert_eq!(
             std::fs::read(out.path().join("b")).unwrap(),
             b"shared content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_xattrs() {
+        use rustix::fs::{XattrFlags, lsetxattr};
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        std::fs::write(&f, b"data").unwrap();
+        // Skip if the filesystem rejects user xattrs (e.g. older tmpfs).
+        if lsetxattr(f.as_path(), c"user.sluice", b"hello", XattrFlags::empty()).is_err() {
+            return;
+        }
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        // The attribute is captured in the stored tree node.
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        let tree = repo.load_tree(&snap_obj.tree).await.unwrap();
+        let node = tree.nodes.iter().find(|n| n.name == b"f").unwrap();
+        assert!(
+            node.xattrs
+                .iter()
+                .any(|(k, v)| k == b"user.sluice" && v == b"hello"),
+            "xattr should be captured, got {:?}",
+            node.xattrs
+        );
+
+        // ...and replayed on restore.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let restored = read_xattrs(&out.path().join("f"));
+        assert!(
+            restored
+                .iter()
+                .any(|(k, v)| k == b"user.sluice" && v == b"hello"),
+            "xattr should be restored, got {restored:?}"
         );
     }
 
@@ -3286,6 +3399,7 @@ mod tests {
             link_target: None,
             dev: 0,
             ino: 0,
+            xattrs: Vec::new(),
         };
         let tree = repo
             .save_tree(&Tree {

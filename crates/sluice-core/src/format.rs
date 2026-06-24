@@ -62,6 +62,10 @@ pub struct Node {
     /// (`nlink > 1`); `0` otherwise. See [`dev`](Self::dev).
     #[serde(default)]
     pub ino: u64,
+    /// Extended attributes as raw `(name, value)` byte pairs, sorted by name.
+    /// Captured without following symlinks; empty for entries with none.
+    #[serde(default)]
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// A point-in-time snapshot: the single commit object of a backup run
@@ -135,6 +139,7 @@ mod tests {
                     link_target: None,
                     dev: 0,
                     ino: 0,
+                    xattrs: vec![(b"user.tag".to_vec(), b"v".to_vec())],
                 },
                 Node {
                     name: b"subdir".to_vec(),
@@ -150,6 +155,7 @@ mod tests {
                     link_target: None,
                     dev: 0,
                     ino: 0,
+                    xattrs: Vec::new(),
                 },
             ],
         }
@@ -234,6 +240,7 @@ mod tests {
                     link_target: None,
                     dev,
                     ino,
+                    xattrs: Vec::new(),
                 },
             )
     }
