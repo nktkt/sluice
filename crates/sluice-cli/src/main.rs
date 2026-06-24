@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, backup_excluding, diff, dump, forget, forget_keep_last, list_files, prune, restore,
-    verify,
+    DiffKind, backup_excluding, diff, dump, forget, forget_keep_last, forget_tagged, list_files,
+    prune, restore, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -60,6 +60,9 @@ enum Command {
     Snapshots {
         /// Repository path or object-store URL.
         repo: String,
+        /// Only show snapshots with this tag.
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Verify the integrity of all snapshots.
     Verify {
@@ -75,6 +78,9 @@ enum Command {
         /// Instead, keep the N most recent snapshots and forget the rest.
         #[arg(long, value_name = "N")]
         keep_last: Option<usize>,
+        /// Instead, forget every snapshot with this tag.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
     },
     /// Reclaim storage no longer referenced by any snapshot.
     Prune {
@@ -146,10 +152,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             restore(&repository, &id, &target).await?;
             println!("restored {id} into {}", target.display());
         }
-        Command::Snapshots { repo } => {
+        Command::Snapshots { repo, tag } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             for id in repository.list_snapshots().await? {
                 let snap = repository.load_snapshot(&id).await?;
+                if let Some(tag) = &tag {
+                    if !snap.tags.iter().any(|t| t == tag) {
+                        continue;
+                    }
+                }
                 let files = snap.summary.files_new
                     + snap.summary.files_changed
                     + snap.summary.files_unmodified;
@@ -184,19 +195,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             repo,
             snapshot,
             keep_last,
+            tag,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            match (snapshot, keep_last) {
-                (Some(snapshot), None) => {
+            match (snapshot, keep_last, tag) {
+                (Some(snapshot), None, None) => {
                     let id = resolve_snapshot(&repository, &snapshot).await?;
                     forget(&repository, &id).await?;
                     println!("forgot {id}");
                 }
-                (None, Some(keep)) => {
+                (None, Some(keep), None) => {
                     let forgotten = forget_keep_last(&repository, keep).await?;
                     println!("forgot {} snapshot(s)", forgotten.len());
                 }
-                _ => return Err("specify either a snapshot id or --keep-last N".into()),
+                (None, None, Some(tag)) => {
+                    let forgotten = forget_tagged(&repository, &tag).await?;
+                    println!("forgot {} snapshot(s)", forgotten.len());
+                }
+                _ => {
+                    return Err(
+                        "specify exactly one of <snapshot>, --keep-last N, or --tag T".into(),
+                    );
+                }
             }
         }
         Command::Prune { repo } => {

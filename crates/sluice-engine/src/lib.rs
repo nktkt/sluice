@@ -222,6 +222,19 @@ pub async fn forget_keep_last<B: StorageBackend>(
     Ok(forgotten)
 }
 
+/// Forget every snapshot tagged `tag`, returning the ids forgotten. Reclaim
+/// their data afterwards with [`prune`].
+pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -> Result<Vec<Id>> {
+    let mut forgotten = Vec::new();
+    for id in repo.list_snapshots().await? {
+        if repo.load_snapshot(&id).await?.tags.iter().any(|t| t == tag) {
+            forget(repo, &id).await?;
+            forgotten.push(id);
+        }
+    }
+    Ok(forgotten)
+}
+
 /// Delete packs no longer referenced by any surviving snapshot, returning the
 /// number removed (mark-and-sweep GC; see `DESIGN.md` §8).
 pub async fn prune<B: StorageBackend>(repo: &Repository<B>) -> Result<usize> {
@@ -1056,5 +1069,25 @@ mod tests {
             repo.load_snapshot(&snap).await.unwrap().tags,
             vec!["weekly".to_string(), "important".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn forget_tagged_removes_matching_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        for (content, tag) in [(b"a".as_slice(), "keep"), (b"b", "temp"), (b"c", "temp")] {
+            std::fs::write(&f, content).unwrap();
+            backup_excluding(&mut repo, src.path(), &[], &[tag.to_string()])
+                .await
+                .unwrap();
+        }
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+
+        let forgotten = forget_tagged(&repo, "temp").await.unwrap();
+        assert_eq!(forgotten.len(), 2);
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
     }
 }
