@@ -402,6 +402,83 @@ pub async fn backup_dry_run<B: StorageBackend>(
     .summary)
 }
 
+/// Back up the bytes read from `reader` as a single-file snapshot named `name`
+/// — for piping a stream (a database dump, a `tar`, a `dd` image). The stream is
+/// chunked and deduplicated like any file (so repeated content still dedups);
+/// metadata is synthesized (mode `0644`, the current time). Holds the shared lock
+/// like a normal backup.
+pub async fn backup_stdin<B: StorageBackend, R: std::io::Read>(
+    repo: &mut Repository<B>,
+    reader: R,
+    name: &[u8],
+    tags: &[String],
+) -> Result<BackupOutcome> {
+    let lock = repo.acquire_lock(false).await?;
+    let result = backup_stdin_inner(repo, reader, name, tags).await;
+    let _ = repo.release_lock(&lock).await;
+    result
+}
+
+async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
+    repo: &mut Repository<B>,
+    reader: R,
+    name: &[u8],
+    tags: &[String],
+) -> Result<BackupOutcome> {
+    let parent = latest_snapshot(repo).await?;
+    let (content, size) = repo.save_file_reader(reader).await?;
+    let now = now_ns();
+    let (uid, gid) = process_owner();
+    let node = Node {
+        name: name.to_vec(),
+        kind: EntryKind::File,
+        mode: 0o100644,
+        uid,
+        gid,
+        mtime_ns: now,
+        ctime_ns: 0,
+        size,
+        content,
+        subtree: None,
+        link_target: None,
+        dev: 0,
+        ino: 0,
+        xattrs: Vec::new(),
+        rdev: 0,
+        sparse: false,
+    };
+    let tree = Tree {
+        version: TREE_VERSION,
+        nodes: vec![node],
+    };
+    let root_tree = repo.save_tree(&tree).await?;
+    repo.flush().await?;
+    let summary = SnapshotStats {
+        files_new: 1,
+        bytes_processed: size,
+        ..Default::default()
+    };
+    let snapshot = Snapshot {
+        version: SNAPSHOT_VERSION,
+        time_ns: now,
+        tree: root_tree,
+        paths: vec![name.to_vec()],
+        hostname: env_or("HOSTNAME", "localhost"),
+        username: env_or("USER", "unknown"),
+        uid,
+        gid,
+        tags: tags.to_vec(),
+        parent: parent.map(|(id, _)| id),
+        program_version: env!("CARGO_PKG_VERSION").to_string(),
+        summary,
+    };
+    let id = repo.commit_snapshot(&snapshot).await?;
+    Ok(BackupOutcome {
+        snapshot: Some(id),
+        summary,
+    })
+}
+
 /// Copy `snapshot` from `src` into `dst`, re-encrypting every blob under `dst`'s
 /// keys and rebuilding the trees, then committing the snapshot in `dst` (which
 /// takes a shared lock for the write). The two repositories may use different
@@ -2866,6 +2943,44 @@ mod tests {
             !names.iter().any(|p| p == "mnt"),
             "the mount-point directory is not descended into"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_stdin_stores_a_stream_as_one_file() {
+        // Multi-chunk, incompressible, to exercise the streaming path.
+        let mut data = vec![0u8; 5 * 1024 * 1024 + 321];
+        let mut state = 0x1234_5678u32;
+        for b in data.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+        }
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let outcome = backup_stdin(
+            &mut repo,
+            std::io::Cursor::new(&data),
+            b"dump.tar",
+            &["nightly".into()],
+        )
+        .await
+        .unwrap();
+        let snap = outcome.snapshot.unwrap();
+        assert_eq!(outcome.summary.files_new, 1);
+        assert_eq!(outcome.summary.bytes_processed, data.len() as u64);
+
+        // The snapshot is a single file under the given name.
+        let entries = list_files(&repo, &snap).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "dump.tar");
+        assert_eq!(entries[0].kind, EntryKind::File);
+
+        // Tag is recorded, and the content round-trips on restore.
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        assert_eq!(snap_obj.tags, vec!["nightly".to_string()]);
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("dump.tar")).unwrap(), data);
     }
 
     #[tokio::test]

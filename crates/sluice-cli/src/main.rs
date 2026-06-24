@@ -15,8 +15,8 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy,
-    backup_sources_with_progress, check, copy_all, copy_snapshot, diff, dump, find, forget,
-    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    backup_sources_with_progress, backup_stdin, check, copy_all, copy_snapshot, diff, dump, find,
+    forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
     restore_with, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
@@ -46,8 +46,15 @@ enum Command {
         repo: String,
         /// Directories to back up (one or more; multiple sources land under a
         /// synthetic root named by each source's final path component).
-        #[arg(required = true, num_args = 1..)]
+        #[arg(required_unless_present = "stdin", num_args = 1..)]
         sources: Vec<PathBuf>,
+        /// Back up the bytes read from standard input as a single file instead of
+        /// walking source paths (for piping a stream).
+        #[arg(long, conflicts_with = "sources")]
+        stdin: bool,
+        /// The filename recorded for --stdin input.
+        #[arg(long = "stdin-filename", value_name = "NAME", default_value = "stdin")]
+        stdin_filename: String,
         /// Glob of entry names to exclude (repeatable), e.g. --exclude '*.log'.
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
@@ -408,6 +415,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         Command::Backup {
             repo,
             sources,
+            stdin,
+            stdin_filename,
             mut excludes,
             exclude_from,
             tags,
@@ -438,17 +447,22 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             };
             let progress: Option<sluice_engine::ProgressFn> =
                 if verbose { Some(&report) } else { None };
-            let outcome = backup_sources_with_progress(
-                &mut repository,
-                &sources,
-                &excludes,
-                &tags,
-                dry_run,
-                max_size,
-                one_file_system,
-                progress,
-            )
-            .await?;
+            let outcome = if stdin {
+                let reader = std::io::stdin().lock();
+                backup_stdin(&mut repository, reader, stdin_filename.as_bytes(), &tags).await?
+            } else {
+                backup_sources_with_progress(
+                    &mut repository,
+                    &sources,
+                    &excludes,
+                    &tags,
+                    dry_run,
+                    max_size,
+                    one_file_system,
+                    progress,
+                )
+                .await?
+            };
             let s = outcome.summary;
             if json {
                 println!(
