@@ -11,7 +11,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, machine-readable JSON output, and
-stable exit codes. Backed by 149 tests across the workspace. The full
+stable exit codes. Backed by 153 tests across the workspace. The full
 architecture is in [`DESIGN.md`](./DESIGN.md). **The on-disk format is not yet
 frozen; do not use it for data you cannot afford to lose.**
 
@@ -36,15 +36,18 @@ export SLUICE_PASSWORD='correct horse battery staple'
 ```sh
 sluice init   ./repo
 sluice backup ./repo ~/documents --exclude '*.log' --exclude node_modules --tag daily
+sluice backup ./repo ~/documents --exclude-from .sluiceignore   # exclude globs from a file
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
 stored chunks without being re-read. `--exclude` (glob, by entry name) and `--tag`
-are repeatable. Multiple source directories go into a single snapshot under a
-synthetic root named by each source's final path component. The Argon2id work
-factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
+are repeatable, and `--exclude-from` reads exclude globs from a file (one per
+line; `#` comments and blank lines ignored). Multiple source directories go into
+a single snapshot under a synthetic root named by each source's final path
+component. The Argon2id work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and
+`SLUICE_KDF_PASSES`.
 
 ### Inspect and restore
 
@@ -85,13 +88,16 @@ which authenticates all stored data. Both exit non-zero on any integrity failure
 sluice forget ./repo --keep-last 7 --keep-daily 14 --keep-weekly 8 \
                      --keep-monthly 12 --keep-yearly 5
 sluice forget ./repo --keep-last 7 --keep-tag important   # protect tagged snapshots
+sluice forget ./repo --keep-daily 30 --keep-within 7d      # also keep everything from the last week
+sluice forget ./repo --keep-last 7 --group-by host         # apply the rules per host
 sluice forget ./repo --tag daily          # or forget by tag
 sluice forget ./repo <snapshot>           # or a single snapshot
 sluice forget ./repo --keep-last 7 --dry-run   # preview without removing
 sluice forget ./repo --keep-last 7 --prune     # forget, then reclaim in one step
 
-sluice prune ./repo            # mark-and-sweep GC: drop dead packs, repack partial ones
-sluice prune ./repo --dry-run  # report reclaimable bytes without touching storage
+sluice prune ./repo                  # mark-and-sweep GC: drop dead packs, repack partial ones
+sluice prune ./repo --max-unused 5   # leave packs that are <=5% dead instead of repacking
+sluice prune ./repo --dry-run        # report reclaimable bytes without touching storage
 ```
 
 `forget` only removes snapshots; `prune` reclaims the now-unreferenced storage,
@@ -173,8 +179,9 @@ blob is authenticated, a single flipped byte in a stored pack is caught by `veri
   thorough read-data `verify`, snapshot diffs, cross-snapshot `find`, and `tag`
   editing.
 - **Retention** — restic-style keep-last/daily/weekly/monthly/yearly plus
-  keep-tag `forget` (with `--dry-run` and `--prune`) plus mark-and-sweep `prune`
-  with repacking.
+  keep-tag and keep-within `forget`, optionally grouped by host or paths (with
+  `--dry-run` and `--prune`), plus mark-and-sweep `prune` with repacking and a
+  `--max-unused` tolerance.
 - **Replication** — `copy` a snapshot (or all) to another repository,
   re-encrypting under its keys, even across different passphrases.
 - **Fast open** — a persisted per-pack index avoids rescanning storage on open;
@@ -221,8 +228,9 @@ concurrency model, CLI surface, and threat model — lives in
   monthly/yearly, `--dry-run`, `--prune`), and repacking `prune` — ✅
 - **M6** — operations: advisory locking (`unlock`), multiple passphrases
   (`key add`/`list`/`remove`/`passwd`), `rebuild-index` — ✅
-- **M7** — UX & scripting: multi-source backups, `backup --dry-run`, `find`,
-  `tag`, `--keep-tag`, `cat`, `copy`, `--json` output, stable exit codes — ✅
+- **M7** — UX & scripting: multi-source backups, `backup --dry-run`/`--exclude-from`,
+  `find`, `tag`, `--keep-tag`/`--keep-within`/`--group-by`, `prune --max-unused`,
+  `cat`, `copy`, `--json` output, stable exit codes — ✅
 - **M8** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
 
 ## Building
@@ -233,7 +241,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 149 tests
+cargo test     # 153 tests
 ```
 
 ## Caveats
