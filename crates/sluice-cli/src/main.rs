@@ -58,6 +58,10 @@ enum Command {
         /// Tag to attach to the snapshot (repeatable).
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+        /// Skip files larger than this size, e.g. 100M, 2G (K/M/G/T suffixes are
+        /// binary; explicitly named single-file sources are always backed up).
+        #[arg(long = "exclude-larger-than", value_name = "SIZE")]
+        exclude_larger_than: Option<String>,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -403,6 +407,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             mut excludes,
             exclude_from,
             tags,
+            exclude_larger_than,
             dry_run,
             verbose,
             json,
@@ -418,6 +423,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     }
                 }
             }
+            let max_size = exclude_larger_than.as_deref().map(parse_size).transpose()?;
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             // With --verbose, print each new/changed file as it is processed.
             let report = |path: &std::path::Path, status: FileStatus| match status {
@@ -433,6 +439,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 &excludes,
                 &tags,
                 dry_run,
+                max_size,
                 progress,
             )
             .await?;
@@ -1292,6 +1299,31 @@ fn parse_within(s: &str) -> Result<i64, Box<dyn Error>> {
         .ok_or_else(|| "duration overflow".into())
 }
 
+/// Parse a byte size like `1024`, `100K`, `2M`, `4G`, `1T` (binary multipliers,
+/// case-insensitive suffix; a bare number is bytes).
+fn parse_size(s: &str) -> Result<u64, Box<dyn Error>> {
+    let s = s.trim();
+    let (digits, factor) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, 1u64),
+        Some(c) => {
+            let factor = match c.to_ascii_uppercase() {
+                'K' => 1024,
+                'M' => 1024 * 1024,
+                'G' => 1024 * 1024 * 1024,
+                'T' => 1024u64.pow(4),
+                _ => return Err(format!("invalid size unit '{c}' (use K/M/G/T)").into()),
+            };
+            (&s[..s.len() - c.len_utf8()], factor)
+        }
+        None => return Err("empty size".into()),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size: {s}"))?;
+    n.checked_mul(factor).ok_or_else(|| "size overflow".into())
+}
+
 /// Stable lowercase name for an entry kind, used in JSON output.
 fn kind_str(kind: EntryKind) -> &'static str {
     match kind {
@@ -1386,7 +1418,19 @@ fn format_utc(ns: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, format_bytes, format_utc, major_minor, mode_string};
+    use super::{EntryKind, format_bytes, format_utc, major_minor, mode_string, parse_size};
+
+    #[test]
+    fn parses_byte_sizes_with_binary_suffixes() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("100K").unwrap(), 100 * 1024);
+        assert_eq!(parse_size("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size("4g").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1T").unwrap(), 1024u64.pow(4));
+        assert!(parse_size("10X").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("").is_err());
+    }
 
     #[test]
     fn formats_byte_counts_with_binary_units() {

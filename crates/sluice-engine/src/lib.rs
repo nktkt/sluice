@@ -130,17 +130,20 @@ pub async fn backup_sources<B: StorageBackend>(
     tags: &[String],
     dry_run: bool,
 ) -> Result<BackupOutcome> {
-    backup_sources_with_progress(repo, sources, exclude_globs, tags, dry_run, None).await
+    backup_sources_with_progress(repo, sources, exclude_globs, tags, dry_run, None, None).await
 }
 
 /// Like [`backup_sources`], but `progress` (if any) is invoked once per regular
-/// file as it is processed, for `--verbose`/progress output.
+/// file as it is processed (for `--verbose`/progress output), and a regular file
+/// discovered during a directory walk larger than `max_file_size` is skipped
+/// (explicitly named single-file sources are always backed up).
 pub async fn backup_sources_with_progress<B: StorageBackend>(
     repo: &mut Repository<B>,
     sources: &[PathBuf],
     exclude_globs: &[String],
     tags: &[String],
     dry_run: bool,
+    max_file_size: Option<u64>,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     if sources.is_empty() {
@@ -158,7 +161,16 @@ pub async fn backup_sources_with_progress<B: StorageBackend>(
     } else {
         Some(repo.acquire_lock(false).await?)
     };
-    let result = backup_sources_inner(repo, sources, exclude_globs, tags, dry_run, progress).await;
+    let result = backup_sources_inner(
+        repo,
+        sources,
+        exclude_globs,
+        tags,
+        dry_run,
+        max_file_size,
+        progress,
+    )
+    .await;
     if let Some(lock) = lock {
         let _ = repo.release_lock(&lock).await;
     }
@@ -172,6 +184,7 @@ async fn backup_sources_inner<B: StorageBackend>(
     exclude_globs: &[String],
     tags: &[String],
     dry_run: bool,
+    max_file_size: Option<u64>,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     let excludes = build_globset(exclude_globs)?;
@@ -225,6 +238,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                 &excludes,
                 &mut summary,
                 dry_run,
+                max_file_size,
                 progress,
             )
             .await?
@@ -282,6 +296,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     &excludes,
                     &mut summary,
                     dry_run,
+                    max_file_size,
                     progress,
                 )
                 .await?;
@@ -1614,6 +1629,7 @@ fn backup_dir<'a, B: StorageBackend>(
     excludes: &'a GlobSet,
     stats: &'a mut SnapshotStats,
     dry_run: bool,
+    max_file_size: Option<u64>,
     progress: Option<ProgressFn<'a>>,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
@@ -1649,6 +1665,13 @@ fn backup_dir<'a, B: StorageBackend>(
             let kind = meta.file_type();
             let mtime = mtime_ns(&meta);
 
+            // Skip regular files over the size limit (--exclude-larger-than).
+            if let Some(limit) = max_file_size {
+                if kind.is_file() && meta.len() > limit {
+                    continue;
+                }
+            }
+
             let node = if kind.is_dir() {
                 let parent_sub = parent_nodes
                     .get(&name)
@@ -1660,6 +1683,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     excludes,
                     stats,
                     dry_run,
+                    max_file_size,
                     progress,
                 )
                 .await?;
@@ -2676,7 +2700,7 @@ mod tests {
         // First backup: both files are new.
         let first = Mutex::new(Vec::new());
         let report = |p: &Path, s: FileStatus| collect(&first, p, s);
-        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, Some(&report))
+        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, None, Some(&report))
             .await
             .unwrap();
         let mut got = first.into_inner().unwrap();
@@ -2690,7 +2714,7 @@ mod tests {
         std::fs::write(src.path().join("a"), b"alpha is now longer").unwrap();
         let second = Mutex::new(Vec::new());
         let report2 = |p: &Path, s: FileStatus| collect(&second, p, s);
-        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, Some(&report2))
+        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, None, Some(&report2))
             .await
             .unwrap();
         let mut got = second.into_inner().unwrap();
@@ -2701,6 +2725,40 @@ mod tests {
                 ("a".into(), FileStatus::Changed),
                 ("b".into(), FileStatus::Unmodified),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_excludes_files_over_the_size_limit() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("small"), vec![0u8; 100]).unwrap();
+        std::fs::write(src.path().join("big"), vec![0u8; 100_000]).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // A 1 KiB limit skips the 100 KiB file but keeps the 100-byte one.
+        let outcome = backup_sources_with_progress(
+            &mut repo,
+            &[src.path().to_path_buf()],
+            &[],
+            &[],
+            false,
+            Some(1024),
+            None,
+        )
+        .await
+        .unwrap();
+        let snap = outcome.snapshot.unwrap();
+        let names: Vec<String> = list_files(&repo, &snap)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(names.iter().any(|p| p == "small"));
+        assert!(
+            !names.iter().any(|p| p == "big"),
+            "the oversized file must be skipped"
         );
     }
 
