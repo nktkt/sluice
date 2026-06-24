@@ -57,6 +57,9 @@ pub enum RepoError {
     /// Refused to remove the repository's last key (it would become unopenable).
     #[error("cannot remove the last key")]
     LastKey,
+    /// No repository was found at the location (no key objects are present).
+    #[error("no repository found at this location")]
+    NotFound,
 }
 
 /// Convenience alias for fallible repository operations.
@@ -172,9 +175,13 @@ impl<B: StorageBackend> Repository<B> {
     /// Open an existing repository on `backend` using `passphrase`. Every stored
     /// key object is tried, so any of the repository's passphrases unlocks it.
     pub async fn open(backend: B, passphrase: &[u8]) -> Result<Self> {
+        let key_ids = backend.list(FileType::Key).await?;
+        if key_ids.is_empty() {
+            return Err(RepoError::NotFound);
+        }
         let mut unlocked: Option<(Id, Zeroizing<Key>)> = None;
         let mut last_err: Option<KeyError> = None;
-        for key_id in backend.list(FileType::Key).await? {
+        for key_id in key_ids {
             let Ok(key_object) =
                 from_cbor::<KeyObject>(&backend.get(FileType::Key, &key_id).await?)
             else {

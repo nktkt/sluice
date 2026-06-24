@@ -14,10 +14,11 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, RetentionPolicy, backup_excluding, check, diff, dump, forget, forget_tagged,
-    forget_with_policy, list_files, prune, prune_excluding, rebuild_index, restore_subpath, verify,
+    DiffKind, EngineError, RetentionPolicy, backup_excluding, check, diff, dump, forget,
+    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    restore_subpath, verify,
 };
-use sluice_repo::Repository;
+use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
 
 /// Encrypted, deduplicating backup & disaster-recovery tool.
@@ -199,8 +200,35 @@ enum KeyCmd {
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
-        std::process::exit(1);
+        std::process::exit(exit_code(error.as_ref()));
     }
+}
+
+/// Map an error to a stable, documented exit code (`DESIGN.md` §7): 10 repo not
+/// found, 11 wrong passphrase, 12 lock held, 13 corruption detected, else 1.
+fn exit_code(error: &(dyn Error + 'static)) -> i32 {
+    fn repo_code(e: &RepoError) -> i32 {
+        match e {
+            RepoError::NotFound => 10,
+            RepoError::Key(_) => 11,
+            RepoError::Locked => 12,
+            RepoError::Blob | RepoError::BlobNotFound(_) => 13,
+            _ => 1,
+        }
+    }
+    // A repository error may be the error itself, wrapped in an EngineError, or
+    // further down the source chain.
+    let mut current: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(err) = current {
+        if let Some(e) = err.downcast_ref::<RepoError>() {
+            return repo_code(e);
+        }
+        if let Some(EngineError::Repo(e)) = err.downcast_ref::<EngineError>() {
+            return repo_code(e);
+        }
+        current = err.source();
+    }
+    1
 }
 
 #[tokio::main]

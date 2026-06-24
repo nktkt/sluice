@@ -74,7 +74,45 @@ fn wrong_password_is_rejected() {
 
     let mut cmd = Command::cargo_bin("sluice").unwrap();
     cmd.env("SLUICE_PASSWORD", "the-wrong-password");
-    cmd.arg("snapshots").arg(&repo).assert().failure();
+    // Exit code 11 = wrong passphrase (DESIGN.md §7).
+    cmd.arg("snapshots").arg(&repo).assert().code(11);
+}
+
+#[test]
+fn opening_a_missing_repo_exits_10() {
+    let dir = tempfile::tempdir().unwrap();
+    // No init: the location holds no repository -> exit code 10 (not found).
+    sluice()
+        .arg("snapshots")
+        .arg(dir.path().join("nope"))
+        .assert()
+        .code(10);
+}
+
+#[test]
+fn prune_exits_12_when_a_lock_is_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    sluice().arg("init").arg(&repo).assert().success();
+
+    // Inject an advisory lock: a CBOR LockInfo { exclusive: false, hostname:
+    // "x", time_ns: 0 } at a valid 64-hex object id.
+    let lock = [
+        &[0xa3u8, 0x69][..],
+        b"exclusive",
+        &[0xf4, 0x68],
+        b"hostname",
+        &[0x61],
+        b"x",
+        &[0x67],
+        b"time_ns",
+        &[0x00],
+    ]
+    .concat();
+    std::fs::write(repo.join("locks").join("aa".repeat(32)), lock).unwrap();
+
+    // Exit code 12 = lock held (DESIGN.md §7).
+    sluice().arg("prune").arg(&repo).assert().code(12);
 }
 
 #[test]
