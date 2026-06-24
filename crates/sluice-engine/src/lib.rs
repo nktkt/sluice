@@ -1300,9 +1300,11 @@ async fn backup_file<B: StorageBackend>(
             (Vec::new(), meta.len())
         } else {
             // Stream the file through the chunker so peak memory is bounded by the
-            // chunk size, not the file size — large files don't load whole.
-            let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
-            repo.save_file_reader(file).await?
+            // chunk size, not the file size — large files don't load whole. A
+            // sparse file's holes are skipped (read as synthesized zeros) instead
+            // of being read from disk.
+            let source = open_file_source(path, meta)?;
+            repo.save_file_reader(source).await?
         }
     };
     stats.bytes_processed += size;
@@ -1832,6 +1834,88 @@ fn is_sparse(meta: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_sparse(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// A [`Read`] over a file's content that skips reading holes: it consults
+/// `SEEK_DATA`/`SEEK_HOLE` and synthesizes zeros for hole regions instead of
+/// reading them from disk. The byte stream is identical to reading the file
+/// normally (holes read back as zeros), so the chunker produces the same chunks
+/// and the backup still dedups — but a mostly-empty sparse file is barely read.
+#[cfg(unix)]
+struct SparseReader {
+    file: std::fs::File,
+    pos: u64,
+    size: u64,
+}
+
+#[cfg(unix)]
+impl std::io::Read for SparseReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use rustix::fs::{SeekFrom, seek};
+        use std::os::unix::fs::FileExt;
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        // Find where the next data begins at or after `pos`. The seek moves the
+        // descriptor's offset, but we read with `read_at` (pread), so it's moot.
+        let data_start = match seek(&self.file, SeekFrom::Data(self.pos)) {
+            Ok(d) => d,
+            // No data at/after `pos`: the remainder is a hole running to EOF.
+            Err(rustix::io::Errno::NXIO) => self.size,
+            Err(e) => return Err(e.into()),
+        };
+        if data_start > self.pos {
+            // `[pos, data_start)` is a hole — emit zeros without touching disk.
+            let n = (data_start - self.pos).min(buf.len() as u64) as usize;
+            buf[..n].fill(0);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        // `pos` is within data; read up to the next hole (the extent's end).
+        let data_end = seek(&self.file, SeekFrom::Hole(self.pos)).map_err(std::io::Error::from)?;
+        let n = (data_end - self.pos).min(buf.len() as u64) as usize;
+        let read = self.file.read_at(&mut buf[..n], self.pos)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+/// The byte source for backing up a regular file: a plain handle, or a
+/// hole-skipping [`SparseReader`] for sparse files. Both yield identical bytes.
+enum FileSource {
+    Plain(std::fs::File),
+    #[cfg(unix)]
+    Sparse(SparseReader),
+}
+
+impl std::io::Read for FileSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            FileSource::Plain(f) => f.read(buf),
+            #[cfg(unix)]
+            FileSource::Sparse(s) => s.read(buf),
+        }
+    }
+}
+
+/// Open `path` for backup, choosing a hole-skipping reader for sparse files.
+fn open_file_source(path: &Path, meta: &std::fs::Metadata) -> Result<FileSource> {
+    let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+    if is_sparse(meta) {
+        Ok(sparse_source(file, meta.len()))
+    } else {
+        Ok(FileSource::Plain(file))
+    }
+}
+
+#[cfg(unix)]
+fn sparse_source(file: std::fs::File, size: u64) -> FileSource {
+    FileSource::Sparse(SparseReader { file, pos: 0, size })
+}
+
+#[cfg(not(unix))]
+fn sparse_source(file: std::fs::File, _size: u64) -> FileSource {
+    FileSource::Plain(file)
 }
 
 /// The effective owner of the running process, recorded on the snapshot object.
@@ -2741,6 +2825,40 @@ mod tests {
             report.warnings
         );
         assert!(!report.messages.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sparse_reader_yields_the_dense_byte_stream() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sp");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"HEAD").unwrap();
+            f.seek(SeekFrom::Start(1 << 20)).unwrap(); // 1 MiB hole
+            f.write_all(b"TAIL").unwrap();
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        if meta.blocks().saturating_mul(512) >= meta.size() {
+            return; // filesystem didn't punch a hole
+        }
+        let mut reader = SparseReader {
+            file: std::fs::File::open(&path).unwrap(),
+            pos: 0,
+            size: meta.size(),
+        };
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+
+        // Identical to reading the file densely: head, a zero-filled hole, tail.
+        let mut want = vec![0u8; (1 << 20) + 4];
+        want[..4].copy_from_slice(b"HEAD");
+        want[1 << 20..].copy_from_slice(b"TAIL");
+        assert_eq!(got, want);
+        // And exactly what a plain read returns.
+        assert_eq!(got, std::fs::read(&path).unwrap());
     }
 
     #[cfg(unix)]
