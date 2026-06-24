@@ -4,6 +4,8 @@
 //! All cryptographic side effects in sluice flow through this crate so they can
 //! be audited and tested in one place (see `DESIGN.md` §5.4 and §9).
 
+mod aead;
 mod hash;
 
+pub use aead::{AeadError, NONCE_LEN, TAG_LEN, open, seal};
 pub use hash::{Key, derive_key, hash, keyed_hash};
