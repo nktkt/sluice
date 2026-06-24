@@ -1563,6 +1563,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backup_restore_handles_empty_files_and_dirs() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("empty.txt"), b"").unwrap(); // zero bytes
+        std::fs::create_dir(src.path().join("emptydir")).unwrap(); // empty directory
+        std::fs::create_dir_all(src.path().join("a/b/c")).unwrap(); // deeply nested, empty
+        std::fs::write(src.path().join("normal"), b"data").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("empty.txt")).unwrap(), b"");
+        assert!(out.path().join("emptydir").is_dir());
+        assert!(out.path().join("a/b/c").is_dir());
+        assert_eq!(std::fs::read(out.path().join("normal")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn backup_restore_preserves_unusual_filenames() {
+        let src = tempfile::tempdir().unwrap();
+        let names = [
+            "café.txt",
+            "日本語.md",
+            "with space.bin",
+            "emoji-🎉",
+            "dot.in.name",
+        ];
+        for name in names {
+            std::fs::write(src.path().join(name), name.as_bytes()).unwrap();
+        }
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        for name in names {
+            assert_eq!(
+                std::fs::read(out.path().join(name)).unwrap(),
+                name.as_bytes(),
+                "filename {name} should round-trip"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn backup_deduplicates_identical_files() {
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("x"), b"same content here").unwrap();
