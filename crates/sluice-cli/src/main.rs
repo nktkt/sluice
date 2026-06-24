@@ -13,7 +13,8 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, backup_excluding, diff, forget, forget_keep_last, list_files, prune, restore, verify,
+    DiffKind, backup_excluding, diff, dump, forget, forget_keep_last, list_files, prune, restore,
+    verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -92,6 +93,15 @@ enum Command {
         from: String,
         /// The newer snapshot id (a unique hex prefix is accepted).
         to: String,
+    },
+    /// Write a single file from a snapshot to stdout.
+    Dump {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
+        /// Path of the file within the snapshot.
+        path: String,
     },
 }
 
@@ -209,6 +219,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 };
                 println!("{sign} {}", change.path);
             }
+        }
+        Command::Dump {
+            repo,
+            snapshot,
+            path,
+        } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let id = resolve_snapshot(&repository, &snapshot).await?;
+            let data = dump(&repository, &id, &path).await?;
+            use std::io::Write;
+            std::io::stdout().write_all(&data)?;
         }
     }
     Ok(())

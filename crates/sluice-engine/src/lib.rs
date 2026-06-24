@@ -37,6 +37,9 @@ pub enum EngineError {
     /// An invalid exclude glob pattern.
     #[error("invalid exclude pattern: {0}")]
     Pattern(String),
+    /// A requested path was not found in the snapshot.
+    #[error("path not found in snapshot: {0}")]
+    NotInSnapshot(String),
 }
 
 /// Convenience alias for fallible engine operations.
@@ -395,6 +398,52 @@ pub async fn diff<B: StorageBackend>(
     }
     changes.sort_by(|x, y| x.path.cmp(&y.path));
     Ok(changes)
+}
+
+/// Extract the contents of a single file at `path` (relative to the backup
+/// root) from `snapshot`, without restoring anything else.
+pub async fn dump<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    path: &str,
+) -> Result<Vec<u8>> {
+    let root = repo.load_snapshot(snapshot).await?.tree;
+    let node = find_node(repo, root, path).await?;
+    match node.kind {
+        EntryKind::File => Ok(repo.load_file(&node.content).await?),
+        _ => Err(EngineError::NotInSnapshot(format!(
+            "{path} is not a regular file"
+        ))),
+    }
+}
+
+/// Navigate a tree DAG to the node at `path`.
+async fn find_node<B: StorageBackend>(
+    repo: &Repository<B>,
+    root_tree: Id,
+    path: &str,
+) -> Result<Node> {
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if components.is_empty() {
+        return Err(EngineError::NotInSnapshot(path.to_string()));
+    }
+    let mut tree_id = root_tree;
+    for (i, component) in components.iter().enumerate() {
+        let tree = repo.load_tree(&tree_id).await?;
+        let node = tree
+            .nodes
+            .into_iter()
+            .find(|n| n.name.as_slice() == component.as_bytes())
+            .ok_or_else(|| EngineError::NotInSnapshot(path.to_string()))?;
+        if i + 1 == components.len() {
+            return Ok(node);
+        }
+        match node.subtree {
+            Some(subtree) => tree_id = subtree,
+            None => return Err(EngineError::NotInSnapshot(path.to_string())),
+        }
+    }
+    Err(EngineError::NotInSnapshot(path.to_string()))
 }
 
 /// Recursively back up `dir`, returning the id of its `Tree` object. `parent`
@@ -960,5 +1009,25 @@ mod tests {
         assert_eq!(of(DiffKind::Removed), vec!["gone"]);
         assert_eq!(of(DiffKind::Modified), vec!["changes"]);
         assert!(!changes.iter().any(|d| d.path == "stable"));
+    }
+
+    #[tokio::test]
+    async fn dump_extracts_a_single_file() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/file.txt"), b"hello dump").unwrap();
+        std::fs::write(src.path().join("top"), b"top-level").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        assert_eq!(
+            dump(&repo, &snap, "sub/file.txt").await.unwrap(),
+            b"hello dump"
+        );
+        assert_eq!(dump(&repo, &snap, "top").await.unwrap(), b"top-level");
+        assert!(dump(&repo, &snap, "missing").await.is_err());
+        assert!(dump(&repo, &snap, "sub").await.is_err()); // a directory, not a file
     }
 }
