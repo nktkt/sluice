@@ -194,6 +194,7 @@ const fn high_bits_mask(bits: u32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::HashSet;
 
     #[test]
@@ -296,5 +297,28 @@ mod tests {
             "only {shared}/{} chunks recurred after a 1-byte insertion",
             base.len()
         );
+    }
+
+    proptest! {
+        #[test]
+        fn any_input_chunks_reassemble_and_respect_bounds(
+            data in proptest::collection::vec(any::<u8>(), 0..30_000)
+        ) {
+            let chunker = small();
+            let chunks: Vec<&[u8]> = chunker.chunks(&data).collect();
+
+            // Chunks concatenate back to the input exactly.
+            let reassembled: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+            prop_assert_eq!(reassembled, data.clone());
+
+            // Nothing exceeds max; non-final chunks are at least min; none empty.
+            for (i, chunk) in chunks.iter().enumerate() {
+                prop_assert!(!chunk.is_empty());
+                prop_assert!(chunk.len() <= 1024);
+                if i + 1 < chunks.len() {
+                    prop_assert!(chunk.len() >= 64);
+                }
+            }
+        }
     }
 }
