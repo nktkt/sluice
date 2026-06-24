@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
-use sluice_engine::{backup, forget, forget_keep_last, list_files, prune, restore, verify};
+use sluice_engine::{
+    backup_excluding, forget, forget_keep_last, list_files, prune, restore, verify,
+};
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
 
@@ -35,6 +37,9 @@ enum Command {
         repo: PathBuf,
         /// Directory to back up.
         source: PathBuf,
+        /// Glob of entry names to exclude (repeatable), e.g. --exclude '*.log'.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        excludes: Vec<String>,
     },
     /// Restore a snapshot into a target directory.
     Restore {
@@ -96,9 +101,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 repo.display()
             );
         }
-        Command::Backup { repo, source } => {
+        Command::Backup {
+            repo,
+            source,
+            excludes,
+        } => {
             let mut repository = Repository::open(LocalBackend::open(&repo), pw).await?;
-            let snapshot = backup(&mut repository, &source).await?;
+            let snapshot = backup_excluding(&mut repository, &source, &excludes).await?;
             println!("{snapshot}");
         }
         Command::Restore {

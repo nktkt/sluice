@@ -13,6 +13,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use sluice_core::{
     EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
 };
@@ -33,6 +34,9 @@ pub enum EngineError {
         /// The underlying I/O error.
         source: std::io::Error,
     },
+    /// An invalid exclude glob pattern.
+    #[error("invalid exclude pattern: {0}")]
+    Pattern(String),
 }
 
 /// Convenience alias for fallible engine operations.
@@ -50,10 +54,28 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
 /// Incremental: the most recent snapshot is used as the parent, and files whose
 /// size and mtime are unchanged reuse their stored chunks without being re-read.
 pub async fn backup<B: StorageBackend>(repo: &mut Repository<B>, source: &Path) -> Result<Id> {
+    backup_excluding(repo, source, &[]).await
+}
+
+/// Back up `source`, skipping entries whose name matches one of `exclude_globs`
+/// (a skipped directory is pruned along with its contents).
+pub async fn backup_excluding<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    source: &Path,
+    exclude_globs: &[String],
+) -> Result<Id> {
+    let excludes = build_globset(exclude_globs)?;
     let parent = latest_snapshot(repo).await?;
     let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
     let mut summary = SnapshotStats::default();
-    let root_tree = backup_dir(repo, source.to_path_buf(), parent_tree, &mut summary).await?;
+    let root_tree = backup_dir(
+        repo,
+        source.to_path_buf(),
+        parent_tree,
+        &excludes,
+        &mut summary,
+    )
+    .await?;
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
         time_ns: now_ns(),
@@ -69,6 +91,17 @@ pub async fn backup<B: StorageBackend>(repo: &mut Repository<B>, source: &Path) 
         summary,
     };
     Ok(repo.commit_snapshot(&snapshot).await?)
+}
+
+/// Compile exclude globs (matched against entry names) into a [`GlobSet`].
+fn build_globset(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).map_err(|e| EngineError::Pattern(e.to_string()))?);
+    }
+    builder
+        .build()
+        .map_err(|e| EngineError::Pattern(e.to_string()))
 }
 
 /// Find the most recent snapshot (by timestamp), if any.
@@ -306,6 +339,7 @@ fn backup_dir<'a, B: StorageBackend>(
     repo: &'a mut Repository<B>,
     dir: PathBuf,
     parent: Option<Id>,
+    excludes: &'a GlobSet,
     stats: &'a mut SnapshotStats,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
@@ -331,9 +365,13 @@ fn backup_dir<'a, B: StorageBackend>(
 
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
+            let file_name = entry.file_name();
+            if excludes.is_match(&file_name) {
+                continue;
+            }
             let path = entry.path();
             let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(&path, e))?;
-            let name = entry.file_name().as_encoded_bytes().to_vec();
+            let name = file_name.as_encoded_bytes().to_vec();
             let kind = meta.file_type();
             let mtime = mtime_ns(&meta);
 
@@ -341,7 +379,7 @@ fn backup_dir<'a, B: StorageBackend>(
                 let parent_sub = parent_nodes
                     .get(&name)
                     .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-                let subtree = backup_dir(repo, path.clone(), parent_sub, stats).await?;
+                let subtree = backup_dir(repo, path.clone(), parent_sub, excludes, stats).await?;
                 stats.dirs += 1;
                 Node {
                     name,
@@ -801,5 +839,31 @@ mod tests {
             filetime::FileTime::from_last_modification_time(&meta).unix_seconds(),
             1_600_000_000
         );
+    }
+
+    #[tokio::test]
+    async fn backup_excludes_matching_names() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(src.path().join("skip.log"), b"skip").unwrap();
+        std::fs::create_dir(src.path().join("cache")).unwrap();
+        std::fs::write(src.path().join("cache/x"), b"x").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup_excluding(&mut repo, src.path(), &["*.log".into(), "cache".into()])
+            .await
+            .unwrap();
+
+        let paths: Vec<String> = list_files(&repo, &snap)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(paths.contains(&"keep.txt".to_string()));
+        assert!(!paths.iter().any(|p| p.contains("skip.log")));
+        assert!(!paths.iter().any(|p| p.contains("cache")));
     }
 }

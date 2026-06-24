@@ -14,6 +14,7 @@ sluice-repo = { path = "../sluice-repo" }
 sluice-store = { path = "../sluice-store" }
 thiserror = { workspace = true }
 filetime = { workspace = true }
+globset = { workspace = true }
 
 [dev-dependencies]
 sluice-crypto = { path = "../sluice-crypto" }
