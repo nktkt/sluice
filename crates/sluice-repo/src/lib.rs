@@ -52,6 +52,9 @@ pub enum RepoError {
     /// The repository uses an unsupported format.
     #[error("unsupported repository format")]
     Unsupported,
+    /// A conflicting advisory lock is already held (see [`Repository::acquire_lock`]).
+    #[error("repository is locked by another operation")]
+    Locked,
 }
 
 /// Convenience alias for fallible repository operations.
@@ -77,6 +80,20 @@ pub struct PruneReport {
     /// Total bytes reclaimed: the full size of each deleted pack plus the size
     /// reduction from repacking each partially-dead pack.
     pub reclaimed_bytes: u64,
+}
+
+/// An advisory repository lock (see `DESIGN.md` §5.2). An *exclusive* lock
+/// (taken by prune) conflicts with any other lock; a *shared* lock (taken by
+/// backup) conflicts only with exclusive locks. Stored unencrypted: it carries
+/// no secrets, only coordination metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockInfo {
+    /// Whether this lock is exclusive.
+    pub exclusive: bool,
+    /// The host that acquired the lock (informational).
+    pub hostname: String,
+    /// When the lock was acquired (ns since the Unix epoch).
+    pub time_ns: i64,
 }
 
 /// An open repository over a storage backend `B`.
@@ -432,6 +449,58 @@ impl<B: StorageBackend> Repository<B> {
     pub fn backend(&self) -> &B {
         &self.backend
     }
+
+    /// List the advisory locks currently held on the repository.
+    pub async fn list_locks(&self) -> Result<Vec<(Id, LockInfo)>> {
+        let mut locks = Vec::new();
+        for id in self.backend.list(FileType::Lock).await? {
+            let bytes = self.backend.get(FileType::Lock, &id).await?;
+            let info: LockInfo = from_cbor(&bytes).map_err(codec)?;
+            locks.push((id, info));
+        }
+        Ok(locks)
+    }
+
+    /// Acquire an advisory lock, returning its id. An exclusive lock conflicts
+    /// with any existing lock; a shared lock conflicts only with exclusive ones.
+    /// Fails with [`RepoError::Locked`] on conflict. A write-then-recheck guards
+    /// against two acquirers racing. Release with [`Repository::release_lock`].
+    pub async fn acquire_lock(&self, exclusive: bool) -> Result<Id> {
+        let conflicts = |locks: &[(Id, LockInfo)], own: Option<&Id>| {
+            locks
+                .iter()
+                .any(|(id, info)| Some(id) != own && (exclusive || info.exclusive))
+        };
+        if conflicts(&self.list_locks().await?, None) {
+            return Err(RepoError::Locked);
+        }
+        let mut raw = [0u8; Id::LEN];
+        fill_random(&mut raw);
+        let id = Id::from_bytes(raw);
+        let info = LockInfo {
+            exclusive,
+            hostname: hostname(),
+            time_ns: now_ns(),
+        };
+        let bytes = to_cbor(&info).map_err(codec)?;
+        self.backend.put(FileType::Lock, &id, bytes.into()).await?;
+        // A conflicting lock may have been written concurrently with ours; if so,
+        // drop ours and report the conflict so neither side wrongly proceeds.
+        if conflicts(&self.list_locks().await?, Some(&id)) {
+            self.backend.remove(FileType::Lock, &id).await.ok();
+            return Err(RepoError::Locked);
+        }
+        Ok(id)
+    }
+
+    /// Release a lock previously returned by [`Repository::acquire_lock`]. Absent
+    /// locks are ignored, so this is safe to call during cleanup.
+    pub async fn release_lock(&self, id: &Id) -> Result<()> {
+        match self.backend.remove(FileType::Lock, id).await {
+            Ok(()) | Err(StoreError::NotFound { .. }) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 /// Rebuild the chunk index by reading every pack's plaintext directory footer.
@@ -459,6 +528,11 @@ fn now_ns() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// Best-effort host name for tagging a lock (informational only).
+fn hostname() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -746,5 +820,40 @@ mod tests {
             let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
             assert_eq!(repo.load_blob(&id).await.unwrap(), data);
         }
+    }
+
+    #[tokio::test]
+    async fn locks_are_advisory_shared_and_exclusive() {
+        let repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // Shared locks coexist; an exclusive lock is refused while they are held.
+        let a = repo.acquire_lock(false).await.unwrap();
+        let b = repo.acquire_lock(false).await.unwrap();
+        assert_eq!(repo.list_locks().await.unwrap().len(), 2);
+        assert!(matches!(
+            repo.acquire_lock(true).await,
+            Err(RepoError::Locked)
+        ));
+
+        repo.release_lock(&a).await.unwrap();
+        repo.release_lock(&b).await.unwrap();
+        // With none held, an exclusive lock blocks every other acquirer.
+        let x = repo.acquire_lock(true).await.unwrap();
+        assert!(matches!(
+            repo.acquire_lock(false).await,
+            Err(RepoError::Locked)
+        ));
+        assert!(matches!(
+            repo.acquire_lock(true).await,
+            Err(RepoError::Locked)
+        ));
+
+        repo.release_lock(&x).await.unwrap();
+        assert!(repo.acquire_lock(true).await.is_ok());
+        // Releasing an absent lock is a no-op.
+        repo.release_lock(&Id::from_bytes([9u8; Id::LEN]))
+            .await
+            .unwrap();
     }
 }

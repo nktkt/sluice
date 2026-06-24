@@ -147,6 +147,11 @@ enum Command {
         /// Repository path or object-store URL.
         repo: String,
     },
+    /// Remove advisory locks left behind by an interrupted operation.
+    Unlock {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
 }
 
 fn main() {
@@ -383,6 +388,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("logical bytes: {logical}");
             println!("stored bytes:  {stored}");
             println!("saved:         {saved}% (dedup + compression)");
+        }
+        Command::Unlock { repo } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let locks = repository.list_locks().await?;
+            for (id, _) in &locks {
+                repository.release_lock(id).await?;
+            }
+            println!("removed {} lock(s)", locks.len());
         }
     }
     Ok(())

@@ -443,7 +443,24 @@ pub async fn prune_excluding<B: StorageBackend>(
     dry_run: bool,
     excluded: &HashSet<Id>,
 ) -> Result<PruneReport> {
-    // MARK: collect every blob reachable from a surviving (non-excluded) snapshot.
+    // A dry run only reads, so it needs no lock; a real prune takes the exclusive
+    // lock that guards deletion against concurrent operations (`DESIGN.md` §8).
+    if dry_run {
+        return prune_marked(repo, true, excluded).await;
+    }
+    let lock = repo.acquire_lock(true).await?;
+    let result = prune_marked(repo, false, excluded).await;
+    let _ = repo.release_lock(&lock).await;
+    result
+}
+
+/// MARK every blob reachable from a surviving (non-`excluded`) snapshot, then
+/// SWEEP + repack, updating the repository's index in place.
+async fn prune_marked<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    dry_run: bool,
+    excluded: &HashSet<Id>,
+) -> Result<PruneReport> {
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
         if excluded.contains(&snapshot) {
@@ -452,7 +469,6 @@ pub async fn prune_excluding<B: StorageBackend>(
         let snap = repo.load_snapshot(&snapshot).await?;
         mark_tree(repo, snap.tree, &mut live).await?;
     }
-    // SWEEP + repack, updating the repository's index in place.
     Ok(repo.sweep(&live, dry_run).await?)
 }
 
@@ -1711,5 +1727,26 @@ mod tests {
         // A plain prune (excluding nothing) finds nothing dead yet.
         let none = prune(&mut repo, true).await.unwrap();
         assert_eq!(none.reclaimed_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_refuses_to_run_while_locked() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        // A concurrent operation holds a (shared) lock.
+        let held = repo.acquire_lock(false).await.unwrap();
+        assert!(prune(&mut repo, false).await.is_err());
+        // A dry run takes no lock, so it still works.
+        assert!(prune(&mut repo, true).await.is_ok());
+
+        // Once released, prune proceeds and releases its own lock afterwards.
+        repo.release_lock(&held).await.unwrap();
+        assert!(prune(&mut repo, false).await.is_ok());
+        assert!(repo.list_locks().await.unwrap().is_empty());
     }
 }
