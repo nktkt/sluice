@@ -74,6 +74,9 @@ pub struct PruneReport {
     pub deleted: usize,
     /// Partially-dead packs repacked (or that would be, under dry-run).
     pub repacked: usize,
+    /// Total bytes reclaimed: the full size of each deleted pack plus the size
+    /// reduction from repacking each partially-dead pack.
+    pub reclaimed_bytes: u64,
 }
 
 /// An open repository over a storage backend `B`.
@@ -245,6 +248,7 @@ impl<B: StorageBackend> Repository<B> {
 
             if live_count == 0 {
                 report.deleted += 1;
+                report.reclaimed_bytes += bytes.len() as u64;
                 if !dry_run {
                     self.backend.remove(FileType::Pack, &pack_id).await?;
                     for entry in &entries {
@@ -253,16 +257,18 @@ impl<B: StorageBackend> Repository<B> {
                 }
             } else if live_count < entries.len() {
                 report.repacked += 1;
-                if !dry_run {
-                    // Partially live: repack the live blobs, then drop the old pack.
-                    let mut builder = PackBuilder::new();
-                    for entry in &entries {
-                        if live.contains(&entry.id) {
-                            let sealed = reader.blob(&entry.id).expect("entry in its own pack");
-                            builder.add(entry.id, entry.kind, sealed);
-                        }
+                // Build the repacked pack (in dry-run too, to measure the savings).
+                let mut builder = PackBuilder::new();
+                for entry in &entries {
+                    if live.contains(&entry.id) {
+                        let sealed = reader.blob(&entry.id).expect("entry in its own pack");
+                        builder.add(entry.id, entry.kind, sealed);
                     }
-                    let (new_bytes, directory) = builder.finish()?;
+                }
+                let (new_bytes, directory) = builder.finish()?;
+                report.reclaimed_bytes += (bytes.len() - new_bytes.len()) as u64;
+                if !dry_run {
+                    // Swap the old pack for the repacked one and refresh the index.
                     let new_pack_id = hash(&new_bytes);
                     self.backend
                         .put(FileType::Pack, &new_pack_id, new_bytes.into())

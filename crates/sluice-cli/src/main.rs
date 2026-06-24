@@ -248,8 +248,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let report = prune(&mut repository, dry_run).await?;
             let verb = if dry_run { "would prune" } else { "pruned" };
             println!(
-                "{verb} {} packs, {} repacked",
-                report.deleted, report.repacked
+                "{verb} {} packs, {} repacked ({} bytes reclaimed)",
+                report.deleted, report.repacked, report.reclaimed_bytes
             );
         }
         Command::Ls { repo, snapshot } => {

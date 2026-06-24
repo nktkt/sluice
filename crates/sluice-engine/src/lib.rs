@@ -1305,7 +1305,8 @@ mod tests {
         );
 
         let removed = prune(&mut repo, false).await.unwrap();
-        assert_eq!(removed.deleted, would.deleted);
+        // A dry run is an exact preview: same deleted/repacked/reclaimed counts.
+        assert_eq!(removed, would);
         assert!(repo.backend().list(FileType::Pack).await.unwrap().len() < before);
     }
 
@@ -1333,13 +1334,16 @@ mod tests {
 
         forget(&repo, &snap1).await.unwrap();
         let before = total_pack_bytes(&repo).await;
-        prune(&mut repo, false).await.unwrap();
+        let report = prune(&mut repo, false).await.unwrap();
         let after = total_pack_bytes(&repo).await;
         // snap1's pack was partially live (b) -> repacked, reclaiming a-v1 + tree1.
         assert!(
             after < before,
             "repack should reclaim space: {before} -> {after}"
         );
+        // The reported reclaimed bytes equal the actual on-disk reduction.
+        assert_eq!(report.repacked, 1);
+        assert_eq!(report.reclaimed_bytes, before - after);
 
         // The survivor still verifies and restores fully (b moved to a new pack).
         assert!(verify(&repo).await.is_ok());
