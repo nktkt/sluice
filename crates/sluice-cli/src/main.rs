@@ -182,6 +182,18 @@ enum KeyCmd {
         /// Repository path or object-store URL.
         repo: String,
     },
+    /// Remove a key by id (refused if it is the last key).
+    Remove {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// The key id to remove (as shown by `key list`).
+        id: String,
+    },
+    /// Change the current passphrase, rotating out its key.
+    Passwd {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
 }
 
 fn main() {
@@ -468,6 +480,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     .add_key(new_pass.as_bytes(), kdf_params())
                     .await?;
                 println!("added key {id}");
+            }
+            KeyCmd::Remove { repo, id } => {
+                let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                let key_id: Id = id.parse().map_err(|_| "invalid key id")?;
+                repository.remove_key(&key_id).await?;
+                println!("removed key {key_id}");
+            }
+            KeyCmd::Passwd { repo } => {
+                let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                let new_pass = read_new_passphrase()?;
+                let id = repository
+                    .change_passphrase(new_pass.as_bytes(), kdf_params())
+                    .await?;
+                println!("changed passphrase; new key {id}");
             }
         },
     }

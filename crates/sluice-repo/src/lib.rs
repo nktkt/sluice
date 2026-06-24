@@ -54,6 +54,9 @@ pub enum RepoError {
     /// A conflicting advisory lock is already held (see [`Repository::acquire_lock`]).
     #[error("repository is locked by another operation")]
     Locked,
+    /// Refused to remove the repository's last key (it would become unopenable).
+    #[error("cannot remove the last key")]
+    LastKey,
 }
 
 /// Convenience alias for fallible repository operations.
@@ -102,6 +105,9 @@ pub struct Repository<B> {
     /// The master key, retained (zeroized on drop) so new key objects can be
     /// wrapped under additional passphrases without re-deriving it.
     master: Zeroizing<Key>,
+    /// Id of the key object that unlocked this handle (the one `change_passphrase`
+    /// rotates out).
+    key_id: Id,
     config: RepoConfig,
     /// chunk id -> (pack id, directory entry). Rebuilt from pack footers on open.
     index: HashMap<Id, (Id, BlobEntry)>,
@@ -149,12 +155,13 @@ impl<B: StorageBackend> Repository<B> {
             .await?;
 
         // Wrap the master under the passphrase and store the first key object.
-        put_key_object(&backend, passphrase, kdf, &master).await?;
+        let key_id = put_key_object(&backend, passphrase, kdf, &master).await?;
 
         Ok(Self {
             backend,
             keys,
             master,
+            key_id,
             config,
             index: HashMap::new(),
             pending: PackBuilder::new(),
@@ -165,7 +172,7 @@ impl<B: StorageBackend> Repository<B> {
     /// Open an existing repository on `backend` using `passphrase`. Every stored
     /// key object is tried, so any of the repository's passphrases unlocks it.
     pub async fn open(backend: B, passphrase: &[u8]) -> Result<Self> {
-        let mut master: Option<Zeroizing<Key>> = None;
+        let mut unlocked: Option<(Id, Zeroizing<Key>)> = None;
         let mut last_err: Option<KeyError> = None;
         for key_id in backend.list(FileType::Key).await? {
             let Ok(key_object) =
@@ -180,14 +187,14 @@ impl<B: StorageBackend> Repository<B> {
             };
             match unwrap_master(passphrase, &key_object.salt, kdf, &key_object.wrapped) {
                 Ok(m) => {
-                    master = Some(m);
+                    unlocked = Some((key_id, m));
                     break;
                 }
                 Err(e) => last_err = Some(e),
             }
         }
-        let master =
-            master.ok_or_else(|| RepoError::Key(last_err.unwrap_or(KeyError::WrongPassphrase)))?;
+        let (key_id, master) = unlocked
+            .ok_or_else(|| RepoError::Key(last_err.unwrap_or(KeyError::WrongPassphrase)))?;
         let keys = KeySet::derive(&master);
 
         let sealed = backend.get(FileType::Config, &CONFIG_ID).await?;
@@ -204,6 +211,7 @@ impl<B: StorageBackend> Repository<B> {
             backend,
             keys,
             master,
+            key_id,
             config,
             index,
             pending: PackBuilder::new(),
@@ -571,6 +579,24 @@ impl<B: StorageBackend> Repository<B> {
     /// with `kdf`), returning its id. Existing passphrases keep working.
     pub async fn add_key(&self, passphrase: &[u8], kdf: KdfParams) -> Result<Id> {
         put_key_object(&self.backend, passphrase, kdf, &self.master).await
+    }
+
+    /// Remove the key object `id`, refusing ([`RepoError::LastKey`]) if it is the
+    /// repository's only key, which would leave the repository unopenable.
+    pub async fn remove_key(&self, id: &Id) -> Result<()> {
+        if self.list_keys().await?.len() <= 1 {
+            return Err(RepoError::LastKey);
+        }
+        self.backend.remove(FileType::Key, id).await?;
+        Ok(())
+    }
+
+    /// Rotate the passphrase: add a key for `passphrase` (stretched with `kdf`)
+    /// and remove the key that unlocked this handle. Returns the new key's id.
+    pub async fn change_passphrase(&self, passphrase: &[u8], kdf: KdfParams) -> Result<Id> {
+        let new_id = self.add_key(passphrase, kdf).await?;
+        self.remove_key(&self.key_id).await?;
+        Ok(new_id)
     }
 }
 
@@ -1089,6 +1115,52 @@ mod tests {
         let keys = repo.list_keys().await.unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&added));
+    }
+
+    #[tokio::test]
+    async fn change_passphrase_rotates_the_unlocking_key() {
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        {
+            let repo = Repository::init(backend.clone(), b"first", fast())
+                .await
+                .unwrap();
+            repo.change_passphrase(b"rotated", fast()).await.unwrap();
+        }
+        // The new passphrase opens it; the old one no longer does.
+        assert!(Repository::open(backend.clone(), b"rotated").await.is_ok());
+        assert!(matches!(
+            Repository::open(backend.clone(), b"first").await,
+            Err(RepoError::Key(_))
+        ));
+        let repo = Repository::open(backend.clone(), b"rotated").await.unwrap();
+        assert_eq!(repo.list_keys().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_key_refuses_the_last_one() {
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let repo = Repository::init(backend.clone(), b"only", fast())
+            .await
+            .unwrap();
+        let only = repo.list_keys().await.unwrap()[0];
+        assert!(matches!(
+            repo.remove_key(&only).await,
+            Err(RepoError::LastKey)
+        ));
+
+        // With a second key present, the first can be removed.
+        let second = repo.add_key(b"second", fast()).await.unwrap();
+        repo.remove_key(&only).await.unwrap();
+        assert_eq!(repo.list_keys().await.unwrap(), vec![second]);
+        // The removed passphrase no longer opens the repository.
+        assert!(matches!(
+            Repository::open(backend.clone(), b"only").await,
+            Err(RepoError::Key(_))
+        ));
     }
 
     #[tokio::test]
