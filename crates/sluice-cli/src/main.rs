@@ -116,6 +116,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let snapshot = backup_excluding(&mut repository, &source, &excludes).await?;
             println!("{snapshot}");
+            let s = repository.load_snapshot(&snapshot).await?.summary;
+            eprintln!(
+                "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
+                s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
+            );
         }
         Command::Restore {
             repo,
