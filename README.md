@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 184 tests across
+machine-readable JSON output, and stable exit codes. Backed by 185 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -77,6 +77,7 @@ sluice restore   ./repo <snapshot> ./out --path docs --path config   # only thes
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
+sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
 ```
 
 `--skip-existing` makes a restore idempotent and resumable: an entry already
@@ -272,7 +273,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 184 tests
+cargo test     # 185 tests
 ```
 
 ## Caveats

@@ -518,6 +518,10 @@ pub struct RestoreOptions {
 /// Concurrent collector for [`RestoreReport`] entries during a restore.
 type Reporter = std::sync::Mutex<RestoreReport>;
 
+/// A callback invoked with each file's path as it is restored (skipped files are
+/// not reported), for `--verbose`/progress output. See [`restore_with`].
+pub type RestoreProgressFn<'a> = &'a (dyn Fn(&Path) + Sync);
+
 /// How many distinct messages to retain. The count stays exact; only the sample
 /// is bounded, so a flood of failures cannot exhaust memory.
 const WARN_SAMPLE_CAP: usize = 20;
@@ -537,7 +541,15 @@ pub async fn restore<B: StorageBackend>(
     snapshot: &Id,
     target: &Path,
 ) -> Result<RestoreReport> {
-    restore_with(repo, snapshot, None, target, RestoreOptions::default()).await
+    restore_with(
+        repo,
+        snapshot,
+        None,
+        target,
+        RestoreOptions::default(),
+        None,
+    )
+    .await
 }
 
 /// Restore a snapshot into `target`. With `subpath`, restore only that entry
@@ -548,17 +560,27 @@ pub async fn restore_subpath<B: StorageBackend>(
     subpath: Option<&str>,
     target: &Path,
 ) -> Result<RestoreReport> {
-    restore_with(repo, snapshot, subpath, target, RestoreOptions::default()).await
+    restore_with(
+        repo,
+        snapshot,
+        subpath,
+        target,
+        RestoreOptions::default(),
+        None,
+    )
+    .await
 }
 
-/// Restore a snapshot (optionally just `subpath`) into `target` under `options`.
-/// [`restore`] and [`restore_subpath`] are thin wrappers with default options.
+/// Restore a snapshot (optionally just `subpath`) into `target` under `options`,
+/// invoking `progress` (if any) with each restored file's path. [`restore`] and
+/// [`restore_subpath`] are thin wrappers with default options and no progress.
 pub async fn restore_with<B: StorageBackend>(
     repo: &Repository<B>,
     snapshot: &Id,
     subpath: Option<&str>,
     target: &Path,
     options: RestoreOptions,
+    progress: Option<RestoreProgressFn<'_>>,
 ) -> Result<RestoreReport> {
     let snap = repo.load_snapshot(snapshot).await?;
     std::fs::create_dir_all(target).map_err(|e| io_err(target, e))?;
@@ -574,12 +596,21 @@ pub async fn restore_with<B: StorageBackend>(
             EntryKind::Dir => {
                 std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
                 if let Some(subtree) = node.subtree {
-                    restore_tree(repo, subtree, dest.clone(), &links, &reporter, options).await?;
+                    restore_tree(
+                        repo,
+                        subtree,
+                        dest.clone(),
+                        &links,
+                        &reporter,
+                        options,
+                        progress,
+                    )
+                    .await?;
                 }
                 apply_metadata(&dest, &node, &reporter);
             }
             EntryKind::File => {
-                restore_file(repo, &dest, &node, &reporter, options).await?;
+                restore_file(repo, &dest, &node, &reporter, options, progress).await?;
             }
             EntryKind::Symlink => {
                 if let Some(link_target) = &node.link_target {
@@ -617,6 +648,7 @@ pub async fn restore_with<B: StorageBackend>(
             &links,
             &reporter,
             options,
+            progress,
         )
         .await?;
     }
@@ -645,6 +677,7 @@ async fn restore_file<B: StorageBackend>(
     node: &Node,
     reporter: &Reporter,
     options: RestoreOptions,
+    progress: Option<RestoreProgressFn<'_>>,
 ) -> Result<()> {
     if options.skip_existing && file_matches(path, node) {
         return Ok(());
@@ -653,6 +686,9 @@ async fn restore_file<B: StorageBackend>(
     apply_metadata(path, node, reporter);
     if options.verify {
         verify_restored_file(repo, path, &node.content).await?;
+    }
+    if let Some(report) = progress {
+        report(path);
     }
     Ok(())
 }
@@ -1729,6 +1765,7 @@ fn restore_tree<'a, B: StorageBackend>(
     links: &'a std::sync::Mutex<HashMap<(u64, u64), PathBuf>>,
     reporter: &'a Reporter,
     options: RestoreOptions,
+    progress: Option<RestoreProgressFn<'a>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         use futures::stream::{StreamExt, TryStreamExt};
@@ -1744,7 +1781,16 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(repo, subtree, path.clone(), links, reporter, options).await?;
+                        restore_tree(
+                            repo,
+                            subtree,
+                            path.clone(),
+                            links,
+                            reporter,
+                            options,
+                            progress,
+                        )
+                        .await?;
                     }
                     apply_metadata(&path, node, reporter);
                 }
@@ -1787,7 +1833,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 .map(|node| {
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
-                        restore_file(repo, &path, node, reporter, options).await?;
+                        restore_file(repo, &path, node, reporter, options, progress).await?;
                         Ok::<(), EngineError>(())
                     }
                 }),
@@ -1824,7 +1870,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     }
                 }
                 None => {
-                    restore_file(repo, &path, node, reporter, options).await?;
+                    restore_file(repo, &path, node, reporter, options, progress).await?;
                 }
             }
         }
@@ -3171,6 +3217,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_reports_per_file_progress() {
+        use std::sync::Mutex;
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b"), b"bravo").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        // A fresh restore reports every file (directories are not reported).
+        let out = tempfile::tempdir().unwrap();
+        let restored = Mutex::new(Vec::new());
+        let report = |p: &Path| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            restored.lock().unwrap().push(name);
+        };
+        restore_with(
+            &repo,
+            &snap,
+            None,
+            out.path(),
+            RestoreOptions::default(),
+            Some(&report),
+        )
+        .await
+        .unwrap();
+        let mut got = restored.into_inner().unwrap();
+        got.sort();
+        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
+
+        // A resumed restore reports nothing — every file already matched.
+        let again = Mutex::new(0u32);
+        let report2 = |_: &Path| *again.lock().unwrap() += 1;
+        let opts = RestoreOptions {
+            skip_existing: true,
+            verify: false,
+        };
+        restore_with(&repo, &snap, None, out.path(), opts, Some(&report2))
+            .await
+            .unwrap();
+        assert_eq!(
+            again.into_inner().unwrap(),
+            0,
+            "skipped files aren't reported"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_skip_existing_leaves_matching_files() {
         let src = tempfile::tempdir().unwrap();
         std::fs::write(src.path().join("f"), b"hello").unwrap();
@@ -3196,7 +3292,7 @@ mod tests {
             skip_existing: true,
             verify: false,
         };
-        restore_with(&repo, &snap, None, out.path(), opts)
+        restore_with(&repo, &snap, None, out.path(), opts, None)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"world");

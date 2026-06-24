@@ -82,6 +82,9 @@ enum Command {
         /// After writing each file, re-read it and verify it matches the snapshot.
         #[arg(long)]
         verify: bool,
+        /// Print each file as it is restored.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Copy snapshots to another repository, re-encrypting under its keys.
     Copy {
@@ -446,6 +449,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             dry_run,
             skip_existing,
             verify,
+            verbose,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
@@ -479,12 +483,19 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     skip_existing,
                     verify,
                 };
+                // With --verbose, print each file as it is restored (to stderr,
+                // like `backup -v`, leaving stdout for the completion line).
+                let report_file = |path: &std::path::Path| eprintln!("{}", path.display());
+                let progress: Option<sluice_engine::RestoreProgressFn> =
+                    if verbose { Some(&report_file) } else { None };
                 let mut report = RestoreReport::default();
                 if paths.is_empty() {
-                    report = restore_with(&repository, &id, None, &target, options).await?;
+                    report =
+                        restore_with(&repository, &id, None, &target, options, progress).await?;
                 } else {
                     for p in &paths {
-                        let r = restore_with(&repository, &id, Some(p), &target, options).await?;
+                        let r = restore_with(&repository, &id, Some(p), &target, options, progress)
+                            .await?;
                         report.warnings += r.warnings;
                         report.messages.extend(r.messages);
                     }
