@@ -4,7 +4,7 @@
 //! and open an encrypted repository and to read and write content-addressed,
 //! deduplicated, encrypted blobs (see `DESIGN.md` §3, §5.2, §5.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use sluice_chunk::{Chunker, ChunkerParams, Gear};
@@ -218,6 +218,53 @@ impl<B: StorageBackend> Repository<B> {
             self.index.insert(entry.id, (pack_id, *entry));
         }
         Ok(())
+    }
+
+    /// Sweep stored packs against the `live` blob set: delete packs whose blobs
+    /// are all unreferenced and, unless `dry_run`, repack packs that are only
+    /// partially live (copying the live blobs into a fresh pack and dropping the
+    /// old) to reclaim the dead blobs' space. Updates the in-memory index.
+    /// Returns the number of fully-dead packs found.
+    pub async fn sweep(&mut self, live: &HashSet<Id>, dry_run: bool) -> Result<usize> {
+        let mut dead = 0;
+        for pack_id in self.backend.list(FileType::Pack).await? {
+            let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
+            let reader = PackReader::parse(&bytes)?;
+            let entries: Vec<BlobEntry> = reader.entries().to_vec();
+            let live_count = entries.iter().filter(|e| live.contains(&e.id)).count();
+
+            if live_count == 0 {
+                dead += 1;
+                if !dry_run {
+                    self.backend.remove(FileType::Pack, &pack_id).await?;
+                    for entry in &entries {
+                        self.index.remove(&entry.id);
+                    }
+                }
+            } else if live_count < entries.len() && !dry_run {
+                // Partially live: repack the live blobs, then drop the old pack.
+                let mut builder = PackBuilder::new();
+                for entry in &entries {
+                    if live.contains(&entry.id) {
+                        let sealed = reader.blob(&entry.id).expect("entry in its own pack");
+                        builder.add(entry.id, entry.kind, sealed);
+                    }
+                }
+                let (new_bytes, directory) = builder.finish()?;
+                let new_pack_id = hash(&new_bytes);
+                self.backend
+                    .put(FileType::Pack, &new_pack_id, new_bytes.into())
+                    .await?;
+                self.backend.remove(FileType::Pack, &pack_id).await?;
+                for entry in &entries {
+                    self.index.remove(&entry.id);
+                }
+                for entry in &directory {
+                    self.index.insert(entry.id, (new_pack_id, *entry));
+                }
+            }
+        }
+        Ok(dead)
     }
 
     /// Load and decrypt the blob with the given id.

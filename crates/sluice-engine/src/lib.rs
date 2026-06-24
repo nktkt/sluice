@@ -18,7 +18,7 @@ use sluice_core::{
     EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
 };
 use sluice_repo::{RepoError, Repository};
-use sluice_store::{FileType, PackReader, StorageBackend};
+use sluice_store::{FileType, StorageBackend};
 
 /// Errors from engine operations.
 #[derive(Debug, thiserror::Error)]
@@ -282,39 +282,15 @@ pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -
 /// Delete packs no longer referenced by any surviving snapshot, returning the
 /// number removed (mark-and-sweep GC; see `DESIGN.md` §8). With `dry_run`, count
 /// the packs that would be removed without deleting anything.
-pub async fn prune<B: StorageBackend>(repo: &Repository<B>, dry_run: bool) -> Result<usize> {
+pub async fn prune<B: StorageBackend>(repo: &mut Repository<B>, dry_run: bool) -> Result<usize> {
     // MARK: collect every blob reachable from a surviving snapshot.
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
         let snap = repo.load_snapshot(&snapshot).await?;
         mark_tree(repo, snap.tree, &mut live).await?;
     }
-
-    // SWEEP: delete any pack whose blobs are all unreferenced.
-    let mut removed = 0;
-    for pack_id in repo
-        .backend()
-        .list(FileType::Pack)
-        .await
-        .map_err(RepoError::from)?
-    {
-        let bytes = repo
-            .backend()
-            .get(FileType::Pack, &pack_id)
-            .await
-            .map_err(RepoError::from)?;
-        let reader = PackReader::parse(&bytes).map_err(RepoError::from)?;
-        if !reader.entries().iter().any(|e| live.contains(&e.id)) {
-            if !dry_run {
-                repo.backend()
-                    .remove(FileType::Pack, &pack_id)
-                    .await
-                    .map_err(RepoError::from)?;
-            }
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    // SWEEP + repack, updating the repository's index in place.
+    Ok(repo.sweep(&live, dry_run).await?)
 }
 
 /// Mark the tree `tree_id` and everything it references as live.
@@ -908,7 +884,7 @@ mod tests {
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
         forget(&repo, &snap1).await.unwrap();
-        let removed = prune(&repo, false).await.unwrap();
+        let removed = prune(&mut repo, false).await.unwrap();
         let after = repo.backend().list(FileType::Pack).await.unwrap().len();
 
         assert!(removed >= 1, "expected to reclaim packs");
@@ -1166,7 +1142,7 @@ mod tests {
         // Forget the old snapshot and prune; the survivor must stay intact —
         // including "b", whose chunk is still referenced by snap2.
         forget(&repo, &snap1).await.unwrap();
-        prune(&repo, false).await.unwrap();
+        prune(&mut repo, false).await.unwrap();
         assert!(verify(&repo).await.is_ok());
 
         let out2 = tempfile::tempdir().unwrap();
@@ -1317,7 +1293,7 @@ mod tests {
         forget(&repo, &snap1).await.unwrap();
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
-        let would = prune(&repo, true).await.unwrap();
+        let would = prune(&mut repo, true).await.unwrap();
         assert!(would >= 1, "dry-run should find packs to prune");
         assert_eq!(
             repo.backend().list(FileType::Pack).await.unwrap().len(),
@@ -1325,8 +1301,54 @@ mod tests {
             "dry-run must not delete anything"
         );
 
-        let removed = prune(&repo, false).await.unwrap();
+        let removed = prune(&mut repo, false).await.unwrap();
         assert_eq!(removed, would);
         assert!(repo.backend().list(FileType::Pack).await.unwrap().len() < before);
+    }
+
+    async fn total_pack_bytes<B: StorageBackend>(repo: &Repository<B>) -> u64 {
+        let mut total = 0;
+        for pid in repo.backend().list(FileType::Pack).await.unwrap() {
+            total += repo.backend().size(FileType::Pack, &pid).await.unwrap();
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn prune_repacks_partially_dead_packs() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), vec![1u8; 3000]).unwrap();
+        std::fs::write(src.path().join("b"), vec![2u8; 3000]).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // snap1: a and b share one accumulated pack.
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+        // Change a; b is untouched, so its chunk stays referenced via dedup.
+        std::fs::write(src.path().join("a"), vec![9u8; 3000]).unwrap();
+        let snap2 = backup(&mut repo, src.path()).await.unwrap();
+
+        forget(&repo, &snap1).await.unwrap();
+        let before = total_pack_bytes(&repo).await;
+        prune(&mut repo, false).await.unwrap();
+        let after = total_pack_bytes(&repo).await;
+        // snap1's pack was partially live (b) -> repacked, reclaiming a-v1 + tree1.
+        assert!(
+            after < before,
+            "repack should reclaim space: {before} -> {after}"
+        );
+
+        // The survivor still verifies and restores fully (b moved to a new pack).
+        assert!(verify(&repo).await.is_ok());
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap2, dst.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(dst.path().join("a")).unwrap(),
+            vec![9u8; 3000]
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("b")).unwrap(),
+            vec![2u8; 3000]
+        );
     }
 }

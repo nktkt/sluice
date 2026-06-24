@@ -244,8 +244,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         Command::Prune { repo, dry_run } => {
-            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let count = prune(&repository, dry_run).await?;
+            let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let count = prune(&mut repository, dry_run).await?;
             if dry_run {
                 println!("would prune {count} packs");
             } else {
