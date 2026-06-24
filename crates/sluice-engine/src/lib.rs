@@ -7,6 +7,7 @@
 //! uses blocking `std::fs` for now; offloading to a thread pool is a later
 //! refinement.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -45,8 +46,14 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
 }
 
 /// Back up the directory `source` into `repo`, returning the new snapshot id.
+///
+/// Incremental: the most recent snapshot is used as the parent, and files whose
+/// size and mtime are unchanged reuse their stored chunks without being re-read.
 pub async fn backup<B: StorageBackend>(repo: &mut Repository<B>, source: &Path) -> Result<Id> {
-    let root_tree = backup_dir(repo, source.to_path_buf()).await?;
+    let parent = latest_snapshot(repo).await?;
+    let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
+    let mut summary = SnapshotStats::default();
+    let root_tree = backup_dir(repo, source.to_path_buf(), parent_tree, &mut summary).await?;
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
         time_ns: now_ns(),
@@ -57,11 +64,28 @@ pub async fn backup<B: StorageBackend>(repo: &mut Repository<B>, source: &Path) 
         uid: 0,
         gid: 0,
         tags: Vec::new(),
-        parent: None,
+        parent: parent.map(|(id, _)| id),
         program_version: env!("CARGO_PKG_VERSION").to_string(),
-        summary: SnapshotStats::default(),
+        summary,
     };
     Ok(repo.commit_snapshot(&snapshot).await?)
+}
+
+/// Find the most recent snapshot (by timestamp), if any.
+async fn latest_snapshot<B: StorageBackend>(
+    repo: &Repository<B>,
+) -> Result<Option<(Id, Snapshot)>> {
+    let mut best: Option<(Id, Snapshot)> = None;
+    for id in repo.list_snapshots().await? {
+        let snap = repo.load_snapshot(&id).await?;
+        if best
+            .as_ref()
+            .map_or(true, |(_, b)| snap.time_ns > b.time_ns)
+        {
+            best = Some((id, snap));
+        }
+    }
+    Ok(best)
 }
 
 /// Restore the snapshot `snapshot` from `repo` into the directory `target`.
@@ -131,12 +155,29 @@ fn verify_tree<'a, B: StorageBackend>(
     })
 }
 
-/// Recursively back up `dir`, returning the id of its `Tree` object.
+/// Recursively back up `dir`, returning the id of its `Tree` object. `parent`
+/// is the id of the same directory's tree in the previous snapshot, if any, and
+/// `stats` accumulates new/changed/unmodified counters.
 fn backup_dir<'a, B: StorageBackend>(
     repo: &'a mut Repository<B>,
     dir: PathBuf,
+    parent: Option<Id>,
+    stats: &'a mut SnapshotStats,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
+        // Load the parent directory's entries for incremental reuse.
+        let parent_nodes: HashMap<Vec<u8>, Node> = match parent {
+            Some(tree_id) => match repo.load_tree(&tree_id).await {
+                Ok(tree) => tree
+                    .nodes
+                    .into_iter()
+                    .map(|n| (n.name.clone(), n))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+
         let mut entries: Vec<_> = std::fs::read_dir(&dir)
             .map_err(|e| io_err(&dir, e))?
             .collect::<std::io::Result<Vec<_>>>()
@@ -150,16 +191,21 @@ fn backup_dir<'a, B: StorageBackend>(
             let meta = std::fs::symlink_metadata(&path).map_err(|e| io_err(&path, e))?;
             let name = entry.file_name().as_encoded_bytes().to_vec();
             let kind = meta.file_type();
+            let mtime = mtime_ns(&meta);
 
             let node = if kind.is_dir() {
-                let subtree = backup_dir(repo, path.clone()).await?;
+                let parent_sub = parent_nodes
+                    .get(&name)
+                    .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
+                let subtree = backup_dir(repo, path.clone(), parent_sub, stats).await?;
+                stats.dirs += 1;
                 Node {
                     name,
                     kind: EntryKind::Dir,
                     mode: mode_of(&meta),
                     uid: 0,
                     gid: 0,
-                    mtime_ns: mtime_ns(&meta),
+                    mtime_ns: mtime,
                     ctime_ns: 0,
                     size: 0,
                     content: Vec::new(),
@@ -167,17 +213,36 @@ fn backup_dir<'a, B: StorageBackend>(
                     link_target: None,
                 }
             } else if kind.is_file() {
-                let data = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
-                let content = repo.save_file(&data).await?;
+                // Reuse the parent's chunks if size and mtime are unchanged.
+                let reuse = parent_nodes.get(&name).and_then(|prev| {
+                    (prev.kind == EntryKind::File
+                        && prev.size == meta.len()
+                        && prev.mtime_ns == mtime)
+                        .then(|| prev.content.clone())
+                });
+                let (content, size) = if let Some(content) = reuse {
+                    stats.files_unmodified += 1;
+                    (content, meta.len())
+                } else {
+                    if parent_nodes.contains_key(&name) {
+                        stats.files_changed += 1;
+                    } else {
+                        stats.files_new += 1;
+                    }
+                    let data = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
+                    let content = repo.save_file(&data).await?;
+                    (content, data.len() as u64)
+                };
+                stats.bytes_processed += size;
                 Node {
                     name,
                     kind: EntryKind::File,
                     mode: mode_of(&meta),
                     uid: 0,
                     gid: 0,
-                    mtime_ns: mtime_ns(&meta),
+                    mtime_ns: mtime,
                     ctime_ns: 0,
-                    size: data.len() as u64,
+                    size,
                     content,
                     subtree: None,
                     link_target: None,
@@ -362,5 +427,45 @@ mod tests {
             .await
             .unwrap();
         assert!(verify(&repo).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn incremental_backup_skips_unchanged_files() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"unchanged data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let snap2 = backup(&mut repo, src.path()).await.unwrap();
+        let s = repo.load_snapshot(&snap2).await.unwrap();
+        assert_eq!(s.summary.files_unmodified, 1);
+        assert_eq!(s.summary.files_new, 0);
+        assert!(s.parent.is_some());
+    }
+
+    #[tokio::test]
+    async fn incremental_backup_detects_and_restores_changes() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f.txt");
+        std::fs::write(&f, b"v1").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        std::fs::write(&f, b"v2 with more content").unwrap();
+        let snap2 = backup(&mut repo, src.path()).await.unwrap();
+        let s = repo.load_snapshot(&snap2).await.unwrap();
+        assert_eq!(s.summary.files_changed, 1);
+        assert_eq!(s.summary.files_unmodified, 0);
+
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap2, dst.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(dst.path().join("f.txt")).unwrap(),
+            b"v2 with more content"
+        );
     }
 }
