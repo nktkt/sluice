@@ -116,3 +116,26 @@ fn backup_of_missing_source_reports_clearly() {
         .failure()
         .stderr(predicate::str::contains("not a directory"));
 }
+
+#[test]
+fn stats_reports_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hello").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    sluice()
+        .arg("stats")
+        .arg(&repo)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("snapshots:     1"))
+        .stdout(predicate::str::contains("packs:"));
+}

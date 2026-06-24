@@ -17,7 +17,7 @@ use sluice_engine::{
     prune, restore_subpath, verify,
 };
 use sluice_repo::Repository;
-use sluice_store::{LocalBackend, ObjectStoreBackend, StorageBackend};
+use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
 
 /// Encrypted, deduplicating backup & disaster-recovery tool.
 #[derive(Parser)]
@@ -117,6 +117,11 @@ enum Command {
     },
     /// Show repository metadata.
     Info {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
+    /// Show repository storage statistics.
+    Stats {
         /// Repository path or object-store URL.
         repo: String,
     },
@@ -289,6 +294,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
             );
             println!("pack target: {} bytes", config.pack_target);
             println!("snapshots:   {snapshots}");
+        }
+        Command::Stats { repo } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let packs = repository.backend().list(FileType::Pack).await?.len();
+            let snapshots = repository.list_snapshots().await?;
+            let mut logical = 0u64;
+            for id in &snapshots {
+                logical += repository.load_snapshot(id).await?.summary.bytes_processed;
+            }
+            println!("snapshots:     {}", snapshots.len());
+            println!("packs:         {packs}");
+            println!("logical bytes: {logical}");
         }
     }
     Ok(())
