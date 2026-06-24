@@ -621,4 +621,27 @@ mod tests {
         );
         assert_eq!(repo.load_blob(&id).await.unwrap(), data);
     }
+
+    #[tokio::test]
+    async fn blob_roundtrips_over_many_random_inputs() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let mut state = 0x1234_5678u64;
+        for _ in 0..200 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let len = (state % 5000) as usize;
+            let mut data = Vec::with_capacity(len);
+            for _ in 0..len {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                data.push((state >> 33) as u8);
+            }
+            let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
+            assert_eq!(repo.load_blob(&id).await.unwrap(), data);
+        }
+    }
 }
