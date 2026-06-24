@@ -18,8 +18,10 @@ use bytes::Bytes;
 use sluice_core::Id;
 
 mod local;
+mod objstore;
 mod pack;
 pub use local::LocalBackend;
+pub use objstore::ObjectStoreBackend;
 pub use pack::{BlobEntry, PackBuilder, PackReader};
 
 /// The category of object stored in a repository; determines its path prefix.
@@ -37,6 +39,18 @@ pub enum FileType {
     Snapshot,
     /// A lock object.
     Lock,
+}
+
+/// The repository subdirectory / object-path prefix for each file type.
+pub(crate) const fn type_dir(ty: FileType) -> &'static str {
+    match ty {
+        FileType::Config => "config",
+        FileType::Key => "keys",
+        FileType::Pack => "data",
+        FileType::Index => "index",
+        FileType::Snapshot => "snapshots",
+        FileType::Lock => "locks",
+    }
 }
 
 /// Errors produced by a [`StorageBackend`] or pack codec.

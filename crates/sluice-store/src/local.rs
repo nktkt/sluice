@@ -9,7 +9,7 @@ use sluice_core::Id;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use crate::{FileType, Result, StorageBackend, StoreError};
+use crate::{FileType, Result, StorageBackend, StoreError, type_dir};
 
 /// Every object category, used to pre-create the directory layout.
 const ALL_TYPES: [FileType; 6] = [
@@ -20,18 +20,6 @@ const ALL_TYPES: [FileType; 6] = [
     FileType::Snapshot,
     FileType::Lock,
 ];
-
-/// The subdirectory name for each object category.
-const fn type_dir(ty: FileType) -> &'static str {
-    match ty {
-        FileType::Config => "config",
-        FileType::Key => "keys",
-        FileType::Pack => "data",
-        FileType::Index => "index",
-        FileType::Snapshot => "snapshots",
-        FileType::Lock => "locks",
-    }
-}
 
 /// A [`StorageBackend`] backed by a local directory tree.
 ///
