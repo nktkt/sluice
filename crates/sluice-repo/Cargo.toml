@@ -9,3 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+sluice-core = { path = "../sluice-core" }
+sluice-crypto = { path = "../sluice-crypto" }
+sluice-store = { path = "../sluice-store" }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
