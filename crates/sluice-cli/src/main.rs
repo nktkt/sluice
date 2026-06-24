@@ -211,6 +211,35 @@ enum Command {
         #[command(subcommand)]
         action: KeyCmd,
     },
+    /// Print a decrypted repository object as JSON (inspection/debugging).
+    Cat {
+        #[command(subcommand)]
+        object: CatObject,
+    },
+}
+
+/// Sub-commands of `cat`.
+#[derive(Subcommand)]
+enum CatObject {
+    /// The repository configuration.
+    Config {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
+    /// A snapshot's full metadata.
+    Snapshot {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
+    },
+    /// A tree object's nodes.
+    Tree {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Tree object id (full hex, as shown by `cat snapshot`).
+        id: String,
+    },
 }
 
 /// Sub-commands of `key`.
@@ -732,6 +761,73 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 println!("changed passphrase; new key {id}");
             }
         },
+        Command::Cat { object } => {
+            let value = match object {
+                CatObject::Config { repo } => {
+                    let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                    let c = repository.config();
+                    serde_json::json!({
+                        "repo_id": c.repo_id.to_string(),
+                        "version": c.version,
+                        "cipher": format!("{:?}", c.cipher),
+                        "chunker": { "min": c.chunker.min, "avg": c.chunker.avg, "max": c.chunker.max },
+                        "pack_target": c.pack_target,
+                        "created_ns": c.created_ns,
+                    })
+                }
+                CatObject::Snapshot { repo, snapshot } => {
+                    let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                    let id = resolve_snapshot(&repository, &snapshot).await?;
+                    let s = repository.load_snapshot(&id).await?;
+                    serde_json::json!({
+                        "id": id.to_string(),
+                        "time_ns": s.time_ns,
+                        "tree": s.tree.to_string(),
+                        "paths": s.paths.iter().map(|p| String::from_utf8_lossy(p).into_owned()).collect::<Vec<_>>(),
+                        "hostname": s.hostname,
+                        "username": s.username,
+                        "uid": s.uid,
+                        "gid": s.gid,
+                        "tags": s.tags,
+                        "parent": s.parent.map(|p| p.to_string()),
+                        "program_version": s.program_version,
+                        "summary": {
+                            "files_new": s.summary.files_new,
+                            "files_changed": s.summary.files_changed,
+                            "files_unmodified": s.summary.files_unmodified,
+                            "dirs": s.summary.dirs,
+                            "bytes_processed": s.summary.bytes_processed,
+                            "bytes_added": s.summary.bytes_added,
+                        },
+                    })
+                }
+                CatObject::Tree { repo, id } => {
+                    let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                    let tid: Id = id.parse().map_err(|_| "invalid tree id")?;
+                    let tree = repository.load_tree(&tid).await?;
+                    let nodes: Vec<serde_json::Value> = tree
+                        .nodes
+                        .iter()
+                        .map(|n| {
+                            serde_json::json!({
+                                "name": String::from_utf8_lossy(&n.name).into_owned(),
+                                "kind": kind_str(n.kind),
+                                "mode": n.mode,
+                                "uid": n.uid,
+                                "gid": n.gid,
+                                "mtime_ns": n.mtime_ns,
+                                "size": n.size,
+                                "content": n.content.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
+                                "subtree": n.subtree.map(|i| i.to_string()),
+                                "link_target": n.link_target.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()),
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({ "nodes": nodes })
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
     }
     Ok(())
 }

@@ -222,6 +222,77 @@ fn snapshots_and_stats_emit_json() {
 }
 
 #[test]
+fn cat_emits_config_snapshot_and_tree_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"data").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .arg("--tag")
+        .arg("daily")
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let parse = |a: assert_cmd::assert::Assert| -> serde_json::Value {
+        serde_json::from_str(&String::from_utf8(a.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON")
+    };
+
+    // cat config
+    let v = parse(
+        sluice()
+            .arg("cat")
+            .arg("config")
+            .arg(&repo)
+            .assert()
+            .success(),
+    );
+    assert_eq!(v["repo_id"].as_str().unwrap().len(), 64);
+    assert_eq!(v["cipher"], "XChaCha20Poly1305");
+    assert!(v["chunker"]["min"].is_number());
+
+    // cat snapshot
+    let v = parse(
+        sluice()
+            .arg("cat")
+            .arg("snapshot")
+            .arg(&repo)
+            .arg(&snap[..12])
+            .assert()
+            .success(),
+    );
+    assert_eq!(v["tags"][0], "daily");
+    let tree_id = v["tree"].as_str().unwrap().to_string();
+    assert_eq!(tree_id.len(), 64);
+
+    // cat tree (the id from the snapshot above)
+    let v = parse(
+        sluice()
+            .arg("cat")
+            .arg("tree")
+            .arg(&repo)
+            .arg(&tree_id)
+            .assert()
+            .success(),
+    );
+    let nodes = v["nodes"].as_array().unwrap();
+    assert!(
+        nodes
+            .iter()
+            .any(|n| n["name"] == "f" && n["kind"] == "file")
+    );
+}
+
+#[test]
 fn forget_and_prune_emit_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
