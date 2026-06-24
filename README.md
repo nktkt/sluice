@@ -8,9 +8,10 @@ directories, and symlinks, with mode and mtime preserved — to a local path **o
 any S3-compatible object store**. It offers point-in-time snapshots (of one or
 many source directories), full and partial restore, two tiers of integrity
 checking, restic-style retention with space-reclaiming prune, tag editing and
-cross-snapshot search, advisory locking for safe concurrent use, multiple
-passphrases, a persisted index for fast repository open, machine-readable JSON
-output, and stable exit codes. Backed by 144 tests across the workspace. The full
+cross-snapshot search, cross-repository copy (re-encrypting under the target's
+keys), advisory locking for safe concurrent use, multiple passphrases, a
+persisted index for fast repository open, machine-readable JSON output, and
+stable exit codes. Backed by 149 tests across the workspace. The full
 architecture is in [`DESIGN.md`](./DESIGN.md). **The on-disk format is not yet
 frozen; do not use it for data you cannot afford to lose.**
 
@@ -56,13 +57,15 @@ sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
 sluice tag       ./repo <snapshot> --add keep --remove daily   # edit a snapshot's tags
 sluice info      ./repo                         # repository metadata
 sluice stats     ./repo                         # logical vs stored bytes, dedup %
+sluice cat       ./repo snapshot <id>           # decrypted object as JSON (config|snapshot|tree)
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path sub/dir   # restore a subtree only
 ```
 
-`snapshots`, `stats`, `ls`, `find`, `prune`, and `forget` accept `--json` for
-machine-readable output, and commands return stable exit codes (10 repo not
-found, 11 wrong passphrase, 12 lock held, 13 corruption) for scripting.
+The listing and result commands (`snapshots`, `stats`, `ls`, `find`, `diff`,
+`prune`, `forget`) accept `--json` for machine-readable output, and commands
+return stable exit codes (10 repo not found, 11 wrong passphrase, 12 lock held,
+13 corruption) for scripting.
 
 ### Integrity
 
@@ -81,6 +84,7 @@ which authenticates all stored data. Both exit non-zero on any integrity failure
 # Keep rules combine as a union (restic semantics); a snapshot kept by any rule survives.
 sluice forget ./repo --keep-last 7 --keep-daily 14 --keep-weekly 8 \
                      --keep-monthly 12 --keep-yearly 5
+sluice forget ./repo --keep-last 7 --keep-tag important   # protect tagged snapshots
 sluice forget ./repo --tag daily          # or forget by tag
 sluice forget ./repo <snapshot>           # or a single snapshot
 sluice forget ./repo --keep-last 7 --dry-run   # preview without removing
@@ -110,6 +114,20 @@ sluice key remove ./repo <key-id>         # remove a key (the last one is refuse
 sluice unlock        ./repo   # clear advisory locks left by an interrupted run
 sluice rebuild-index ./repo   # rescan packs to repair a damaged/stale index
 ```
+
+### Replicate to another repository
+
+`copy` re-encrypts a snapshot under the destination's keys, so the two
+repositories can use different passphrases — useful for migrating or replicating
+to an offsite repo, or rotating keys by re-encryption.
+
+```sh
+sluice copy ./repo s3://my-bucket/backups <snapshot>   # one snapshot
+sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempotent)
+```
+
+The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
+source's). Re-running copies only what is missing.
 
 ### Offsite: object storage
 
@@ -154,8 +172,11 @@ blob is authenticated, a single flipped byte in a stored pack is caught by `veri
   source directories, full or partial restore, fast structural `check` and
   thorough read-data `verify`, snapshot diffs, cross-snapshot `find`, and `tag`
   editing.
-- **Retention** — restic-style keep-last/daily/weekly/monthly/yearly `forget`
-  (with `--dry-run` and `--prune`) plus mark-and-sweep `prune` with repacking.
+- **Retention** — restic-style keep-last/daily/weekly/monthly/yearly plus
+  keep-tag `forget` (with `--dry-run` and `--prune`) plus mark-and-sweep `prune`
+  with repacking.
+- **Replication** — `copy` a snapshot (or all) to another repository,
+  re-encrypting under its keys, even across different passphrases.
 - **Fast open** — a persisted per-pack index avoids rescanning storage on open;
   `rebuild-index` repairs it.
 - **Scriptable** — machine-readable `--json` output and stable exit codes.
@@ -201,7 +222,7 @@ concurrency model, CLI surface, and threat model — lives in
 - **M6** — operations: advisory locking (`unlock`), multiple passphrases
   (`key add`/`list`/`remove`/`passwd`), `rebuild-index` — ✅
 - **M7** — UX & scripting: multi-source backups, `backup --dry-run`, `find`,
-  `tag`, `--json` output, stable exit codes — ✅
+  `tag`, `--keep-tag`, `cat`, `copy`, `--json` output, stable exit codes — ✅
 - **M8** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
 
 ## Building
@@ -212,7 +233,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 144 tests
+cargo test     # 149 tests
 ```
 
 ## Caveats
