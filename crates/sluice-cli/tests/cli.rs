@@ -269,6 +269,49 @@ fn backup_exclude_from_file() {
 }
 
 #[test]
+fn restore_multiple_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::create_dir_all(src.join("other")).unwrap();
+    std::fs::write(src.join("docs/memo"), b"m").unwrap();
+    std::fs::write(src.join("config.txt"), b"c").unwrap();
+    std::fs::write(src.join("other/z"), b"z").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Restore two specific paths; the third (other/) is left out.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .arg("--path")
+        .arg("docs")
+        .arg("--path")
+        .arg("config.txt")
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("docs/memo")).unwrap(), b"m");
+    assert_eq!(std::fs::read(out.join("config.txt")).unwrap(), b"c");
+    assert!(
+        !out.join("other").exists(),
+        "unrequested paths must not be restored"
+    );
+}
+
+#[test]
 fn restore_dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -66,9 +66,9 @@ enum Command {
         snapshot: String,
         /// Directory to restore into.
         target: PathBuf,
-        /// Restore only this path within the snapshot.
-        #[arg(long)]
-        path: Option<String>,
+        /// Restore only this path within the snapshot (repeatable; omit for all).
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<String>,
         /// Report what would be restored (file count and bytes) without writing.
         #[arg(long)]
         dry_run: bool,
@@ -402,17 +402,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
             repo,
             snapshot,
             target,
-            path,
+            paths,
             dry_run,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
             if dry_run {
                 let mut entries = list_files(&repository, &id).await?;
-                if let Some(p) = &path {
-                    let p = p.trim_matches('/');
-                    let prefix = format!("{p}/");
-                    entries.retain(|e| e.path == p || e.path.starts_with(&prefix));
+                if !paths.is_empty() {
+                    // Keep entries under any of the requested paths.
+                    let bounds: Vec<(String, String)> = paths
+                        .iter()
+                        .map(|p| {
+                            let p = p.trim_matches('/').to_string();
+                            let prefix = format!("{p}/");
+                            (p, prefix)
+                        })
+                        .collect();
+                    entries.retain(|e| {
+                        bounds
+                            .iter()
+                            .any(|(p, prefix)| e.path == *p || e.path.starts_with(prefix))
+                    });
                 }
                 let files = entries.iter().filter(|e| e.kind == EntryKind::File);
                 let count = files.clone().count();
@@ -422,7 +433,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     target.display()
                 );
             } else {
-                restore_subpath(&repository, &id, path.as_deref(), &target).await?;
+                if paths.is_empty() {
+                    restore_subpath(&repository, &id, None, &target).await?;
+                } else {
+                    for p in &paths {
+                        restore_subpath(&repository, &id, Some(p), &target).await?;
+                    }
+                }
                 println!("restored {id} into {}", target.display());
             }
         }
