@@ -163,6 +163,10 @@ enum Command {
         /// Show what would be reclaimed without deleting anything.
         #[arg(long)]
         dry_run: bool,
+        /// Tolerate up to this percent dead data per pack: don't repack packs at
+        /// or below the threshold (0 = repack every partially-dead pack).
+        #[arg(long = "max-unused", value_name = "PERCENT", default_value_t = 0)]
+        max_unused: u8,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -599,9 +603,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 // would-be-forgotten ones as excluded to preview the reclamation.
                 let report = if dry_run {
                     let excluded: HashSet<Id> = forgotten.iter().copied().collect();
-                    prune_excluding(&mut repository, true, &excluded).await?
+                    prune_excluding(&mut repository, true, &excluded, 0).await?
                 } else {
-                    prune(&mut repository, false).await?
+                    prune(&mut repository, false, 0).await?
                 };
                 if !json {
                     let pverb = if dry_run {
@@ -637,10 +641,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Prune {
             repo,
             dry_run,
+            max_unused,
             json,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let report = prune(&mut repository, dry_run).await?;
+            let report = prune(&mut repository, dry_run, max_unused).await?;
             if json {
                 println!(
                     "{}",

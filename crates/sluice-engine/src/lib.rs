@@ -860,8 +860,9 @@ pub async fn forget_tagged<B: StorageBackend>(
 pub async fn prune<B: StorageBackend>(
     repo: &mut Repository<B>,
     dry_run: bool,
+    max_unused: u8,
 ) -> Result<PruneReport> {
-    prune_excluding(repo, dry_run, &HashSet::new()).await
+    prune_excluding(repo, dry_run, &HashSet::new(), max_unused).await
 }
 
 /// Like [`prune`], but treat the snapshots in `excluded` as already gone — their
@@ -871,14 +872,15 @@ pub async fn prune_excluding<B: StorageBackend>(
     repo: &mut Repository<B>,
     dry_run: bool,
     excluded: &HashSet<Id>,
+    max_unused: u8,
 ) -> Result<PruneReport> {
     // A dry run only reads, so it needs no lock; a real prune takes the exclusive
     // lock that guards deletion against concurrent operations (`DESIGN.md` §8).
     if dry_run {
-        return prune_marked(repo, true, excluded).await;
+        return prune_marked(repo, true, excluded, max_unused).await;
     }
     let lock = repo.acquire_lock(true).await?;
-    let result = prune_marked(repo, false, excluded).await;
+    let result = prune_marked(repo, false, excluded, max_unused).await;
     let _ = repo.release_lock(&lock).await;
     result
 }
@@ -889,6 +891,7 @@ async fn prune_marked<B: StorageBackend>(
     repo: &mut Repository<B>,
     dry_run: bool,
     excluded: &HashSet<Id>,
+    max_unused: u8,
 ) -> Result<PruneReport> {
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
@@ -898,7 +901,7 @@ async fn prune_marked<B: StorageBackend>(
         let snap = repo.load_snapshot(&snapshot).await?;
         mark_tree(repo, snap.tree, &mut live).await?;
     }
-    Ok(repo.sweep(&live, dry_run).await?)
+    Ok(repo.sweep(&live, dry_run, max_unused).await?)
 }
 
 /// Repair the repository's index segments by rescanning packs (see
@@ -1554,7 +1557,7 @@ mod tests {
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
         forget(&repo, &snap1).await.unwrap();
-        let report = prune(&mut repo, false).await.unwrap();
+        let report = prune(&mut repo, false, 0).await.unwrap();
         let after = repo.backend().list(FileType::Pack).await.unwrap().len();
 
         assert!(report.deleted >= 1, "expected to reclaim packs");
@@ -2106,7 +2109,7 @@ mod tests {
         // Forget the old snapshot and prune; the survivor must stay intact —
         // including "b", whose chunk is still referenced by snap2.
         forget(&repo, &snap1).await.unwrap();
-        prune(&mut repo, false).await.unwrap();
+        prune(&mut repo, false, 0).await.unwrap();
         assert!(verify(&repo).await.is_ok());
 
         let out2 = tempfile::tempdir().unwrap();
@@ -2257,7 +2260,7 @@ mod tests {
         forget(&repo, &snap1).await.unwrap();
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
-        let would = prune(&mut repo, true).await.unwrap();
+        let would = prune(&mut repo, true, 0).await.unwrap();
         assert!(would.deleted >= 1, "dry-run should find packs to prune");
         assert_eq!(
             repo.backend().list(FileType::Pack).await.unwrap().len(),
@@ -2265,7 +2268,7 @@ mod tests {
             "dry-run must not delete anything"
         );
 
-        let removed = prune(&mut repo, false).await.unwrap();
+        let removed = prune(&mut repo, false, 0).await.unwrap();
         // A dry run is an exact preview: same deleted/repacked/reclaimed counts.
         assert_eq!(removed, would);
         assert!(repo.backend().list(FileType::Pack).await.unwrap().len() < before);
@@ -2295,7 +2298,7 @@ mod tests {
 
         forget(&repo, &snap1).await.unwrap();
         let before = total_pack_bytes(&repo).await;
-        let report = prune(&mut repo, false).await.unwrap();
+        let report = prune(&mut repo, false, 0).await.unwrap();
         let after = total_pack_bytes(&repo).await;
         // snap1's pack was partially live (b) -> repacked, reclaiming a-v1 + tree1.
         assert!(
@@ -2334,7 +2337,9 @@ mod tests {
 
         // Excluding snap1 (still present) previews reclaiming its now-dead data.
         let excluded = HashSet::from([snap1]);
-        let report = prune_excluding(&mut repo, true, &excluded).await.unwrap();
+        let report = prune_excluding(&mut repo, true, &excluded, 0)
+            .await
+            .unwrap();
         assert!(
             report.reclaimed_bytes > 0,
             "should preview reclaimable bytes"
@@ -2344,7 +2349,7 @@ mod tests {
         assert!(verify(&repo).await.is_ok());
 
         // A plain prune (excluding nothing) finds nothing dead yet.
-        let none = prune(&mut repo, true).await.unwrap();
+        let none = prune(&mut repo, true, 0).await.unwrap();
         assert_eq!(none.reclaimed_bytes, 0);
     }
 
@@ -2359,14 +2364,47 @@ mod tests {
 
         // A concurrent operation holds a (shared) lock.
         let held = repo.acquire_lock(false).await.unwrap();
-        assert!(prune(&mut repo, false).await.is_err());
+        assert!(prune(&mut repo, false, 0).await.is_err());
         // A dry run takes no lock, so it still works.
-        assert!(prune(&mut repo, true).await.is_ok());
+        assert!(prune(&mut repo, true, 0).await.is_ok());
 
         // Once released, prune proceeds and releases its own lock afterwards.
         repo.release_lock(&held).await.unwrap();
-        assert!(prune(&mut repo, false).await.is_ok());
+        assert!(prune(&mut repo, false, 0).await.is_ok());
         assert!(repo.list_locks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_max_unused_skips_low_waste_packs() {
+        let src = tempfile::tempdir().unwrap();
+        // A large *incompressible* file (so its stored size dominates the pack),
+        // reused across backups, plus a tiny one.
+        let mut big = vec![0u8; 200_000];
+        let mut state = 0x1234_5678u32;
+        for b in big.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+        }
+        std::fs::write(src.path().join("big"), &big).unwrap();
+        std::fs::write(src.path().join("small"), b"v1").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+        std::fs::write(src.path().join("small"), b"v2").unwrap(); // change only the tiny file
+        backup(&mut repo, src.path()).await.unwrap();
+        forget(&repo, &snap1).await.unwrap();
+
+        // snap1's pack is almost entirely the still-live big chunk; only small-v1
+        // and tree1 are dead (well under 50%), so a 50% tolerance leaves it.
+        let report = prune(&mut repo, false, 50).await.unwrap();
+        assert_eq!(report.repacked, 0, "low-waste pack should be left alone");
+        assert!(verify(&repo).await.is_ok());
+
+        // Zero tolerance repacks it.
+        let report = prune(&mut repo, false, 0).await.unwrap();
+        assert_eq!(report.repacked, 1);
+        assert!(verify(&repo).await.is_ok());
     }
 
     #[tokio::test]

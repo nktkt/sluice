@@ -284,7 +284,12 @@ impl<B: StorageBackend> Repository<B> {
     /// old) to reclaim the dead blobs' space. Updates the in-memory index.
     /// Returns the counts of packs deleted and repacked (a dry run reports the
     /// same counts it would act on without touching storage).
-    pub async fn sweep(&mut self, live: &HashSet<Id>, dry_run: bool) -> Result<PruneReport> {
+    pub async fn sweep(
+        &mut self,
+        live: &HashSet<Id>,
+        dry_run: bool,
+        max_unused: u8,
+    ) -> Result<PruneReport> {
         let mut report = PruneReport::default();
         for pack_id in self.backend.list(FileType::Pack).await? {
             let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
@@ -303,6 +308,24 @@ impl<B: StorageBackend> Repository<B> {
                     }
                 }
             } else if live_count < entries.len() {
+                // Tolerate up to `max_unused`% dead bytes: skip repacking packs at
+                // or below the threshold, leaving their waste in place.
+                let total_bytes: u64 = entries.iter().map(|e| u64::from(e.length)).sum();
+                let dead_bytes: u64 = entries
+                    .iter()
+                    .filter(|e| !live.contains(&e.id))
+                    .map(|e| u64::from(e.length))
+                    .sum();
+                let dead_pct = if total_bytes == 0 {
+                    0
+                } else {
+                    dead_bytes * 100 / total_bytes
+                };
+                // max_unused == 0 means "repack any partially-dead pack"; a
+                // positive threshold leaves packs at or below it alone.
+                if max_unused > 0 && dead_pct <= u64::from(max_unused) {
+                    continue;
+                }
                 report.repacked += 1;
                 // Build the repacked pack (in dry-run too, to measure the savings).
                 let mut builder = PackBuilder::new();
@@ -1034,7 +1057,7 @@ mod tests {
         repo.flush().await.unwrap();
 
         // Only `keep` is live, so the shared pack is repacked into a fresh one.
-        let report = repo.sweep(&HashSet::from([keep]), false).await.unwrap();
+        let report = repo.sweep(&HashSet::from([keep]), false, 0).await.unwrap();
         assert_eq!(report.repacked, 1);
 
         // The old pack's index segment is gone and the new pack's is present.
