@@ -75,6 +75,62 @@ pub async fn restore<B: StorageBackend>(
     restore_tree(repo, snap.tree, target.to_path_buf()).await
 }
 
+/// A summary produced by [`verify`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// Number of snapshots checked.
+    pub snapshots: usize,
+    /// Number of tree objects read and authenticated.
+    pub trees: usize,
+    /// Number of content (file chunk) blobs read and authenticated.
+    pub blobs: usize,
+}
+
+/// Verify every snapshot in `repo` by reading and authenticating all reachable
+/// trees and content blobs (a full read-data check; see `DESIGN.md` §5.7).
+///
+/// Returns the counts on success, or the first error identifying a missing or
+/// corrupt object.
+pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyReport> {
+    let mut report = VerifyReport::default();
+    for snapshot in repo.list_snapshots().await? {
+        let snap = repo.load_snapshot(&snapshot).await?;
+        report.snapshots += 1;
+        verify_tree(repo, snap.tree, &mut report).await?;
+    }
+    Ok(report)
+}
+
+/// Recursively read and authenticate the tree `tree_id` and its content blobs.
+fn verify_tree<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    report: &'a mut VerifyReport,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        report.trees += 1;
+        for node in &tree.nodes {
+            match node.kind {
+                EntryKind::Dir => {
+                    if let Some(subtree) = node.subtree {
+                        verify_tree(repo, subtree, report).await?;
+                    }
+                }
+                EntryKind::File => {
+                    for id in &node.content {
+                        // load_blob authenticates (AEAD) and decompresses.
+                        repo.load_blob(id).await?;
+                        report.blobs += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Recursively back up `dir`, returning the id of its `Tree` object.
 fn backup_dir<'a, B: StorageBackend>(
     repo: &'a mut Repository<B>,
@@ -271,5 +327,40 @@ mod tests {
             .unwrap();
         let snap = backup(&mut repo, src.path()).await.unwrap();
         assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap]);
+    }
+
+    #[tokio::test]
+    async fn verify_passes_after_backup() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha").unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/b"), vec![1u8; 5000]).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let report = verify(&repo).await.unwrap();
+        assert_eq!(report.snapshots, 1);
+        assert!(report.trees >= 2, "root + subdir trees");
+        assert!(report.blobs >= 2, "two file chunks");
+    }
+
+    #[tokio::test]
+    async fn verify_fails_when_a_pack_is_missing() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), vec![9u8; 5000]).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let packs = repo.backend().list(FileType::Pack).await.unwrap();
+        repo.backend()
+            .remove(FileType::Pack, &packs[0])
+            .await
+            .unwrap();
+        assert!(verify(&repo).await.is_err());
     }
 }

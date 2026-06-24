@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sluice_core::Id;
 use sluice_crypto::KdfParams;
-use sluice_engine::{backup, restore};
+use sluice_engine::{backup, restore, verify};
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
 
@@ -47,6 +47,11 @@ enum Command {
     },
     /// List the snapshots in a repository.
     Snapshots {
+        /// Path of the repository.
+        repo: PathBuf,
+    },
+    /// Verify the integrity of all snapshots.
+    Verify {
         /// Path of the repository.
         repo: PathBuf,
     },
@@ -89,6 +94,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             for id in repository.list_snapshots().await? {
                 println!("{id}");
             }
+        }
+        Command::Verify { repo } => {
+            let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
+            let report = verify(&repository).await?;
+            println!(
+                "ok: {} snapshots, {} trees, {} blobs verified",
+                report.snapshots, report.trees, report.blobs
+            );
         }
     }
     Ok(())
