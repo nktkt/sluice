@@ -43,6 +43,9 @@ enum Command {
         /// Glob of entry names to exclude (repeatable), e.g. --exclude '*.log'.
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
+        /// Tag to attach to the snapshot (repeatable).
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// Restore a snapshot into a target directory.
     Restore {
@@ -122,9 +125,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             repo,
             source,
             excludes,
+            tags,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let snapshot = backup_excluding(&mut repository, &source, &excludes).await?;
+            let snapshot = backup_excluding(&mut repository, &source, &excludes, &tags).await?;
             println!("{snapshot}");
             let s = repository.load_snapshot(&snapshot).await?.summary;
             eprintln!(
@@ -155,8 +159,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .map(|p| String::from_utf8_lossy(p).into_owned())
                     .collect();
                 let hex = id.to_string();
+                let tags = if snap.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", snap.tags.join(","))
+                };
                 println!(
-                    "{}  {}  {files} files  {}",
+                    "{}  {}  {files} files  {}{tags}",
                     &hex[..16],
                     format_utc(snap.time_ns),
                     paths.join(", ")

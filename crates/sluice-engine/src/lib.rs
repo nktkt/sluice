@@ -57,7 +57,7 @@ fn io_err(path: &Path, source: std::io::Error) -> EngineError {
 /// Incremental: the most recent snapshot is used as the parent, and files whose
 /// size and mtime are unchanged reuse their stored chunks without being re-read.
 pub async fn backup<B: StorageBackend>(repo: &mut Repository<B>, source: &Path) -> Result<Id> {
-    backup_excluding(repo, source, &[]).await
+    backup_excluding(repo, source, &[], &[]).await
 }
 
 /// Back up `source`, skipping entries whose name matches one of `exclude_globs`
@@ -66,6 +66,7 @@ pub async fn backup_excluding<B: StorageBackend>(
     repo: &mut Repository<B>,
     source: &Path,
     exclude_globs: &[String],
+    tags: &[String],
 ) -> Result<Id> {
     let excludes = build_globset(exclude_globs)?;
     let parent = latest_snapshot(repo).await?;
@@ -88,7 +89,7 @@ pub async fn backup_excluding<B: StorageBackend>(
         username: env_or("USER", "unknown"),
         uid: 0,
         gid: 0,
-        tags: Vec::new(),
+        tags: tags.to_vec(),
         parent: parent.map(|(id, _)| id),
         program_version: env!("CARGO_PKG_VERSION").to_string(),
         summary,
@@ -966,9 +967,14 @@ mod tests {
         let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
             .await
             .unwrap();
-        let snap = backup_excluding(&mut repo, src.path(), &["*.log".into(), "cache".into()])
-            .await
-            .unwrap();
+        let snap = backup_excluding(
+            &mut repo,
+            src.path(),
+            &["*.log".into(), "cache".into()],
+            &[],
+        )
+        .await
+        .unwrap();
 
         let paths: Vec<String> = list_files(&repo, &snap)
             .await
@@ -1029,5 +1035,26 @@ mod tests {
         assert_eq!(dump(&repo, &snap, "top").await.unwrap(), b"top-level");
         assert!(dump(&repo, &snap, "missing").await.is_err());
         assert!(dump(&repo, &snap, "sub").await.is_err()); // a directory, not a file
+    }
+
+    #[tokio::test]
+    async fn backup_records_tags() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"x").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup_excluding(
+            &mut repo,
+            src.path(),
+            &[],
+            &["weekly".into(), "important".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.load_snapshot(&snap).await.unwrap().tags,
+            vec!["weekly".to_string(), "important".to_string()]
+        );
     }
 }
