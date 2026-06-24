@@ -13,3 +13,10 @@ name = "sluice"
 path = "src/main.rs"
 
 [dependencies]
+sluice-core = { path = "../sluice-core" }
+sluice-crypto = { path = "../sluice-crypto" }
+sluice-engine = { path = "../sluice-engine" }
+sluice-repo = { path = "../sluice-repo" }
+sluice-store = { path = "../sluice-store" }
+clap = { workspace = true }
+tokio = { workspace = true }
