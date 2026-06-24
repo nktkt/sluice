@@ -99,7 +99,12 @@ pub struct Snapshot {
 }
 
 /// Summary counters describing a backup run.
+///
+/// `#[serde(default)]` lets a snapshot written by a future sluice — which may
+/// add more counters — still decode here, and lets an older snapshot decode in
+/// a future build, with any absent counter reading as zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SnapshotStats {
     /// Files seen for the first time.
     pub files_new: u64,
@@ -205,6 +210,117 @@ mod tests {
         let bytes = to_cbor(&snap).unwrap();
         let back: Snapshot = from_cbor(&bytes).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // A `Node`/`Tree` exactly as a pre-hardlink, pre-xattr sluice would have
+    // written it: no `dev`, `ino`, or `xattrs` fields. The current code must
+    // still decode such objects (so existing repositories keep opening), with
+    // the added fields falling back to their `#[serde(default)]` values. This
+    // pins down the `serde(default)` + ciborium back-compat guarantee that three
+    // format extensions have relied on.
+    #[test]
+    fn legacy_tree_without_new_node_fields_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct OldNode {
+            name: Vec<u8>,
+            kind: EntryKind,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            mtime_ns: i64,
+            ctime_ns: i64,
+            size: u64,
+            content: Vec<Id>,
+            subtree: Option<Id>,
+            link_target: Option<Vec<u8>>,
+        }
+        #[derive(serde::Serialize)]
+        struct OldTree {
+            version: u8,
+            nodes: Vec<OldNode>,
+        }
+
+        let old = OldTree {
+            version: TREE_VERSION,
+            nodes: vec![
+                OldNode {
+                    name: b"legacy.txt".to_vec(),
+                    kind: EntryKind::File,
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    mtime_ns: 1_700_000_000_000_000_000,
+                    ctime_ns: 0,
+                    size: 7,
+                    content: vec![Id::from_bytes([3u8; 32])],
+                    subtree: None,
+                    link_target: None,
+                },
+                OldNode {
+                    name: b"old-link".to_vec(),
+                    kind: EntryKind::Symlink,
+                    mode: 0o777,
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: 0,
+                    ctime_ns: 0,
+                    size: 0,
+                    content: Vec::new(),
+                    subtree: None,
+                    link_target: Some(b"legacy.txt".to_vec()),
+                },
+            ],
+        };
+
+        let bytes = to_cbor(&old).unwrap();
+        let tree: Tree = from_cbor(&bytes).expect("legacy tree must still decode");
+
+        assert_eq!(tree.version, TREE_VERSION);
+        assert_eq!(tree.nodes.len(), 2);
+
+        let file = &tree.nodes[0];
+        assert_eq!(file.name, b"legacy.txt");
+        assert_eq!(file.kind, EntryKind::File);
+        assert_eq!(file.uid, 1000);
+        assert_eq!(file.content, vec![Id::from_bytes([3u8; 32])]);
+        // The new fields fall back to their defaults.
+        assert_eq!(file.dev, 0);
+        assert_eq!(file.ino, 0);
+        assert!(file.xattrs.is_empty());
+
+        let link = &tree.nodes[1];
+        assert_eq!(link.kind, EntryKind::Symlink);
+        assert_eq!(link.link_target.as_deref(), Some(b"legacy.txt".as_slice()));
+        assert!(link.xattrs.is_empty());
+    }
+
+    // A `SnapshotStats` from a build that tracked fewer counters must still
+    // decode, with the absent counters reading as zero (guards the container
+    // `#[serde(default)]`).
+    #[test]
+    fn stats_with_fewer_counters_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct OldStats {
+            files_new: u64,
+            files_changed: u64,
+            files_unmodified: u64,
+            dirs: u64,
+        }
+
+        let bytes = to_cbor(&OldStats {
+            files_new: 5,
+            files_changed: 2,
+            files_unmodified: 9,
+            dirs: 3,
+        })
+        .unwrap();
+        let stats: SnapshotStats = from_cbor(&bytes).expect("legacy stats must still decode");
+
+        assert_eq!(stats.files_new, 5);
+        assert_eq!(stats.dirs, 3);
+        // Counters added later default to zero.
+        assert_eq!(stats.bytes_processed, 0);
+        assert_eq!(stats.bytes_added, 0);
     }
 
     fn arb_id() -> impl Strategy<Value = Id> {

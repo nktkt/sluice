@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 168 tests across
+machine-readable JSON output, and stable exit codes. Backed by 170 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -250,7 +250,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 168 tests
+cargo test     # 170 tests
 ```
 
 ## Caveats
