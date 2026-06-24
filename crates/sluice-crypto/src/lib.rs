@@ -6,6 +6,8 @@
 
 mod aead;
 mod hash;
+mod keys;
 
 pub use aead::{AeadError, NONCE_LEN, TAG_LEN, open, seal};
 pub use hash::{Key, derive_key, hash, keyed_hash};
+pub use keys::{KdfParams, KeyError, KeySet, unwrap_master, wrap_master};
