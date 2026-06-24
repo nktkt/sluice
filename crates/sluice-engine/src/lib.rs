@@ -456,6 +456,9 @@ pub struct VerifyReport {
 /// Concurrent content-blob reads during [`verify`].
 const VERIFY_CONCURRENCY: usize = 16;
 
+/// Concurrent file reconstructions per directory during restore.
+const RESTORE_CONCURRENCY: usize = 16;
+
 /// Verify every snapshot in `repo` by reading and authenticating all reachable
 /// trees and content blobs (a full read-data check; see `DESIGN.md` §5.7).
 ///
@@ -1305,7 +1308,11 @@ fn restore_tree<'a, B: StorageBackend>(
     dir: PathBuf,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
+        use futures::stream::{StreamExt, TryStreamExt};
+
         let tree = repo.load_tree(&tree_id).await?;
+        // Directories (recurse) and symlinks first, sequentially, to build the
+        // structure. A subdirectory's mtime is replayed after its own subtree.
         for node in &tree.nodes {
             let path = dir.join(osstring_from_bytes(&node.name));
             match node.kind {
@@ -1314,12 +1321,6 @@ fn restore_tree<'a, B: StorageBackend>(
                     if let Some(subtree) = node.subtree {
                         restore_tree(repo, subtree, path.clone()).await?;
                     }
-                    // Replay the directory's mtime after its children are written.
-                    apply_metadata(&path, node);
-                }
-                EntryKind::File => {
-                    let data = repo.load_file(&node.content).await?;
-                    std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
                     apply_metadata(&path, node);
                 }
                 EntryKind::Symlink => {
@@ -1327,9 +1328,26 @@ fn restore_tree<'a, B: StorageBackend>(
                         symlink(&osstring_from_bytes(target), &path)?;
                     }
                 }
-                _ => continue, // special files (fifo, socket, device): follow-up work
+                _ => {} // files below; special files (fifo/socket/device) are skipped
             }
         }
+        // Files: reconstruct concurrently — each reads its chunks and writes a
+        // distinct path, so the writes don't conflict. This directory's own mtime
+        // is replayed by the caller after this call returns, i.e. after the files.
+        futures::stream::iter(tree.nodes.iter().filter(|n| n.kind == EntryKind::File).map(
+            |node| {
+                let path = dir.join(osstring_from_bytes(&node.name));
+                async move {
+                    let data = repo.load_file(&node.content).await?;
+                    std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                    apply_metadata(&path, node);
+                    Ok::<(), EngineError>(())
+                }
+            },
+        ))
+        .buffer_unordered(RESTORE_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
         Ok(())
     })
 }
@@ -1440,6 +1458,41 @@ mod tests {
             std::fs::read(dst.path().join("sub/c.bin")).unwrap(),
             vec![7u8; 1000]
         );
+    }
+
+    #[tokio::test]
+    async fn restore_reconstructs_many_files_concurrently() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        for i in 0..25u8 {
+            std::fs::write(
+                src.path().join(format!("f{i}")),
+                format!("contents {i}").as_bytes(),
+            )
+            .unwrap();
+            std::fs::write(
+                src.path().join(format!("sub/g{i}")),
+                vec![i; 100 + i as usize],
+            )
+            .unwrap();
+        }
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        for i in 0..25u8 {
+            assert_eq!(
+                std::fs::read(out.path().join(format!("f{i}"))).unwrap(),
+                format!("contents {i}").as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(out.path().join(format!("sub/g{i}"))).unwrap(),
+                vec![i; 100 + i as usize]
+            );
+        }
     }
 
     #[tokio::test]
