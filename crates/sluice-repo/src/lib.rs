@@ -1,19 +1,21 @@
 //! `sluice-repo` — the repository handle.
 //!
 //! Ties `sluice-store`, `sluice-crypto`, and `sluice-core` together to create
-//! and open an encrypted repository (see `DESIGN.md` §3). On `init`, a random
-//! master key is generated, split into subkeys, used to seal the config, and
-//! itself wrapped under the passphrase; on `open`, the passphrase unwraps the
-//! master and authenticates the config.
+//! and open an encrypted repository and to read and write content-addressed,
+//! deduplicated, encrypted blobs (see `DESIGN.md` §3, §5.2, §5.4).
+
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use sluice_core::{
-    CONFIG_VERSION, ChunkerConfig, CipherSuite, Id, REPO_MAGIC, RepoConfig, from_cbor, to_cbor,
+    BlobKind, CONFIG_VERSION, ChunkerConfig, CipherSuite, Id, REPO_MAGIC, RepoConfig, from_cbor,
+    to_cbor,
 };
 use sluice_crypto::{
-    KdfParams, KeyError, KeySet, fill_random, open, random_key, seal, unwrap_master, wrap_master,
+    KdfParams, KeyError, KeySet, fill_random, hash, keyed_hash, open, random_key, seal,
+    unwrap_master, wrap_master,
 };
-use sluice_store::{FileType, StorageBackend, StoreError};
+use sluice_store::{BlobEntry, FileType, PackBuilder, PackReader, StorageBackend, StoreError};
 
 /// Well-known id of the single (encrypted) config object.
 const CONFIG_ID: Id = Id::from_bytes([0u8; 32]);
@@ -40,6 +42,12 @@ pub enum RepoError {
     /// The config object failed authentication or could not be decrypted.
     #[error("config authentication failed")]
     Config,
+    /// A blob's contents failed authentication or could not be decrypted.
+    #[error("blob authentication failed")]
+    Blob,
+    /// No blob with the given id is known to this repository.
+    #[error("blob not found: {0}")]
+    BlobNotFound(Id),
     /// The repository uses an unsupported format.
     #[error("unsupported repository format")]
     Unsupported,
@@ -63,6 +71,8 @@ pub struct Repository<B> {
     backend: B,
     keys: KeySet,
     config: RepoConfig,
+    /// chunk id -> (pack id, directory entry). Rebuilt from pack footers on open.
+    index: HashMap<Id, (Id, BlobEntry)>,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -124,6 +134,7 @@ impl<B: StorageBackend> Repository<B> {
             backend,
             keys,
             config,
+            index: HashMap::new(),
         })
     }
 
@@ -147,11 +158,70 @@ impl<B: StorageBackend> Repository<B> {
             return Err(RepoError::Unsupported);
         }
 
+        let index = build_index(&backend).await?;
+
         Ok(Self {
             backend,
             keys,
             config,
+            index,
         })
+    }
+
+    /// Store `plaintext` as a blob, returning its content-address id.
+    ///
+    /// The id is `keyed_hash(id_key, plaintext)`; if that blob is already
+    /// present the store is skipped (deduplication). Otherwise the plaintext is
+    /// AEAD-sealed under `data_key` and written in a new pack.
+    pub async fn save_blob(&mut self, kind: BlobKind, plaintext: &[u8]) -> Result<Id> {
+        let id = keyed_hash(&self.keys.id_key, plaintext);
+        if self.index.contains_key(&id) {
+            return Ok(id);
+        }
+
+        let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), plaintext);
+        let mut builder = PackBuilder::new();
+        builder.add(id, kind, &sealed);
+        let (bytes, directory) = builder.finish()?;
+        let pack_id = hash(&bytes);
+        self.backend
+            .put(FileType::Pack, &pack_id, bytes.into())
+            .await?;
+
+        for entry in &directory {
+            self.index.insert(entry.id, (pack_id, *entry));
+        }
+        Ok(id)
+    }
+
+    /// Load and decrypt the blob with the given id.
+    pub async fn load_blob(&self, id: &Id) -> Result<Vec<u8>> {
+        let (pack_id, entry) = self
+            .index
+            .get(id)
+            .copied()
+            .ok_or(RepoError::BlobNotFound(*id))?;
+        let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
+        let reader = PackReader::parse(&bytes)?;
+        let sealed = reader.blob(id).ok_or(RepoError::BlobNotFound(*id))?;
+        open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed).map_err(|_| RepoError::Blob)
+    }
+
+    /// Whether a blob with the given id is present.
+    #[must_use]
+    pub fn has_blob(&self, id: &Id) -> bool {
+        self.index.contains_key(id)
+    }
+
+    /// Associated data binding a sealed blob to this repository and its kind.
+    fn blob_aad(&self, kind: BlobKind) -> Vec<u8> {
+        let mut aad = Vec::with_capacity(Id::LEN + 1);
+        aad.extend_from_slice(self.config.repo_id.as_bytes());
+        aad.push(match kind {
+            BlobKind::Data => 0,
+            BlobKind::Tree => 1,
+        });
+        aad
     }
 
     /// The repository configuration.
@@ -166,17 +236,24 @@ impl<B: StorageBackend> Repository<B> {
         self.config.repo_id
     }
 
-    /// The derived subkey set (consumed by the engine when sealing blobs).
-    #[must_use]
-    pub fn keys(&self) -> &KeySet {
-        &self.keys
-    }
-
     /// Borrow the storage backend.
     #[must_use]
     pub fn backend(&self) -> &B {
         &self.backend
     }
+}
+
+/// Rebuild the chunk index by reading every pack's plaintext directory footer.
+async fn build_index<B: StorageBackend>(backend: &B) -> Result<HashMap<Id, (Id, BlobEntry)>> {
+    let mut index = HashMap::new();
+    for pack_id in backend.list(FileType::Pack).await? {
+        let bytes = backend.get(FileType::Pack, &pack_id).await?;
+        let reader = PackReader::parse(&bytes)?;
+        for entry in reader.entries() {
+            index.insert(entry.id, (pack_id, *entry));
+        }
+    }
+    Ok(index)
 }
 
 /// Map a core (CBOR) error into a repository error.
@@ -205,6 +282,10 @@ mod tests {
             t_cost: 1,
             p_cost: 1,
         }
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[tokio::test]
@@ -246,20 +327,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn init_persists_config_and_key_objects() {
-        let be = MemoryBackend::new();
-        let repo = Repository::init(be, b"pass", fast()).await.unwrap();
-        assert!(
-            repo.backend()
-                .exists(FileType::Config, &CONFIG_ID)
-                .await
-                .unwrap()
-        );
-        assert!(repo.backend().exists(FileType::Key, &KEY_ID).await.unwrap());
-        // Each distinct repo gets a distinct random id.
-        let other = Repository::init(MemoryBackend::new(), b"pass", fast())
+    async fn distinct_repos_have_distinct_ids() {
+        let a = Repository::init(MemoryBackend::new(), b"pass", fast())
             .await
             .unwrap();
-        assert_ne!(repo.id(), other.id());
+        let b = Repository::init(MemoryBackend::new(), b"pass", fast())
+            .await
+            .unwrap();
+        assert_ne!(a.id(), b.id());
+    }
+
+    #[tokio::test]
+    async fn save_then_load_blob_roundtrips() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let id = repo
+            .save_blob(BlobKind::Data, b"hello world")
+            .await
+            .unwrap();
+        assert!(repo.has_blob(&id));
+        assert_eq!(repo.load_blob(&id).await.unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn identical_content_deduplicates() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let a = repo.save_blob(BlobKind::Data, b"dup").await.unwrap();
+        let b = repo.save_blob(BlobKind::Data, b"dup").await.unwrap();
+        assert_eq!(a, b);
+        assert_eq!(repo.backend().list(FileType::Pack).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blobs_are_encrypted_at_rest() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let secret = b"TOP-SECRET-PLAINTEXT-MARKER";
+        repo.save_blob(BlobKind::Data, secret).await.unwrap();
+        for pid in repo.backend().list(FileType::Pack).await.unwrap() {
+            let bytes = repo.backend().get(FileType::Pack, &pid).await.unwrap();
+            assert!(
+                !contains_subslice(&bytes, secret),
+                "plaintext leaked into a stored pack"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn index_rebuilds_on_open_so_blobs_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = {
+            let be = LocalBackend::create(dir.path()).await.unwrap();
+            let mut repo = Repository::init(be, b"pw", fast()).await.unwrap();
+            repo.save_blob(BlobKind::Data, b"persisted blob")
+                .await
+                .unwrap()
+        };
+        let be = LocalBackend::open(dir.path());
+        let repo = Repository::open(be, b"pw").await.unwrap();
+        assert!(repo.has_blob(&id));
+        assert_eq!(repo.load_blob(&id).await.unwrap(), b"persisted blob");
+    }
+
+    #[tokio::test]
+    async fn load_unknown_blob_is_error() {
+        let repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.load_blob(&Id::from_bytes([5u8; 32])).await,
+            Err(RepoError::BlobNotFound(_))
+        ));
     }
 }
