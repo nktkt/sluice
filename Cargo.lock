@@ -1876,6 +1876,7 @@ dependencies = [
  "bytes",
  "futures",
  "object_store",
+ "proptest",
  "serde",
  "sluice-core",
  "tempfile",

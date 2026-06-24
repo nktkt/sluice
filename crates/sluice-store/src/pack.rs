@@ -168,6 +168,7 @@ impl<'a> PackReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn id(b: u8) -> Id {
         Id::from_bytes([b; 32])
@@ -227,5 +228,36 @@ mod tests {
             PackReader::parse(&bytes),
             Err(StoreError::MalformedPack(_))
         ));
+    }
+
+    proptest! {
+        // The directory is parsed from an untrusted backend, so arbitrary bytes
+        // must never panic — only Ok or a MalformedPack error.
+        #[test]
+        fn parse_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2000)
+        ) {
+            let _ = PackReader::parse(&bytes);
+        }
+
+        // Any well-formed pack parses and yields its blobs back.
+        #[test]
+        fn build_then_parse_roundtrips(
+            blobs in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..200),
+                0..10,
+            )
+        ) {
+            let mut builder = PackBuilder::new();
+            for (i, data) in blobs.iter().enumerate() {
+                builder.add(id(i as u8), BlobKind::Data, data);
+            }
+            let (bytes, _) = builder.finish().unwrap();
+            let reader = PackReader::parse(&bytes).unwrap();
+            prop_assert_eq!(reader.len(), blobs.len());
+            for (i, data) in blobs.iter().enumerate() {
+                prop_assert_eq!(reader.blob(&id(i as u8)).unwrap(), data.as_slice());
+            }
+        }
     }
 }
