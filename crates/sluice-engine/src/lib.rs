@@ -612,6 +612,8 @@ pub struct RetentionPolicy {
     pub yearly: usize,
     /// Always keep snapshots carrying any of these tags, regardless of counts.
     pub keep_tags: Vec<String>,
+    /// Always keep snapshots taken within this many nanoseconds of now (0 = off).
+    pub keep_within_ns: i64,
 }
 
 impl RetentionPolicy {
@@ -624,6 +626,7 @@ impl RetentionPolicy {
             && self.monthly == 0
             && self.yearly == 0
             && self.keep_tags.is_empty()
+            && self.keep_within_ns == 0
     }
 }
 
@@ -770,6 +773,16 @@ pub async fn forget_with_policy<B: StorageBackend>(
     let mut keep: HashSet<Id> = HashSet::new();
     for group in groups.values() {
         select_kept(group, policy, &mut keep);
+    }
+    // `--keep-within`: keep every snapshot newer than `now - keep_within_ns`,
+    // independent of grouping.
+    if policy.keep_within_ns > 0 {
+        let cutoff = now_ns() - policy.keep_within_ns;
+        for (id, time, _, _) in &snapshots {
+            if *time >= cutoff {
+                keep.insert(*id);
+            }
+        }
     }
 
     let mut forgotten = Vec::new();
@@ -1728,6 +1741,53 @@ mod tests {
             .unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([newest, important]));
+    }
+
+    #[tokio::test]
+    async fn forget_with_policy_keeps_within_a_window() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const HOUR: i64 = 3_600_000_000_000;
+        const DAY: i64 = 86_400_000_000_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        let recent = repo.commit_snapshot(&at(now - HOUR)).await.unwrap(); // ~1h ago
+        let _old = repo.commit_snapshot(&at(now - 30 * DAY)).await.unwrap(); // ~30d ago
+
+        // keep-within 7 days keeps only the recent snapshot (no count rules).
+        let policy = RetentionPolicy {
+            keep_within_ns: 7 * DAY,
+            ..Default::default()
+        };
+        forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([recent]));
     }
 
     #[tokio::test]

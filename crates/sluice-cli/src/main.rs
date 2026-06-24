@@ -137,6 +137,9 @@ enum Command {
         /// Always keep snapshots with this tag, regardless of count rules (repeatable).
         #[arg(long = "keep-tag", value_name = "TAG")]
         keep_tag: Vec<String>,
+        /// Keep all snapshots taken within this window, e.g. 7d, 24h, 2w.
+        #[arg(long = "keep-within", value_name = "DURATION")]
+        keep_within: Option<String>,
         /// Apply the keep rules per group (host or paths) instead of globally.
         #[arg(long = "group-by", value_enum)]
         group_by: Option<GroupByArg>,
@@ -530,6 +533,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_monthly,
             keep_yearly,
             keep_tag,
+            keep_within,
             group_by,
             tag,
             dry_run,
@@ -537,6 +541,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
             json,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let keep_within_ns = match &keep_within {
+                Some(s) => parse_within(s)?,
+                None => 0,
+            };
             let policy = RetentionPolicy {
                 last: keep_last.unwrap_or(0),
                 daily: keep_daily.unwrap_or(0),
@@ -544,6 +552,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 monthly: keep_monthly.unwrap_or(0),
                 yearly: keep_yearly.unwrap_or(0),
                 keep_tags: keep_tag,
+                keep_within_ns,
             };
             let group = match group_by {
                 None => GroupBy::None,
@@ -1016,6 +1025,26 @@ fn read_new_passphrase() -> Result<String, Box<dyn Error>> {
 }
 
 /// Format epoch-nanoseconds as `YYYY-MM-DD HH:MM:SS UTC` (no dependencies).
+/// Parse a retention window like `7d`, `24h`, or `2w` into nanoseconds. Units:
+/// s (seconds), m (minutes), h (hours), d (days), w (weeks).
+fn parse_within(s: &str) -> Result<i64, Box<dyn Error>> {
+    let s = s.trim();
+    let unit = s.chars().last().ok_or("empty duration")?;
+    let factor: i64 = match unit {
+        's' => 1_000_000_000,
+        'm' => 60_000_000_000,
+        'h' => 3_600_000_000_000,
+        'd' => 86_400_000_000_000,
+        'w' => 604_800_000_000_000,
+        _ => return Err(format!("invalid duration unit '{unit}' (use s/m/h/d/w)").into()),
+    };
+    let n: i64 = s[..s.len() - unit.len_utf8()]
+        .parse()
+        .map_err(|_| format!("invalid duration: {s}"))?;
+    n.checked_mul(factor)
+        .ok_or_else(|| "duration overflow".into())
+}
+
 /// Stable lowercase name for an entry kind, used in JSON output.
 fn kind_str(kind: EntryKind) -> &'static str {
     match kind {
