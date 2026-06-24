@@ -96,6 +96,9 @@ enum Command {
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
+        /// Show which snapshots would be forgotten without removing them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Reclaim storage no longer referenced by any snapshot.
     Prune {
@@ -236,6 +239,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_monthly,
             keep_yearly,
             tag,
+            dry_run,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let policy = RetentionPolicy {
@@ -245,19 +249,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 monthly: keep_monthly.unwrap_or(0),
                 yearly: keep_yearly.unwrap_or(0),
             };
+            let verb = if dry_run { "would forget" } else { "forgot" };
             match (snapshot, tag, policy.is_empty()) {
                 (Some(snapshot), None, true) => {
                     let id = resolve_snapshot(&repository, &snapshot).await?;
-                    forget(&repository, &id).await?;
-                    println!("forgot {id}");
+                    if !dry_run {
+                        forget(&repository, &id).await?;
+                    }
+                    println!("{verb} {id}");
                 }
                 (None, Some(tag), true) => {
-                    let forgotten = forget_tagged(&repository, &tag).await?;
-                    println!("forgot {} snapshot(s)", forgotten.len());
+                    let forgotten = forget_tagged(&repository, &tag, dry_run).await?;
+                    println!("{verb} {} snapshot(s)", forgotten.len());
                 }
                 (None, None, false) => {
-                    let forgotten = forget_with_policy(&repository, policy).await?;
-                    println!("forgot {} snapshot(s)", forgotten.len());
+                    let forgotten = forget_with_policy(&repository, policy, dry_run).await?;
+                    println!("{verb} {} snapshot(s)", forgotten.len());
                 }
                 _ => {
                     return Err(

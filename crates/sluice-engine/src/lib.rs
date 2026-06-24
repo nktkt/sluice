@@ -316,7 +316,8 @@ fn year_bucket(time_ns: i64) -> i64 {
 }
 
 /// Apply a retention `policy`, forgetting every snapshot kept by no rule, and
-/// return the ids forgotten. Reclaim their data afterwards with [`prune`].
+/// return the ids forgotten (or, with `dry_run`, the ids that *would* be
+/// forgotten, removing nothing). Reclaim their data afterwards with [`prune`].
 ///
 /// Each bucketed rule keeps the most recent snapshot of each of its last N
 /// buckets: walking newest-first, the first snapshot seen for a bucket is that
@@ -325,6 +326,7 @@ fn year_bucket(time_ns: i64) -> i64 {
 pub async fn forget_with_policy<B: StorageBackend>(
     repo: &Repository<B>,
     policy: RetentionPolicy,
+    dry_run: bool,
 ) -> Result<Vec<Id>> {
     let mut snapshots = Vec::new();
     for id in repo.list_snapshots().await? {
@@ -359,7 +361,9 @@ pub async fn forget_with_policy<B: StorageBackend>(
     let mut forgotten = Vec::new();
     for (id, _) in &snapshots {
         if !keep.contains(id) {
-            forget(repo, id).await?;
+            if !dry_run {
+                forget(repo, id).await?;
+            }
             forgotten.push(*id);
         }
     }
@@ -378,6 +382,7 @@ pub async fn forget_keep_last<B: StorageBackend>(
             last: keep,
             ..Default::default()
         },
+        false,
     )
     .await
 }
@@ -395,17 +400,25 @@ pub async fn forget_keep_daily<B: StorageBackend>(
             daily: keep,
             ..Default::default()
         },
+        false,
     )
     .await
 }
 
-/// Forget every snapshot tagged `tag`, returning the ids forgotten. Reclaim
+/// Forget every snapshot tagged `tag`, returning the ids forgotten (or, with
+/// `dry_run`, the ids that *would* be forgotten, removing nothing). Reclaim
 /// their data afterwards with [`prune`].
-pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -> Result<Vec<Id>> {
+pub async fn forget_tagged<B: StorageBackend>(
+    repo: &Repository<B>,
+    tag: &str,
+    dry_run: bool,
+) -> Result<Vec<Id>> {
     let mut forgotten = Vec::new();
     for id in repo.list_snapshots().await? {
         if repo.load_snapshot(&id).await?.tags.iter().any(|t| t == tag) {
-            forget(repo, &id).await?;
+            if !dry_run {
+                forget(repo, &id).await?;
+            }
             forgotten.push(id);
         }
     }
@@ -1163,7 +1176,12 @@ mod tests {
             weekly: 2,
             ..Default::default()
         };
-        let forgotten = forget_with_policy(&repo, policy).await.unwrap();
+        // Dry run previews the same removal without touching the repo.
+        let preview = forget_with_policy(&repo, policy, true).await.unwrap();
+        assert_eq!(preview, vec![d9]);
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+
+        let forgotten = forget_with_policy(&repo, policy, false).await.unwrap();
         assert_eq!(forgotten, vec![d9]);
 
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
@@ -1221,7 +1239,7 @@ mod tests {
             yearly: 2,
             ..Default::default()
         };
-        let forgotten = forget_with_policy(&repo, policy).await.unwrap();
+        let forgotten = forget_with_policy(&repo, policy, false).await.unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([y1971, feb]));
         // Both January 1970 snapshots are dropped (older year, non-newest month).
@@ -1401,8 +1419,13 @@ mod tests {
         }
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
 
-        let forgotten = forget_tagged(&repo, "temp").await.unwrap();
-        assert_eq!(forgotten.len(), 2);
+        // A dry run reports the same ids but removes nothing.
+        let preview = forget_tagged(&repo, "temp", true).await.unwrap();
+        assert_eq!(preview.len(), 2);
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+
+        let forgotten = forget_tagged(&repo, "temp", false).await.unwrap();
+        assert_eq!(forgotten, preview);
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
     }
 
