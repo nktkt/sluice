@@ -269,6 +269,53 @@ fn backup_exclude_from_file() {
 }
 
 #[test]
+fn ls_lists_a_subpath() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub/deep")).unwrap();
+    std::fs::write(src.join("top.txt"), b"t").unwrap();
+    std::fs::write(src.join("sub/a"), b"a").unwrap();
+    std::fs::write(src.join("sub/deep/b"), b"b").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let out = sluice()
+        .arg("ls")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg("sub")
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    let paths: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"sub"));
+    assert!(paths.contains(&"sub/a"));
+    assert!(paths.contains(&"sub/deep/b"));
+    assert!(
+        !paths.contains(&"top.txt"),
+        "subpath ls must exclude siblings"
+    );
+}
+
+#[test]
 fn diff_emits_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

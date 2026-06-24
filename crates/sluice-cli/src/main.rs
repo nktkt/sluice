@@ -177,6 +177,8 @@ enum Command {
         repo: String,
         /// Snapshot id (a unique hex prefix is accepted).
         snapshot: String,
+        /// List only this path within the snapshot (a file or directory subtree).
+        path: Option<String>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -667,11 +669,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Ls {
             repo,
             snapshot,
+            path,
             json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
-            let entries = list_files(&repository, &id).await?;
+            let mut entries = list_files(&repository, &id).await?;
+            // Restrict to a subpath (the entry itself plus everything under it).
+            if let Some(p) = &path {
+                let p = p.trim_matches('/');
+                let prefix = format!("{p}/");
+                entries.retain(|e| e.path == p || e.path.starts_with(&prefix));
+            }
             if json {
                 let arr: Vec<serde_json::Value> = entries
                     .iter()
