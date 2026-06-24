@@ -74,6 +74,21 @@ pub async fn backup_excluding<B: StorageBackend>(
     if !source.is_dir() {
         return Err(EngineError::NotADirectory(source.display().to_string()));
     }
+    // Hold a shared lock for the run: it blocks a concurrent prune from deleting
+    // data this snapshot will reference, while letting other backups proceed.
+    let lock = repo.acquire_lock(false).await?;
+    let result = backup_inner(repo, source, exclude_globs, tags).await;
+    let _ = repo.release_lock(&lock).await;
+    result
+}
+
+/// The body of [`backup_excluding`], run while holding a shared lock.
+async fn backup_inner<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    source: &Path,
+    exclude_globs: &[String],
+    tags: &[String],
+) -> Result<Id> {
     let excludes = build_globset(exclude_globs)?;
     let parent = latest_snapshot(repo).await?;
     let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
@@ -1747,6 +1762,24 @@ mod tests {
         // Once released, prune proceeds and releases its own lock afterwards.
         repo.release_lock(&held).await.unwrap();
         assert!(prune(&mut repo, false).await.is_ok());
+        assert!(repo.list_locks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_refuses_under_an_exclusive_lock() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+
+        // An exclusive lock (as prune holds) blocks backup's shared lock.
+        let held = repo.acquire_lock(true).await.unwrap();
+        assert!(backup(&mut repo, src.path()).await.is_err());
+
+        // Released: backup proceeds and leaves no lock behind.
+        repo.release_lock(&held).await.unwrap();
+        assert!(backup(&mut repo, src.path()).await.is_ok());
         assert!(repo.list_locks().await.unwrap().is_empty());
     }
 }
