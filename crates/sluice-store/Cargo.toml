@@ -9,3 +9,10 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+sluice-core = { path = "../sluice-core" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
