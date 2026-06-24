@@ -251,6 +251,66 @@ fn verify_tree<'a, B: StorageBackend>(
     })
 }
 
+/// A summary produced by [`check`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CheckReport {
+    /// Number of snapshots inspected.
+    pub snapshots: usize,
+    /// Number of tree objects read and authenticated.
+    pub trees: usize,
+    /// Number of referenced content (file chunk) blobs.
+    pub blobs: usize,
+    /// Referenced content blobs absent from the repository.
+    pub missing: Vec<Id>,
+}
+
+/// Structural integrity check: walk every snapshot's trees (decrypting and
+/// authenticating each) and confirm every referenced content blob is present,
+/// *without* reading or decrypting the file data (see `DESIGN.md` §5.7). Much
+/// cheaper than [`verify`], which authenticates all data; use it for routine
+/// integrity checks. Missing blobs are collected in [`CheckReport::missing`].
+pub async fn check<B: StorageBackend>(repo: &Repository<B>) -> Result<CheckReport> {
+    let mut report = CheckReport::default();
+    for snapshot in repo.list_snapshots().await? {
+        let snap = repo.load_snapshot(&snapshot).await?;
+        report.snapshots += 1;
+        check_tree(repo, snap.tree, &mut report).await?;
+    }
+    Ok(report)
+}
+
+/// Recursively authenticate the tree `tree_id` and record whether each content
+/// blob it references is present (by index lookup, not by reading the data).
+fn check_tree<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    report: &'a mut CheckReport,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        report.trees += 1;
+        for node in &tree.nodes {
+            match node.kind {
+                EntryKind::Dir => {
+                    if let Some(subtree) = node.subtree {
+                        check_tree(repo, subtree, report).await?;
+                    }
+                }
+                EntryKind::File => {
+                    for id in &node.content {
+                        report.blobs += 1;
+                        if !repo.has_blob(id) {
+                            report.missing.push(*id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Remove a snapshot so it can no longer be restored. The data it referenced is
 /// reclaimed only by a subsequent [`prune`].
 pub async fn forget<B: StorageBackend>(repo: &Repository<B>, snapshot: &Id) -> Result<()> {
@@ -1781,5 +1841,97 @@ mod tests {
         repo.release_lock(&held).await.unwrap();
         assert!(backup(&mut repo, src.path()).await.is_ok());
         assert!(repo.list_locks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_passes_for_a_healthy_backup() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha").unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/b"), vec![5u8; 2000]).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let report = check(&repo).await.unwrap();
+        assert_eq!(report.snapshots, 1);
+        assert!(report.trees >= 2, "root + subdir trees");
+        assert!(report.blobs >= 2, "a and d/b content");
+        assert!(report.missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_reports_a_missing_content_blob() {
+        use sluice_core::BlobKind;
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let mut repo = Repository::init(backend.clone(), b"pw", fast())
+            .await
+            .unwrap();
+
+        // A content chunk, alone in its own pack.
+        let chunk = repo
+            .save_blob(BlobKind::Data, b"file contents")
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let packs = repo.backend().list(FileType::Pack).await.unwrap();
+        assert_eq!(packs.len(), 1);
+        let pack_c = packs[0];
+
+        // A tree referencing the chunk (in a separate pack) and a snapshot.
+        let node = Node {
+            name: b"f".to_vec(),
+            kind: EntryKind::File,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 13,
+            content: vec![chunk],
+            subtree: None,
+            link_target: None,
+        };
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![node],
+            })
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        repo.commit_snapshot(&Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns: 0,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        })
+        .await
+        .unwrap();
+
+        // Healthy while the chunk is present.
+        assert!(check(&repo).await.unwrap().missing.is_empty());
+
+        // Drop the chunk's pack and its index segment, then reopen so the rebuilt
+        // index no longer knows the chunk.
+        backend.remove(FileType::Pack, &pack_c).await.unwrap();
+        backend.remove(FileType::Index, &pack_c).await.ok();
+        let reopened = Repository::open(backend.clone(), b"pw").await.unwrap();
+
+        let report = check(&reopened).await.unwrap();
+        assert_eq!(report.trees, 1);
+        assert_eq!(report.blobs, 1);
+        assert_eq!(report.missing, vec![chunk]);
     }
 }

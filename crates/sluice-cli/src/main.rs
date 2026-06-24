@@ -14,7 +14,7 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, RetentionPolicy, backup_excluding, diff, dump, forget, forget_tagged,
+    DiffKind, RetentionPolicy, backup_excluding, check, diff, dump, forget, forget_tagged,
     forget_with_policy, list_files, prune, prune_excluding, restore_subpath, verify,
 };
 use sluice_repo::Repository;
@@ -70,6 +70,11 @@ enum Command {
     },
     /// Verify the integrity of all snapshots.
     Verify {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
+    /// Check structural integrity without reading file data (fast).
+    Check {
         /// Repository path or object-store URL.
         repo: String,
     },
@@ -238,6 +243,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 "ok: {} snapshots, {} trees, {} blobs verified",
                 report.snapshots, report.trees, report.blobs
             );
+        }
+        Command::Check { repo } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let report = check(&repository).await?;
+            if report.missing.is_empty() {
+                println!(
+                    "ok: {} snapshots, {} trees, {} blobs referenced",
+                    report.snapshots, report.trees, report.blobs
+                );
+            } else {
+                eprintln!(
+                    "FAILED: {} of {} referenced blobs missing",
+                    report.missing.len(),
+                    report.blobs
+                );
+                for id in &report.missing {
+                    eprintln!("  missing {id}");
+                }
+                return Err("structural integrity check failed".into());
+            }
         }
         Command::Forget {
             repo,
