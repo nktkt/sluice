@@ -162,6 +162,26 @@ enum Command {
         /// Repository path or object-store URL.
         repo: String,
     },
+    /// Manage the passphrases (keys) that unlock the repository.
+    Key {
+        #[command(subcommand)]
+        action: KeyCmd,
+    },
+}
+
+/// Sub-commands of `key`.
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// List the repository's keys.
+    List {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
+    /// Add a passphrase (read from SLUICE_NEW_PASSWORD or prompted).
+    Add {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
 }
 
 fn main() {
@@ -432,6 +452,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let n = rebuild_index(&mut repository).await?;
             println!("rebuilt index for {n} pack(s)");
         }
+        Command::Key { action } => match action {
+            KeyCmd::List { repo } => {
+                let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                let keys = repository.list_keys().await?;
+                println!("{} key(s):", keys.len());
+                for id in &keys {
+                    println!("  {id}");
+                }
+            }
+            KeyCmd::Add { repo } => {
+                let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                let new_pass = read_new_passphrase()?;
+                let id = repository
+                    .add_key(new_pass.as_bytes(), kdf_params())
+                    .await?;
+                println!("added key {id}");
+            }
+        },
     }
     Ok(())
 }
@@ -505,6 +543,23 @@ fn read_passphrase(confirm: bool) -> Result<String, Box<dyn Error>> {
     }
     let passphrase = rpassword::prompt_password("Passphrase: ")?;
     if confirm && passphrase != rpassword::prompt_password("Confirm passphrase: ")? {
+        return Err("passphrases do not match".into());
+    }
+    Ok(passphrase)
+}
+
+/// Read the *new* passphrase for `key add` from `SLUICE_NEW_PASSWORD` or, on a
+/// terminal, a confirmed prompt.
+fn read_new_passphrase() -> Result<String, Box<dyn Error>> {
+    use std::io::IsTerminal;
+    if let Ok(passphrase) = std::env::var("SLUICE_NEW_PASSWORD") {
+        return Ok(passphrase);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err("no new passphrase: set SLUICE_NEW_PASSWORD or run in a terminal".into());
+    }
+    let passphrase = rpassword::prompt_password("New passphrase: ")?;
+    if passphrase != rpassword::prompt_password("Confirm new passphrase: ")? {
         return Err("passphrases do not match".into());
     }
     Ok(passphrase)

@@ -13,15 +13,14 @@ use sluice_core::{
     Tree, from_cbor, to_cbor,
 };
 use sluice_crypto::{
-    KdfParams, KeyError, KeySet, compress, decompress, fill_random, hash, keyed_hash, open,
+    KdfParams, Key, KeyError, KeySet, compress, decompress, fill_random, hash, keyed_hash, open,
     random_key, seal, unwrap_master, wrap_master,
 };
 use sluice_store::{BlobEntry, FileType, PackBuilder, PackReader, StorageBackend, StoreError};
+use zeroize::Zeroizing;
 
 /// Well-known id of the single (encrypted) config object.
 const CONFIG_ID: Id = Id::from_bytes([0u8; 32]);
-/// Well-known id of the master-key object.
-const KEY_ID: Id = Id::from_bytes([0u8; 32]);
 /// AEAD associated data for the config object. It cannot be the repo id, which
 /// lives *inside* the config and so is unknown until after decryption.
 const CONFIG_AAD: &[u8] = b"sluice.v1 config";
@@ -100,6 +99,9 @@ pub struct LockInfo {
 pub struct Repository<B> {
     backend: B,
     keys: KeySet,
+    /// The master key, retained (zeroized on drop) so new key objects can be
+    /// wrapped under additional passphrases without re-deriving it.
+    master: Zeroizing<Key>,
     config: RepoConfig,
     /// chunk id -> (pack id, directory entry). Rebuilt from pack footers on open.
     index: HashMap<Id, (Id, BlobEntry)>,
@@ -113,7 +115,7 @@ impl<B: StorageBackend> Repository<B> {
     /// Initialize a new encrypted repository on `backend`, protected by
     /// `passphrase` (stretched with the given Argon2id parameters).
     pub async fn init(backend: B, passphrase: &[u8], kdf: KdfParams) -> Result<Self> {
-        let master = random_key();
+        let master = Zeroizing::new(random_key());
         let keys = KeySet::derive(&master);
 
         let mut repo_id = [0u8; 32];
@@ -146,27 +148,13 @@ impl<B: StorageBackend> Repository<B> {
             .put(FileType::Config, &CONFIG_ID, sealed_config.into())
             .await?;
 
-        // Wrap the master under the passphrase and store the key object.
-        let mut salt = [0u8; 16];
-        fill_random(&mut salt);
-        let key_object = KeyObject {
-            salt: salt.to_vec(),
-            m_cost_kib: kdf.m_cost_kib,
-            t_cost: kdf.t_cost,
-            p_cost: kdf.p_cost,
-            wrapped: wrap_master(passphrase, &salt, kdf, &master)?,
-        };
-        backend
-            .put(
-                FileType::Key,
-                &KEY_ID,
-                to_cbor(&key_object).map_err(codec)?.into(),
-            )
-            .await?;
+        // Wrap the master under the passphrase and store the first key object.
+        put_key_object(&backend, passphrase, kdf, &master).await?;
 
         Ok(Self {
             backend,
             keys,
+            master,
             config,
             index: HashMap::new(),
             pending: PackBuilder::new(),
@@ -174,16 +162,32 @@ impl<B: StorageBackend> Repository<B> {
         })
     }
 
-    /// Open an existing repository on `backend` using `passphrase`.
+    /// Open an existing repository on `backend` using `passphrase`. Every stored
+    /// key object is tried, so any of the repository's passphrases unlocks it.
     pub async fn open(backend: B, passphrase: &[u8]) -> Result<Self> {
-        let key_object: KeyObject =
-            from_cbor(&backend.get(FileType::Key, &KEY_ID).await?).map_err(codec)?;
-        let kdf = KdfParams {
-            m_cost_kib: key_object.m_cost_kib,
-            t_cost: key_object.t_cost,
-            p_cost: key_object.p_cost,
-        };
-        let master = unwrap_master(passphrase, &key_object.salt, kdf, &key_object.wrapped)?;
+        let mut master: Option<Zeroizing<Key>> = None;
+        let mut last_err: Option<KeyError> = None;
+        for key_id in backend.list(FileType::Key).await? {
+            let Ok(key_object) =
+                from_cbor::<KeyObject>(&backend.get(FileType::Key, &key_id).await?)
+            else {
+                continue; // unparseable key object; try the next
+            };
+            let kdf = KdfParams {
+                m_cost_kib: key_object.m_cost_kib,
+                t_cost: key_object.t_cost,
+                p_cost: key_object.p_cost,
+            };
+            match unwrap_master(passphrase, &key_object.salt, kdf, &key_object.wrapped) {
+                Ok(m) => {
+                    master = Some(m);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let master =
+            master.ok_or_else(|| RepoError::Key(last_err.unwrap_or(KeyError::WrongPassphrase)))?;
         let keys = KeySet::derive(&master);
 
         let sealed = backend.get(FileType::Config, &CONFIG_ID).await?;
@@ -199,6 +203,7 @@ impl<B: StorageBackend> Repository<B> {
         Ok(Self {
             backend,
             keys,
+            master,
             config,
             index,
             pending: PackBuilder::new(),
@@ -555,6 +560,18 @@ impl<B: StorageBackend> Repository<B> {
         self.index = index;
         Ok(packs.len())
     }
+
+    /// List the ids of the repository's key objects (each unlocks it with one
+    /// passphrase).
+    pub async fn list_keys(&self) -> Result<Vec<Id>> {
+        Ok(self.backend.list(FileType::Key).await?)
+    }
+
+    /// Add a key object that unlocks the repository with `passphrase` (stretched
+    /// with `kdf`), returning its id. Existing passphrases keep working.
+    pub async fn add_key(&self, passphrase: &[u8], kdf: KdfParams) -> Result<Id> {
+        put_key_object(&self.backend, passphrase, kdf, &self.master).await
+    }
 }
 
 /// Build the chunk index, preferring persisted per-pack index segments and
@@ -592,6 +609,36 @@ async fn build_index<B: StorageBackend>(backend: &B) -> Result<HashMap<Id, (Id, 
         }
     }
     Ok(index)
+}
+
+/// Wrap `master` under `passphrase` and store the resulting key object at a
+/// fresh random id, returning that id. Used by `init` and `add_key`.
+async fn put_key_object<B: StorageBackend>(
+    backend: &B,
+    passphrase: &[u8],
+    kdf: KdfParams,
+    master: &Key,
+) -> Result<Id> {
+    let mut salt = [0u8; 16];
+    fill_random(&mut salt);
+    let key_object = KeyObject {
+        salt: salt.to_vec(),
+        m_cost_kib: kdf.m_cost_kib,
+        t_cost: kdf.t_cost,
+        p_cost: kdf.p_cost,
+        wrapped: wrap_master(passphrase, &salt, kdf, master)?,
+    };
+    let mut raw = [0u8; Id::LEN];
+    fill_random(&mut raw);
+    let id = Id::from_bytes(raw);
+    backend
+        .put(
+            FileType::Key,
+            &id,
+            to_cbor(&key_object).map_err(codec)?.into(),
+        )
+        .await?;
+    Ok(id)
 }
 
 /// Map a core (CBOR) error into a repository error.
@@ -1015,6 +1062,33 @@ mod tests {
         // The refreshed in-memory index still serves both blobs.
         assert_eq!(repo.load_blob(&id1).await.unwrap(), vec![1u8; 3000]);
         assert_eq!(repo.load_blob(&id2).await.unwrap(), vec![2u8; 3000]);
+    }
+
+    #[tokio::test]
+    async fn multiple_keys_each_unlock_the_repository() {
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let added = {
+            let repo = Repository::init(backend.clone(), b"first", fast())
+                .await
+                .unwrap();
+            repo.add_key(b"second", fast()).await.unwrap()
+        };
+
+        // Either passphrase opens the repository.
+        assert!(Repository::open(backend.clone(), b"first").await.is_ok());
+        assert!(Repository::open(backend.clone(), b"second").await.is_ok());
+        // A wrong passphrase still fails with a key error.
+        assert!(matches!(
+            Repository::open(backend.clone(), b"third").await,
+            Err(RepoError::Key(_))
+        ));
+
+        let repo = Repository::open(backend.clone(), b"first").await.unwrap();
+        let keys = repo.list_keys().await.unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&added));
     }
 
     #[tokio::test]

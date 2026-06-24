@@ -15,6 +15,7 @@ sluice-crypto = { path = "../sluice-crypto" }
 sluice-store = { path = "../sluice-store" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
