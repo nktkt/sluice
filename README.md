@@ -5,13 +5,14 @@
 **Status: alpha.** `sluice` creates encrypted repositories and performs
 deduplicated, compressed, **incremental** backups and restores — of files,
 directories, and symlinks, with mode and mtime preserved — to a local path **or
-any S3-compatible object store**. It offers point-in-time snapshots, full and
-partial restore, two tiers of integrity checking, restic-style retention with
-space-reclaiming prune, advisory locking for safe concurrent use, multiple
-passphrases, and a persisted index for fast repository open. Backed by 135 tests
-across the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md).
-**The on-disk format is not yet frozen; do not use it for data you cannot afford
-to lose.**
+any S3-compatible object store**. It offers point-in-time snapshots (of one or
+many source directories), full and partial restore, two tiers of integrity
+checking, restic-style retention with space-reclaiming prune, tag editing and
+cross-snapshot search, advisory locking for safe concurrent use, multiple
+passphrases, a persisted index for fast repository open, machine-readable JSON
+output, and stable exit codes. Backed by 144 tests across the workspace. The full
+architecture is in [`DESIGN.md`](./DESIGN.md). **The on-disk format is not yet
+frozen; do not use it for data you cannot afford to lose.**
 
 `sluice` backs up a large number of *your own* files to an **untrusted** storage
 backend — a local disk, a NAS, or any S3-compatible object store (S3, GCS,
@@ -34,25 +35,34 @@ export SLUICE_PASSWORD='correct horse battery staple'
 ```sh
 sluice init   ./repo
 sluice backup ./repo ~/documents --exclude '*.log' --exclude node_modules --tag daily
+sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
+sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
 stored chunks without being re-read. `--exclude` (glob, by entry name) and `--tag`
-are repeatable. The Argon2id work factor is tunable with `SLUICE_KDF_MEMORY_KIB`
-and `SLUICE_KDF_PASSES`.
+are repeatable. Multiple source directories go into a single snapshot under a
+synthetic root named by each source's final path component. The Argon2id work
+factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 
 ### Inspect and restore
 
 ```sh
 sluice snapshots ./repo [--tag daily]          # <id> <time> <N files> <paths>
 sluice ls        ./repo <snapshot>             # list a snapshot's entries
+sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
 sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes between snapshots
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
+sluice tag       ./repo <snapshot> --add keep --remove daily   # edit a snapshot's tags
 sluice info      ./repo                         # repository metadata
 sluice stats     ./repo                         # logical vs stored bytes, dedup %
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path sub/dir   # restore a subtree only
 ```
+
+`snapshots`, `stats`, `ls`, `find`, `prune`, and `forget` accept `--json` for
+machine-readable output, and commands return stable exit codes (10 repo not
+found, 11 wrong passphrase, 12 lock held, 13 corruption) for scripting.
 
 ### Integrity
 
@@ -140,12 +150,15 @@ blob is authenticated, a single flipped byte in a stored pack is caught by `veri
 - **Compression** — per-chunk `zstd` (skipped for incompressible data).
 - **Encryption at rest** — you hold the keys; XChaCha20-Poly1305 and Argon2id,
   with multiple passphrases and rotation.
-- **Snapshots, restore, verify, diff** — point-in-time snapshots, full or partial
-  restore, fast structural `check` and thorough read-data `verify`, and diffs.
+- **Snapshots, restore, verify, diff** — point-in-time snapshots of one or many
+  source directories, full or partial restore, fast structural `check` and
+  thorough read-data `verify`, snapshot diffs, cross-snapshot `find`, and `tag`
+  editing.
 - **Retention** — restic-style keep-last/daily/weekly/monthly/yearly `forget`
   (with `--dry-run` and `--prune`) plus mark-and-sweep `prune` with repacking.
 - **Fast open** — a persisted per-pack index avoids rescanning storage on open;
   `rebuild-index` repairs it.
+- **Scriptable** — machine-readable `--json` output and stable exit codes.
 - **Pluggable backends** — local filesystem and S3-compatible object storage.
 - **Crash-consistent** — append-only; the snapshot is written last as the single
   commit point.
@@ -187,7 +200,9 @@ concurrency model, CLI surface, and threat model — lives in
   monthly/yearly, `--dry-run`, `--prune`), and repacking `prune` — ✅
 - **M6** — operations: advisory locking (`unlock`), multiple passphrases
   (`key add`/`list`/`remove`/`passwd`), `rebuild-index` — ✅
-- **M7** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
+- **M7** — UX & scripting: multi-source backups, `backup --dry-run`, `find`,
+  `tag`, `--json` output, stable exit codes — ✅
+- **M8** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
 
 ## Building
 
@@ -197,7 +212,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 135 tests
+cargo test     # 144 tests
 ```
 
 ## Caveats
