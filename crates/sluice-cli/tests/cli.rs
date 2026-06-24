@@ -222,6 +222,53 @@ fn snapshots_and_stats_emit_json() {
 }
 
 #[test]
+fn backup_exclude_from_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("node_modules")).unwrap();
+    std::fs::write(src.join("keep.txt"), b"k").unwrap();
+    std::fs::write(src.join("skip.log"), b"l").unwrap();
+    std::fs::write(src.join("node_modules/x"), b"n").unwrap();
+    let exfile = dir.path().join("excludes.txt");
+    std::fs::write(&exfile, "# a comment\n*.log\n\nnode_modules\n").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .arg("--exclude-from")
+        .arg(&exfile)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let out = sluice()
+        .arg("ls")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    let paths: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"keep.txt"));
+    assert!(!paths.iter().any(|p| p.contains("skip.log")));
+    assert!(!paths.iter().any(|p| p.contains("node_modules")));
+}
+
+#[test]
 fn diff_emits_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

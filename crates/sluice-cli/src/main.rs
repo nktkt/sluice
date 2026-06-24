@@ -47,6 +47,10 @@ enum Command {
         /// Glob of entry names to exclude (repeatable), e.g. --exclude '*.log'.
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
+        /// Read exclude globs from a file, one per line (repeatable; blank lines
+        /// and lines starting with '#' are ignored).
+        #[arg(long = "exclude-from", value_name = "FILE")]
+        exclude_from: Vec<PathBuf>,
         /// Tag to attach to the snapshot (repeatable).
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
@@ -346,10 +350,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Backup {
             repo,
             sources,
-            excludes,
+            mut excludes,
+            exclude_from,
             tags,
             dry_run,
         } => {
+            // Append patterns read from each --exclude-from file.
+            for file in &exclude_from {
+                let contents = std::fs::read_to_string(file)
+                    .map_err(|e| format!("reading {}: {e}", file.display()))?;
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() && !line.starts_with('#') {
+                        excludes.push(line.to_string());
+                    }
+                }
+            }
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let outcome =
                 backup_sources(&mut repository, &sources, &excludes, &tags, dry_run).await?;
