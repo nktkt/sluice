@@ -297,15 +297,26 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Stats { repo } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let packs = repository.backend().list(FileType::Pack).await?.len();
+            let pack_ids = repository.backend().list(FileType::Pack).await?;
+            let mut stored = 0u64;
+            for pid in &pack_ids {
+                stored += repository.backend().size(FileType::Pack, pid).await?;
+            }
             let snapshots = repository.list_snapshots().await?;
             let mut logical = 0u64;
             for id in &snapshots {
                 logical += repository.load_snapshot(id).await?.summary.bytes_processed;
             }
+            let saved = if logical > 0 && stored < logical {
+                (logical - stored) * 100 / logical
+            } else {
+                0
+            };
             println!("snapshots:     {}", snapshots.len());
-            println!("packs:         {packs}");
+            println!("packs:         {}", pack_ids.len());
             println!("logical bytes: {logical}");
+            println!("stored bytes:  {stored}");
+            println!("saved:         {saved}% (dedup + compression)");
         }
     }
     Ok(())

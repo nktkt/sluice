@@ -115,6 +115,14 @@ impl StorageBackend for ObjectStoreBackend {
             Err(e) => Err(os_err(e)),
         }
     }
+
+    async fn size(&self, ty: FileType, id: &Id) -> Result<u64> {
+        match self.store.head(&self.object_path(ty, id)).await {
+            Ok(meta) => Ok(meta.size as u64),
+            Err(object_store::Error::NotFound { .. }) => Err(StoreError::NotFound { ty, id: *id }),
+            Err(e) => Err(os_err(e)),
+        }
+    }
 }
 
 #[cfg(test)]

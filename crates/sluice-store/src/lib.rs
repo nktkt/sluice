@@ -106,6 +106,9 @@ pub trait StorageBackend: Send + Sync {
 
     /// Remove an object (used only by prune).
     async fn remove(&self, ty: FileType, id: &Id) -> Result<()>;
+
+    /// The stored size of an object in bytes.
+    async fn size(&self, ty: FileType, id: &Id) -> Result<u64>;
 }
 
 /// Lets an `Arc<dyn StorageBackend>` (or any `Arc<B>`) be used as a backend, so
@@ -130,6 +133,10 @@ impl<B: StorageBackend + ?Sized> StorageBackend for Arc<B> {
 
     async fn remove(&self, ty: FileType, id: &Id) -> Result<()> {
         (**self).remove(ty, id).await
+    }
+
+    async fn size(&self, ty: FileType, id: &Id) -> Result<u64> {
+        (**self).size(ty, id).await
     }
 }
 
@@ -204,6 +211,15 @@ impl StorageBackend for MemoryBackend {
             .expect("store mutex poisoned")
             .remove(&(ty, *id))
             .map(|_| ())
+            .ok_or(StoreError::NotFound { ty, id: *id })
+    }
+
+    async fn size(&self, ty: FileType, id: &Id) -> Result<u64> {
+        self.objects
+            .lock()
+            .expect("store mutex poisoned")
+            .get(&(ty, *id))
+            .map(|b| b.len() as u64)
             .ok_or(StoreError::NotFound { ty, id: *id })
     }
 }
@@ -288,5 +304,18 @@ mod tests {
             .unwrap();
         assert!(be.exists(FileType::Pack, &id(7)).await.unwrap());
         assert_eq!(be.list(FileType::Pack).await.unwrap(), vec![id(7)]);
+    }
+
+    #[tokio::test]
+    async fn size_returns_stored_length() {
+        let be = MemoryBackend::new();
+        be.put(FileType::Pack, &id(1), Bytes::from_static(b"twelve bytes"))
+            .await
+            .unwrap();
+        assert_eq!(be.size(FileType::Pack, &id(1)).await.unwrap(), 12);
+        assert!(matches!(
+            be.size(FileType::Pack, &id(2)).await,
+            Err(StoreError::NotFound { .. })
+        ));
     }
 }

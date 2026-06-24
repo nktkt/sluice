@@ -125,6 +125,14 @@ impl StorageBackend for LocalBackend {
             Err(e) => Err(io(e)),
         }
     }
+
+    async fn size(&self, ty: FileType, id: &Id) -> Result<u64> {
+        match fs::metadata(self.path(ty, id)).await {
+            Ok(meta) => Ok(meta.len()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Err(StoreError::NotFound { ty, id: *id }),
+            Err(e) => Err(io(e)),
+        }
+    }
 }
 
 #[cfg(test)]
