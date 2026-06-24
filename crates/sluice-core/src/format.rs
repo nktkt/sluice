@@ -27,8 +27,8 @@ pub struct Tree {
 /// A single filesystem entry within a [`Tree`].
 ///
 /// `name` and `link_target` are raw bytes so non-UTF-8 names round-trip
-/// faithfully. Extended attributes, hardlink, and device fields are added in a
-/// later milestone; the format is not yet frozen.
+/// faithfully. Extended attributes are added in a later milestone; the format
+/// is not yet frozen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     /// Entry name as raw `OsStr` bytes.
@@ -53,6 +53,15 @@ pub struct Node {
     pub subtree: Option<Id>,
     /// Symlink: the raw link-target bytes.
     pub link_target: Option<Vec<u8>>,
+    /// Source device id, recorded only for hardlinked regular files (`nlink > 1`);
+    /// `0` otherwise. With [`ino`](Self::ino) it identifies a hardlink group so
+    /// restore can recreate the links instead of duplicating content.
+    #[serde(default)]
+    pub dev: u64,
+    /// Source inode number, recorded only for hardlinked regular files
+    /// (`nlink > 1`); `0` otherwise. See [`dev`](Self::dev).
+    #[serde(default)]
+    pub ino: u64,
 }
 
 /// A point-in-time snapshot: the single commit object of a backup run
@@ -124,6 +133,8 @@ mod tests {
                     content: vec![Id::from_bytes([7u8; 32])],
                     subtree: None,
                     link_target: None,
+                    dev: 0,
+                    ino: 0,
                 },
                 Node {
                     name: b"subdir".to_vec(),
@@ -137,6 +148,8 @@ mod tests {
                     content: vec![],
                     subtree: Some(Id::from_bytes([9u8; 32])),
                     link_target: None,
+                    dev: 0,
+                    ino: 0,
                 },
             ],
         }
@@ -203,20 +216,26 @@ mod tests {
             any::<i64>(),
             any::<u64>(),
             proptest::collection::vec(arb_id(), 0..4),
+            any::<u64>(),
+            any::<u64>(),
         )
-            .prop_map(|(name, mode, uid, gid, mtime, ctime, size, content)| Node {
-                name,
-                kind: EntryKind::File,
-                mode,
-                uid,
-                gid,
-                mtime_ns: mtime,
-                ctime_ns: ctime,
-                size,
-                content,
-                subtree: None,
-                link_target: None,
-            })
+            .prop_map(
+                |(name, mode, uid, gid, mtime, ctime, size, content, dev, ino)| Node {
+                    name,
+                    kind: EntryKind::File,
+                    mode,
+                    uid,
+                    gid,
+                    mtime_ns: mtime,
+                    ctime_ns: ctime,
+                    size,
+                    content,
+                    subtree: None,
+                    link_target: None,
+                    dev,
+                    ino,
+                },
+            )
     }
 
     proptest! {

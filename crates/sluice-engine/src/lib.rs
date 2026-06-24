@@ -260,6 +260,8 @@ async fn backup_sources_inner<B: StorageBackend>(
                     content: Vec::new(),
                     subtree: Some(subtree),
                     link_target: None,
+                    dev: 0,
+                    ino: 0,
                 });
             }
         }
@@ -467,8 +469,11 @@ pub async fn restore_subpath<B: StorageBackend>(
 ) -> Result<()> {
     let snap = repo.load_snapshot(snapshot).await?;
     std::fs::create_dir_all(target).map_err(|e| io_err(target, e))?;
+    // Maps a source (dev, ino) to the first path restored for it, so hardlinked
+    // files are recreated as links rather than duplicated.
+    let links = std::sync::Mutex::new(HashMap::new());
     let Some(path) = subpath else {
-        return restore_tree(repo, snap.tree, target.to_path_buf()).await;
+        return restore_tree(repo, snap.tree, target.to_path_buf(), &links).await;
     };
 
     let node = find_node(repo, snap.tree, path).await?;
@@ -477,7 +482,7 @@ pub async fn restore_subpath<B: StorageBackend>(
         EntryKind::Dir => {
             std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
             if let Some(subtree) = node.subtree {
-                restore_tree(repo, subtree, dest.clone()).await?;
+                restore_tree(repo, subtree, dest.clone(), &links).await?;
             }
             apply_metadata(&dest, &node);
         }
@@ -489,7 +494,12 @@ pub async fn restore_subpath<B: StorageBackend>(
         EntryKind::Symlink => {
             if let Some(link_target) = &node.link_target {
                 symlink(&osstring_from_bytes(link_target), &dest)?;
+                set_owner(&dest, node.uid, node.gid, false);
             }
+        }
+        EntryKind::Fifo => {
+            make_fifo(&dest, node.mode)?;
+            apply_special_metadata(&dest, &node);
         }
         _ => {}
     }
@@ -1253,6 +1263,7 @@ async fn backup_file<B: StorageBackend>(
         }
     };
     stats.bytes_processed += size;
+    let (dev, ino) = hardlink_ids(meta);
     Ok(Node {
         name,
         kind: EntryKind::File,
@@ -1265,6 +1276,8 @@ async fn backup_file<B: StorageBackend>(
         content,
         subtree: None,
         link_target: None,
+        dev,
+        ino,
     })
 }
 
@@ -1331,6 +1344,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     content: Vec::new(),
                     subtree: Some(subtree),
                     link_target: None,
+                    dev: 0,
+                    ino: 0,
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
@@ -1349,6 +1364,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     content: Vec::new(),
                     subtree: None,
                     link_target: Some(target.into_os_string().into_encoded_bytes()),
+                    dev: 0,
+                    ino: 0,
                 }
             } else if let Some(special) = special_kind(&kind) {
                 // FIFO / socket / device: record the node (no content) so the
@@ -1366,6 +1383,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     content: Vec::new(),
                     subtree: None,
                     link_target: None,
+                    dev: 0,
+                    ino: 0,
                 }
             } else {
                 continue; // unknown entry type
@@ -1391,6 +1410,7 @@ fn restore_tree<'a, B: StorageBackend>(
     repo: &'a Repository<B>,
     tree_id: Id,
     dir: PathBuf,
+    links: &'a std::sync::Mutex<HashMap<(u64, u64), PathBuf>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         use futures::stream::{StreamExt, TryStreamExt};
@@ -1404,7 +1424,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(repo, subtree, path.clone()).await?;
+                        restore_tree(repo, subtree, path.clone(), links).await?;
                     }
                     apply_metadata(&path, node);
                 }
@@ -1423,23 +1443,59 @@ fn restore_tree<'a, B: StorageBackend>(
                 _ => {}
             }
         }
-        // Files: reconstruct concurrently — each reads its chunks and writes a
-        // distinct path, so the writes don't conflict. This directory's own mtime
-        // is replayed by the caller after this call returns, i.e. after the files.
-        futures::stream::iter(tree.nodes.iter().filter(|n| n.kind == EntryKind::File).map(
-            |node| {
-                let path = dir.join(osstring_from_bytes(&node.name));
-                async move {
-                    let data = repo.load_file(&node.content).await?;
-                    std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
-                    apply_metadata(&path, node);
-                    Ok::<(), EngineError>(())
-                }
-            },
-        ))
+        // Plain files (no hardlinks): reconstruct concurrently — each reads its
+        // chunks and writes a distinct path, so the writes don't conflict. This
+        // directory's own mtime is replayed by the caller after this call
+        // returns, i.e. after the files.
+        futures::stream::iter(
+            tree.nodes
+                .iter()
+                .filter(|n| n.kind == EntryKind::File && n.ino == 0)
+                .map(|node| {
+                    let path = dir.join(osstring_from_bytes(&node.name));
+                    async move {
+                        let data = repo.load_file(&node.content).await?;
+                        std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                        apply_metadata(&path, node);
+                        Ok::<(), EngineError>(())
+                    }
+                }),
+        )
         .buffer_unordered(RESTORE_CONCURRENCY)
         .try_collect::<Vec<()>>()
         .await?;
+
+        // Hardlinked files (nlink > 1 at backup): the first entry seen for each
+        // source (dev, ino) materializes the content; later entries — possibly in
+        // other directories — become hard links to it. Done sequentially against
+        // the shared inode map; hardlinks are rare, so this isn't a hot path.
+        for node in tree
+            .nodes
+            .iter()
+            .filter(|n| n.kind == EntryKind::File && n.ino != 0)
+        {
+            let path = dir.join(osstring_from_bytes(&node.name));
+            let target = {
+                let mut map = links.lock().expect("restore link map poisoned");
+                match map.get(&(node.dev, node.ino)) {
+                    Some(existing) => Some(existing.clone()),
+                    None => {
+                        map.insert((node.dev, node.ino), path.clone());
+                        None
+                    }
+                }
+            };
+            match target {
+                Some(existing) => {
+                    std::fs::hard_link(&existing, &path).map_err(|e| io_err(&path, e))?;
+                }
+                None => {
+                    let data = repo.load_file(&node.content).await?;
+                    std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                    apply_metadata(&path, node);
+                }
+            }
+        }
         Ok(())
     })
 }
@@ -1585,6 +1641,24 @@ fn gid_of(meta: &std::fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn gid_of(_meta: &std::fs::Metadata) -> u32 {
     0
+}
+
+/// The `(dev, ino)` hardlink-group key for a regular file, or `(0, 0)` when the
+/// file has only one link (so restore treats it as an ordinary file). Only
+/// `nlink > 1` files can be hardlinks, so the common case stays zero-cost.
+#[cfg(unix)]
+fn hardlink_ids(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    if meta.nlink() > 1 {
+        (meta.dev(), meta.ino())
+    } else {
+        (0, 0)
+    }
+}
+
+#[cfg(not(unix))]
+fn hardlink_ids(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
 }
 
 /// The effective owner of the running process, recorded on the snapshot object.
@@ -1862,6 +1936,8 @@ mod tests {
             content: vec![chunk],
             subtree: None,
             link_target: None,
+            dev: 0,
+            ino: 0,
         };
         let tree = repo
             .save_tree(&Tree {
@@ -2365,6 +2441,42 @@ mod tests {
         restore(&repo, &snap, out.path()).await.unwrap();
         let m = std::fs::metadata(out.path().join("owned")).unwrap();
         assert_eq!((m.uid(), m.gid()), (1, 2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_hardlinks() {
+        use std::os::unix::fs::MetadataExt;
+        let src = tempfile::tempdir().unwrap();
+        let a = src.path().join("a");
+        let b = src.path().join("b");
+        std::fs::write(&a, b"shared content").unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        assert_eq!(std::fs::metadata(&a).unwrap().nlink(), 2, "test setup");
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+
+        let ra = std::fs::metadata(out.path().join("a")).unwrap();
+        let rb = std::fs::metadata(out.path().join("b")).unwrap();
+        // The two entries are reunited into one inode with two links, not two
+        // independent copies.
+        assert_eq!(ra.ino(), rb.ino(), "restored entries should share an inode");
+        assert_eq!(ra.nlink(), 2, "restored inode should have two links");
+        assert_eq!(
+            std::fs::read(out.path().join("a")).unwrap(),
+            b"shared content"
+        );
+        assert_eq!(
+            std::fs::read(out.path().join("b")).unwrap(),
+            b"shared content"
+        );
     }
 
     #[cfg(unix)]
@@ -3172,6 +3284,8 @@ mod tests {
             content: vec![chunk],
             subtree: None,
             link_target: None,
+            dev: 0,
+            ino: 0,
         };
         let tree = repo
             .save_tree(&Tree {
