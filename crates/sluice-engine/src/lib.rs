@@ -165,6 +165,26 @@ pub async fn forget<B: StorageBackend>(repo: &Repository<B>, snapshot: &Id) -> R
     Ok(())
 }
 
+/// Keep the `keep` most recent snapshots and forget the rest, returning the ids
+/// that were forgotten. Reclaim their data afterwards with [`prune`].
+pub async fn forget_keep_last<B: StorageBackend>(
+    repo: &Repository<B>,
+    keep: usize,
+) -> Result<Vec<Id>> {
+    let mut snapshots = Vec::new();
+    for id in repo.list_snapshots().await? {
+        let time = repo.load_snapshot(&id).await?.time_ns;
+        snapshots.push((id, time));
+    }
+    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+    let mut forgotten = Vec::new();
+    for (id, _) in snapshots.into_iter().skip(keep) {
+        forget(repo, &id).await?;
+        forgotten.push(id);
+    }
+    Ok(forgotten)
+}
+
 /// Delete packs no longer referenced by any surviving snapshot, returning the
 /// number removed (mark-and-sweep GC; see `DESIGN.md` §8).
 pub async fn prune<B: StorageBackend>(repo: &Repository<B>) -> Result<usize> {
@@ -651,5 +671,27 @@ mod tests {
         let a = entries.iter().find(|e| e.path == "a.txt").unwrap();
         assert_eq!(a.kind, EntryKind::File);
         assert_eq!(a.size, 5);
+    }
+
+    #[tokio::test]
+    async fn forget_keep_last_retains_recent_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // Three distinct snapshots (distinct content => distinct ids).
+        for content in [b"v1".as_slice(), b"v2", b"v3"] {
+            std::fs::write(&f, content).unwrap();
+            backup(&mut repo, src.path()).await.unwrap();
+        }
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+
+        let forgotten = forget_keep_last(&repo, 2).await.unwrap();
+        assert_eq!(forgotten.len(), 1);
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 2);
+
+        // Keeping more than exist forgets nothing.
+        assert!(forget_keep_last(&repo, 5).await.unwrap().is_empty());
     }
 }

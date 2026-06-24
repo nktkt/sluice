@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
-use sluice_engine::{backup, forget, list_files, prune, restore, verify};
+use sluice_engine::{backup, forget, forget_keep_last, list_files, prune, restore, verify};
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
 
@@ -55,12 +55,15 @@ enum Command {
         /// Path of the repository.
         repo: PathBuf,
     },
-    /// Forget (remove) a snapshot; reclaim its data later with `prune`.
+    /// Forget snapshots; reclaim their data later with `prune`.
     Forget {
         /// Path of the repository.
         repo: PathBuf,
-        /// Snapshot id (a unique hex prefix is accepted).
-        snapshot: String,
+        /// Snapshot id to forget (a unique hex prefix is accepted).
+        snapshot: Option<String>,
+        /// Instead, keep the N most recent snapshots and forget the rest.
+        #[arg(long, value_name = "N")]
+        keep_last: Option<usize>,
     },
     /// Reclaim storage no longer referenced by any snapshot.
     Prune {
@@ -137,11 +140,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 report.snapshots, report.trees, report.blobs
             );
         }
-        Command::Forget { repo, snapshot } => {
+        Command::Forget {
+            repo,
+            snapshot,
+            keep_last,
+        } => {
             let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
-            let id = resolve_snapshot(&repository, &snapshot).await?;
-            forget(&repository, &id).await?;
-            println!("forgot {id}");
+            match (snapshot, keep_last) {
+                (Some(snapshot), None) => {
+                    let id = resolve_snapshot(&repository, &snapshot).await?;
+                    forget(&repository, &id).await?;
+                    println!("forgot {id}");
+                }
+                (None, Some(keep)) => {
+                    let forgotten = forget_keep_last(&repository, keep).await?;
+                    println!("forgot {} snapshot(s)", forgotten.len());
+                }
+                _ => return Err("specify either a snapshot id or --keep-last N".into()),
+            }
         }
         Command::Prune { repo } => {
             let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
