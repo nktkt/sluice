@@ -13,8 +13,8 @@ use sluice_core::{
     Tree, from_cbor, to_cbor,
 };
 use sluice_crypto::{
-    KdfParams, Key, KeyError, KeySet, compress, decompress, fill_random, hash, keyed_hash, open,
-    random_key, seal, unwrap_master, wrap_master,
+    DEFAULT_LEVEL, KdfParams, Key, KeyError, KeySet, compress, decompress, fill_random, hash,
+    keyed_hash, open, random_key, seal, unwrap_master, wrap_master,
 };
 use sluice_store::{BlobEntry, FileType, PackBuilder, PackReader, StorageBackend, StoreError};
 use zeroize::Zeroizing;
@@ -129,6 +129,18 @@ impl<B: StorageBackend> Repository<B> {
     /// Initialize a new encrypted repository on `backend`, protected by
     /// `passphrase` (stretched with the given Argon2id parameters).
     pub async fn init(backend: B, passphrase: &[u8], kdf: KdfParams) -> Result<Self> {
+        Self::init_with_compression(backend, passphrase, kdf, DEFAULT_LEVEL).await
+    }
+
+    /// Like [`init`](Self::init) but pinning a zstd compression `level` for the
+    /// repository's blobs. The chunk id is the plaintext hash, so the level does
+    /// not affect deduplication or interoperability — only stored size and speed.
+    pub async fn init_with_compression(
+        backend: B,
+        passphrase: &[u8],
+        kdf: KdfParams,
+        compression: i32,
+    ) -> Result<Self> {
         let master = Zeroizing::new(random_key());
         let keys = KeySet::derive(&master);
 
@@ -150,6 +162,7 @@ impl<B: StorageBackend> Repository<B> {
             cipher: CipherSuite::XChaCha20Poly1305,
             pack_target: PACK_TARGET,
             created_ns: now_ns(),
+            compression,
         };
 
         // Seal the config under meta_key and store it.
@@ -242,7 +255,7 @@ impl<B: StorageBackend> Repository<B> {
             return Ok(id);
         }
 
-        let frame = compress(plaintext);
+        let frame = compress(plaintext, self.config.compression);
         let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), &frame);
         let entry = self.pending.add(id, kind, &sealed);
         self.pending_index.insert(id, entry);
@@ -963,6 +976,19 @@ mod tests {
             .unwrap();
         let content = repo.save_file(b"hello file").await.unwrap();
         assert_eq!(repo.load_file(&content).await.unwrap(), b"hello file");
+    }
+
+    #[tokio::test]
+    async fn init_with_compression_pins_the_level_and_still_roundtrips() {
+        let mut repo = Repository::init_with_compression(MemoryBackend::new(), b"pw", fast(), 19)
+            .await
+            .unwrap();
+        assert_eq!(repo.config().compression, 19);
+        // The level changes only the stored size, not correctness: data still
+        // round-trips, and the default repo reads it fine (frames self-describe).
+        let data = vec![7u8; 50_000];
+        let content = repo.save_file(&data).await.unwrap();
+        assert_eq!(repo.load_file(&content).await.unwrap(), data);
     }
 
     #[tokio::test]

@@ -36,6 +36,9 @@ enum Command {
     Init {
         /// Repository path or object-store URL (e.g. s3://bucket/prefix).
         repo: String,
+        /// zstd compression level for stored blobs (1 fastest .. 22 smallest).
+        #[arg(long, value_name = "LEVEL", default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
+        compression: i32,
     },
     /// Back up one or more directories into a single snapshot.
     Backup {
@@ -384,9 +387,14 @@ async fn run() -> Result<i32, Box<dyn Error>> {
     // 0 = success; set to 3 when a restore completes with best-effort warnings.
     let mut exit = 0;
     match cli.command {
-        Command::Init { repo } => {
-            let repository =
-                Repository::init(backend(&repo, true).await?, pw, kdf_params()).await?;
+        Command::Init { repo, compression } => {
+            let repository = Repository::init_with_compression(
+                backend(&repo, true).await?,
+                pw,
+                kdf_params(),
+                compression,
+            )
+            .await?;
             println!("initialized repository {} at {repo}", repository.id());
         }
         Command::Backup {
@@ -992,6 +1000,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                             "max": config.chunker.max,
                         },
                         "pack_target": config.pack_target,
+                        "compression": config.compression,
                         "snapshots": snapshots,
                         "packs": pack_ids.len(),
                         "keys": keys,
@@ -1007,6 +1016,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     config.chunker.min, config.chunker.avg, config.chunker.max
                 );
                 println!("pack target: {} bytes", config.pack_target);
+                println!("compression: zstd level {}", config.compression);
                 println!("snapshots:   {snapshots}");
                 println!("packs:       {}", pack_ids.len());
                 println!("keys:        {keys}");

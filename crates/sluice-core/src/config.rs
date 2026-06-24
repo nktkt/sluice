@@ -56,6 +56,16 @@ pub struct RepoConfig {
     pub pack_target: u64,
     /// Creation time, nanoseconds since the Unix epoch.
     pub created_ns: i64,
+    /// zstd compression level applied to blobs before encryption. The zstd frame
+    /// self-describes, so the level only affects writing; older configs without
+    /// this field default to the standard level 3.
+    #[serde(default = "default_compression")]
+    pub compression: i32,
+}
+
+/// The default zstd compression level (matches `sluice_crypto`'s default).
+fn default_compression() -> i32 {
+    3
 }
 
 impl RepoConfig {
@@ -85,6 +95,7 @@ mod tests {
             cipher: CipherSuite::XChaCha20Poly1305,
             pack_target: 16 * 1024 * 1024,
             created_ns: 1_700_000_000_000_000_000,
+            compression: 3,
         }
     }
 
@@ -92,6 +103,34 @@ mod tests {
     fn repo_config_roundtrips() {
         let c = sample();
         assert_eq!(from_cbor::<RepoConfig>(&to_cbor(&c).unwrap()).unwrap(), c);
+    }
+
+    #[test]
+    fn legacy_config_without_compression_defaults_to_level_3() {
+        // A config exactly as a pre-compression-level build wrote it.
+        #[derive(serde::Serialize)]
+        struct OldConfig {
+            magic: [u8; 8],
+            version: u32,
+            repo_id: Id,
+            chunker: ChunkerConfig,
+            cipher: CipherSuite,
+            pack_target: u64,
+            created_ns: i64,
+        }
+        let old = sample();
+        let bytes = to_cbor(&OldConfig {
+            magic: old.magic,
+            version: old.version,
+            repo_id: old.repo_id,
+            chunker: old.chunker,
+            cipher: old.cipher,
+            pack_target: old.pack_target,
+            created_ns: old.created_ns,
+        })
+        .unwrap();
+        let decoded: RepoConfig = from_cbor(&bytes).expect("legacy config must still decode");
+        assert_eq!(decoded.compression, 3, "missing field defaults to level 3");
     }
 
     #[test]

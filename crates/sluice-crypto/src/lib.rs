@@ -12,7 +12,7 @@ mod keys;
 mod rng;
 
 pub use aead::{AeadError, NONCE_LEN, TAG_LEN, open, seal};
-pub use compress::{CompressError, compress, decompress};
+pub use compress::{CompressError, DEFAULT_LEVEL, compress, decompress};
 pub use hash::{Key, derive_key, hash, keyed_hash};
 pub use keys::{KdfParams, KeyError, KeySet, unwrap_master, wrap_master};
 pub use rng::{fill_random, random_key};

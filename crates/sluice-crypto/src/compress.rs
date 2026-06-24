@@ -9,8 +9,9 @@
 const RAW: u8 = 0;
 /// Marker: the payload is a zstd frame.
 const ZSTD: u8 = 1;
-/// zstd compression level (level 3 balances ratio and throughput).
-const LEVEL: i32 = 3;
+/// Default zstd level (3 balances ratio and throughput); used when a repository
+/// records no level. The frame self-describes, so [`decompress`] needs no level.
+pub const DEFAULT_LEVEL: i32 = 3;
 
 /// Error reversing [`compress`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -26,14 +27,14 @@ pub enum CompressError {
     Zstd(String),
 }
 
-/// Compress `plaintext`, returning `[marker][payload]`.
+/// Compress `plaintext` at zstd `level`, returning `[marker][payload]`.
 ///
 /// Falls back to storing the bytes verbatim when zstd would not shrink them
-/// (e.g. already-compressed media), so the output is never larger than
-/// `plaintext.len() + 1`.
+/// (e.g. already-compressed media) or when the level is rejected, so the output
+/// is never larger than `plaintext.len() + 1`.
 #[must_use]
-pub fn compress(plaintext: &[u8]) -> Vec<u8> {
-    if let Ok(compressed) = zstd::bulk::compress(plaintext, LEVEL) {
+pub fn compress(plaintext: &[u8], level: i32) -> Vec<u8> {
+    if let Ok(compressed) = zstd::bulk::compress(plaintext, level) {
         if compressed.len() + 1 < plaintext.len() {
             let mut out = Vec::with_capacity(compressed.len() + 1);
             out.push(ZSTD);
@@ -64,7 +65,7 @@ mod tests {
     #[test]
     fn compressible_data_shrinks_and_roundtrips() {
         let data = vec![0u8; 10_000];
-        let frame = compress(&data);
+        let frame = compress(&data, DEFAULT_LEVEL);
         assert_eq!(frame[0], ZSTD);
         assert!(frame.len() < data.len());
         assert_eq!(decompress(&frame).unwrap(), data);
@@ -79,15 +80,30 @@ mod tests {
                 (s >> 33) as u8
             })
             .collect();
-        let frame = compress(&data);
+        let frame = compress(&data, DEFAULT_LEVEL);
         assert_eq!(frame[0], RAW);
         assert_eq!(decompress(&frame).unwrap(), data);
     }
 
     #[test]
     fn empty_input_roundtrips() {
-        let frame = compress(b"");
+        let frame = compress(b"", DEFAULT_LEVEL);
         assert_eq!(decompress(&frame).unwrap(), b"");
+    }
+
+    #[test]
+    fn any_level_roundtrips_and_a_higher_level_is_no_larger() {
+        // Repetitive-but-varied data so a higher level can find more.
+        let mut data = Vec::new();
+        for i in 0..20_000u32 {
+            data.extend_from_slice(&(i % 97).to_le_bytes());
+        }
+        // Every frame decompresses regardless of the level it was written at.
+        for level in [1, 3, 9, 19] {
+            assert_eq!(decompress(&compress(&data, level)).unwrap(), data);
+        }
+        // A higher level should not produce a larger frame than a lower one.
+        assert!(compress(&data, 19).len() <= compress(&data, 1).len());
     }
 
     #[test]
