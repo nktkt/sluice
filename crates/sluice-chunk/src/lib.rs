@@ -39,6 +39,29 @@ impl Gear {
         }
         Self(table)
     }
+
+    /// Build a gear table from 32 seed bytes (the repository's `gear_seed`),
+    /// folding them into a SplitMix64 seed.
+    #[must_use]
+    pub fn from_seed_bytes(seed: &[u8; 32]) -> Self {
+        let mut state = 0u64;
+        let mut i = 0;
+        while i < seed.len() {
+            let word = u64::from_le_bytes([
+                seed[i],
+                seed[i + 1],
+                seed[i + 2],
+                seed[i + 3],
+                seed[i + 4],
+                seed[i + 5],
+                seed[i + 6],
+                seed[i + 7],
+            ]);
+            state = (state ^ word).wrapping_mul(0x0000_0100_0000_01B3);
+            i += 8;
+        }
+        Self::from_seed(state)
+    }
 }
 
 impl Default for Gear {
@@ -172,6 +195,18 @@ const fn high_bits_mask(bits: u32) -> u64 {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn gear_from_seed_bytes_is_deterministic_and_seed_sensitive() {
+        assert_eq!(
+            Gear::from_seed_bytes(&[1u8; 32]).0,
+            Gear::from_seed_bytes(&[1u8; 32]).0
+        );
+        assert_ne!(
+            Gear::from_seed_bytes(&[1u8; 32]).0,
+            Gear::from_seed_bytes(&[2u8; 32]).0
+        );
+    }
 
     fn small() -> Chunker {
         Chunker::new(

@@ -498,6 +498,7 @@ name = "sluice-repo"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "sluice-chunk",
  "sluice-core",
  "sluice-crypto",
  "sluice-store",

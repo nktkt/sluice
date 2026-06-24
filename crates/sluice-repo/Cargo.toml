@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 sluice-core = { path = "../sluice-core" }
+sluice-chunk = { path = "../sluice-chunk" }
 sluice-crypto = { path = "../sluice-crypto" }
 sluice-store = { path = "../sluice-store" }
 serde = { workspace = true }

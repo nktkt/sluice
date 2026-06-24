@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use sluice_chunk::{Chunker, ChunkerParams, Gear};
 use sluice_core::{
     BlobKind, CONFIG_VERSION, ChunkerConfig, CipherSuite, Id, REPO_MAGIC, RepoConfig, from_cbor,
     to_cbor,
@@ -207,6 +208,48 @@ impl<B: StorageBackend> Repository<B> {
         open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed).map_err(|_| RepoError::Blob)
     }
 
+    /// Split `data` into content-defined chunks, store each as a `Data` blob,
+    /// and return the ordered chunk ids that make up the file's content.
+    pub async fn save_file(&mut self, data: &[u8]) -> Result<Vec<Id>> {
+        let chunker = self.chunker();
+        let mut spans = Vec::new();
+        let mut offset = 0usize;
+        for chunk in chunker.chunks(data) {
+            spans.push((offset, chunk.len()));
+            offset += chunk.len();
+        }
+        let mut ids = Vec::with_capacity(spans.len());
+        for (start, len) in spans {
+            ids.push(
+                self.save_blob(BlobKind::Data, &data[start..start + len])
+                    .await?,
+            );
+        }
+        Ok(ids)
+    }
+
+    /// Reassemble a file from its ordered chunk ids.
+    pub async fn load_file(&self, content: &[Id]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for id in content {
+            out.extend_from_slice(&self.load_blob(id).await?);
+        }
+        Ok(out)
+    }
+
+    /// Build the FastCDC chunker pinned by this repository's config.
+    fn chunker(&self) -> Chunker {
+        let c = &self.config.chunker;
+        Chunker::new(
+            ChunkerParams {
+                min: c.min as usize,
+                avg: c.avg as usize,
+                max: c.max as usize,
+            },
+            Gear::from_seed_bytes(&c.gear_seed),
+        )
+    }
+
     /// Whether a blob with the given id is present.
     #[must_use]
     pub fn has_blob(&self, id: &Id) -> bool {
@@ -402,5 +445,64 @@ mod tests {
             repo.load_blob(&Id::from_bytes([5u8; 32])).await,
             Err(RepoError::BlobNotFound(_))
         ));
+    }
+
+    fn pseudo_random(n: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n);
+        let mut s = 0xABCD_1234u64;
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push((s >> 33) as u8);
+        }
+        v
+    }
+
+    #[tokio::test]
+    async fn save_file_load_file_roundtrips_small() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let content = repo.save_file(b"hello file").await.unwrap();
+        assert_eq!(repo.load_file(&content).await.unwrap(), b"hello file");
+    }
+
+    #[tokio::test]
+    async fn save_file_load_file_roundtrips_multichunk() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // Larger than the 4 MiB max chunk size, so it must span multiple chunks.
+        let data = pseudo_random(5 * 1024 * 1024);
+        let content = repo.save_file(&data).await.unwrap();
+        assert!(content.len() >= 2, "expected multiple chunks");
+        assert_eq!(repo.load_file(&content).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn resaving_a_file_dedups_its_chunks() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let data = pseudo_random(2 * 1024 * 1024);
+        let ids1 = repo.save_file(&data).await.unwrap();
+        let packs = repo.backend().list(FileType::Pack).await.unwrap().len();
+        let ids2 = repo.save_file(&data).await.unwrap();
+        assert_eq!(ids1, ids2);
+        assert_eq!(
+            repo.backend().list(FileType::Pack).await.unwrap().len(),
+            packs
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_file_has_no_chunks() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let content = repo.save_file(b"").await.unwrap();
+        assert!(content.is_empty());
+        assert_eq!(repo.load_file(&content).await.unwrap(), b"");
     }
 }
