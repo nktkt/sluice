@@ -112,6 +112,11 @@ enum Command {
         /// Path of the file within the snapshot.
         path: String,
     },
+    /// Show repository metadata.
+    Info {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
 }
 
 #[tokio::main]
@@ -259,6 +264,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let data = dump(&repository, &id, &path).await?;
             use std::io::Write;
             std::io::stdout().write_all(&data)?;
+        }
+        Command::Info { repo } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let config = repository.config();
+            let snapshots = repository.list_snapshots().await?.len();
+            println!("repository:  {}", repository.id());
+            println!("created:     {}", format_utc(config.created_ns));
+            println!("cipher:      {:?}", config.cipher);
+            println!(
+                "chunker:     min {} / avg {} / max {} bytes",
+                config.chunker.min, config.chunker.avg, config.chunker.max
+            );
+            println!("pack target: {} bytes", config.pack_target);
+            println!("snapshots:   {snapshots}");
         }
     }
     Ok(())

@@ -88,3 +88,17 @@ fn missing_password_is_an_error() {
         .failure()
         .stderr(predicate::str::contains("SLUICE_PASSWORD"));
 }
+
+#[test]
+fn info_shows_repository_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("info")
+        .arg(&repo)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cipher:"))
+        .stdout(predicate::str::contains("snapshots:   0"));
+}
