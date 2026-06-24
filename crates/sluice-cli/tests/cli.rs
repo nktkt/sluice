@@ -102,3 +102,17 @@ fn info_shows_repository_metadata() {
         .stdout(predicate::str::contains("cipher:"))
         .stdout(predicate::str::contains("snapshots:   0"));
 }
+
+#[test]
+fn backup_of_missing_source_reports_clearly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(dir.path().join("nope"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a directory"));
+}

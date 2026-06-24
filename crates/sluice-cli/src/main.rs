@@ -122,8 +122,15 @@ enum Command {
     },
 }
 
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
     let confirm = matches!(cli.command, Command::Init { .. });
     let passphrase = read_passphrase(confirm)?;
