@@ -11,7 +11,7 @@
 use std::fmt;
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use zeroize::Zeroizing;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::{Key, derive_key, open, seal};
 
@@ -21,7 +21,7 @@ const WRAP_AAD: &[u8] = b"sluice.v1 master-key";
 /// The subkeys derived from the master key.
 ///
 /// `Debug` is redacted so key material never lands in logs.
-#[derive(Clone)]
+#[derive(Clone, ZeroizeOnDrop)]
 pub struct KeySet {
     /// Keyed-BLAKE3 key for content addresses (chunk and tree IDs).
     pub id_key: Key,
