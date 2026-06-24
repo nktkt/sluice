@@ -15,7 +15,7 @@ use std::pin::Pin;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sluice_core::{
-    EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
+    BlobKind, EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
 };
 use sluice_repo::{PruneReport, RepoError, Repository};
 use sluice_store::{FileType, StorageBackend};
@@ -271,6 +271,85 @@ pub async fn backup_dry_run<B: StorageBackend>(
     )
     .await?
     .summary)
+}
+
+/// Copy `snapshot` from `src` into `dst`, re-encrypting every blob under `dst`'s
+/// keys and rebuilding the trees, then committing the snapshot in `dst` (which
+/// takes a shared lock for the write). The two repositories may use different
+/// passphrases. The copy keeps the original's metadata (time, tags, paths) but
+/// has no parent, since the source's history does not exist in `dst`. Returns
+/// the new snapshot id in `dst`.
+pub async fn copy_snapshot<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    snapshot: &Id,
+) -> Result<Id> {
+    let snap = src.load_snapshot(snapshot).await?;
+    let lock = dst.acquire_lock(false).await?;
+    let result = copy_snapshot_inner(src, dst, &snap).await;
+    let _ = dst.release_lock(&lock).await;
+    result
+}
+
+/// The body of [`copy_snapshot`], run while holding `dst`'s shared lock.
+async fn copy_snapshot_inner<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    snap: &Snapshot,
+) -> Result<Id> {
+    let tree = copy_tree(src, dst, snap.tree).await?;
+    dst.flush().await?;
+    let new_snapshot = Snapshot {
+        tree,
+        parent: None,
+        ..snap.clone()
+    };
+    Ok(dst.commit_snapshot(&new_snapshot).await?)
+}
+
+/// Recursively copy the tree `tree_id` from `src` into `dst`, re-keying every
+/// content blob and rebuilding each node, returning the new tree id in `dst`.
+fn copy_tree<'a, S: StorageBackend, D: StorageBackend>(
+    src: &'a Repository<S>,
+    dst: &'a mut Repository<D>,
+    tree_id: Id,
+) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
+    Box::pin(async move {
+        let tree = src.load_tree(&tree_id).await?;
+        let mut nodes = Vec::with_capacity(tree.nodes.len());
+        for node in tree.nodes {
+            let (content, subtree) = match node.kind {
+                EntryKind::Dir => {
+                    let sub = match node.subtree {
+                        Some(child) => Some(copy_tree(src, dst, child).await?),
+                        None => None,
+                    };
+                    (Vec::new(), sub)
+                }
+                EntryKind::File => {
+                    let mut copied = Vec::with_capacity(node.content.len());
+                    for chunk in &node.content {
+                        let data = src.load_blob(chunk).await?;
+                        copied.push(dst.save_blob(BlobKind::Data, &data).await?);
+                    }
+                    (copied, None)
+                }
+                // Symlinks and special files reference no blobs.
+                _ => (Vec::new(), None),
+            };
+            nodes.push(Node {
+                content,
+                subtree,
+                ..node
+            });
+        }
+        Ok(dst
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes,
+            })
+            .await?)
+    })
 }
 
 /// Compile exclude globs (matched against entry names) into a [`GlobSet`].
@@ -2154,6 +2233,42 @@ mod tests {
         assert_eq!(again.files_unmodified, 2);
         // The dry run added no second snapshot.
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn copy_snapshot_between_repositories() {
+        let src_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src_dir.path().join("sub")).unwrap();
+        std::fs::write(src_dir.path().join("a.txt"), b"alpha").unwrap();
+        std::fs::write(src_dir.path().join("sub/b.bin"), vec![7u8; 3000]).unwrap();
+
+        let mut src = Repository::init(MemoryBackend::new(), b"src-pw", fast())
+            .await
+            .unwrap();
+        let snap = backup_excluding(&mut src, src_dir.path(), &[], &["weekly".into()][..])
+            .await
+            .unwrap();
+
+        // A separate repository with a *different* passphrase.
+        let mut dst = Repository::init(MemoryBackend::new(), b"dst-pw", fast())
+            .await
+            .unwrap();
+        let new_id = copy_snapshot(&src, &mut dst, &snap).await.unwrap();
+
+        // The copy authenticates in dst, keeps the metadata, and has no parent.
+        assert!(verify(&dst).await.is_ok());
+        let copied = dst.load_snapshot(&new_id).await.unwrap();
+        assert_eq!(copied.tags, vec!["weekly".to_string()]);
+        assert!(copied.parent.is_none());
+
+        // Restoring from dst reproduces the original bytes.
+        let out = tempfile::tempdir().unwrap();
+        restore(&dst, &new_id, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(out.path().join("sub/b.bin")).unwrap(),
+            vec![7u8; 3000]
+        );
     }
 
     #[tokio::test]
