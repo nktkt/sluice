@@ -177,3 +177,46 @@ fn stats_reports_counts() {
         .stdout(predicate::str::contains("snapshots:     1"))
         .stdout(predicate::str::contains("packs:"));
 }
+
+#[test]
+fn snapshots_and_stats_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hello json").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .arg("--tag")
+        .arg("daily")
+        .assert()
+        .success();
+
+    let out = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"].as_str().unwrap().len(), 64);
+    assert_eq!(arr[0]["tags"][0], "daily");
+    assert_eq!(arr[0]["files"], 1);
+
+    let out = sluice()
+        .arg("stats")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["snapshots"], 1);
+    assert!(v["packs"].as_u64().unwrap() >= 1);
+}

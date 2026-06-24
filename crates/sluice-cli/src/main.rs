@@ -71,6 +71,9 @@ enum Command {
         /// Only show snapshots with this tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Add or remove tags on a snapshot (rewrites it under a new id).
     Tag {
@@ -175,6 +178,9 @@ enum Command {
     Stats {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove advisory locks left behind by an interrupted operation.
     Unlock {
@@ -302,8 +308,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             restore_subpath(&repository, &id, path.as_deref(), &target).await?;
             println!("restored {id} into {}", target.display());
         }
-        Command::Snapshots { repo, tag } => {
+        Command::Snapshots { repo, tag, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let mut snaps = Vec::new();
             for id in repository.list_snapshots().await? {
                 let snap = repository.load_snapshot(&id).await?;
                 if let Some(tag) = &tag {
@@ -311,26 +318,56 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         continue;
                     }
                 }
-                let files = snap.summary.files_new
-                    + snap.summary.files_changed
-                    + snap.summary.files_unmodified;
-                let paths: Vec<String> = snap
-                    .paths
+                snaps.push((id, snap));
+            }
+            if json {
+                let arr: Vec<serde_json::Value> = snaps
                     .iter()
-                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .map(|(id, snap)| {
+                        let files = snap.summary.files_new
+                            + snap.summary.files_changed
+                            + snap.summary.files_unmodified;
+                        let paths: Vec<String> = snap
+                            .paths
+                            .iter()
+                            .map(|p| String::from_utf8_lossy(p).into_owned())
+                            .collect();
+                        serde_json::json!({
+                            "id": id.to_string(),
+                            "time_ns": snap.time_ns,
+                            "hostname": snap.hostname,
+                            "username": snap.username,
+                            "tags": snap.tags,
+                            "paths": paths,
+                            "files": files,
+                            "bytes": snap.summary.bytes_processed,
+                        })
+                    })
                     .collect();
-                let hex = id.to_string();
-                let tags = if snap.tags.is_empty() {
-                    String::new()
-                } else {
-                    format!("  [{}]", snap.tags.join(","))
-                };
-                println!(
-                    "{}  {}  {files} files  {}{tags}",
-                    &hex[..16],
-                    format_utc(snap.time_ns),
-                    paths.join(", ")
-                );
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for (id, snap) in &snaps {
+                    let files = snap.summary.files_new
+                        + snap.summary.files_changed
+                        + snap.summary.files_unmodified;
+                    let paths: Vec<String> = snap
+                        .paths
+                        .iter()
+                        .map(|p| String::from_utf8_lossy(p).into_owned())
+                        .collect();
+                    let hex = id.to_string();
+                    let tags = if snap.tags.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [{}]", snap.tags.join(","))
+                    };
+                    println!(
+                        "{}  {}  {files} files  {}{tags}",
+                        &hex[..16],
+                        format_utc(snap.time_ns),
+                        paths.join(", ")
+                    );
+                }
             }
         }
         Command::Tag {
@@ -519,7 +556,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("pack target: {} bytes", config.pack_target);
             println!("snapshots:   {snapshots}");
         }
-        Command::Stats { repo } => {
+        Command::Stats { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let pack_ids = repository.backend().list(FileType::Pack).await?;
             let mut stored = 0u64;
@@ -536,11 +573,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 0
             };
-            println!("snapshots:     {}", snapshots.len());
-            println!("packs:         {}", pack_ids.len());
-            println!("logical bytes: {logical}");
-            println!("stored bytes:  {stored}");
-            println!("saved:         {saved}% (dedup + compression)");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "snapshots": snapshots.len(),
+                        "packs": pack_ids.len(),
+                        "logical_bytes": logical,
+                        "stored_bytes": stored,
+                        "saved_percent": saved,
+                    }))?
+                );
+            } else {
+                println!("snapshots:     {}", snapshots.len());
+                println!("packs:         {}", pack_ids.len());
+                println!("logical bytes: {logical}");
+                println!("stored bytes:  {stored}");
+                println!("saved:         {saved}% (dedup + compression)");
+            }
         }
         Command::Unlock { repo } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;

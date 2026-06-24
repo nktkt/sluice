@@ -23,6 +23,7 @@ tokio = { workspace = true }
 rpassword = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -1796,6 +1796,7 @@ dependencies = [
  "object_store",
  "predicates",
  "rpassword",
+ "serde_json",
  "sluice-core",
  "sluice-crypto",
  "sluice-engine",
