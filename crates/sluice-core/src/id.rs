@@ -3,12 +3,15 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// A 256-bit content address — the BLAKE3 hash that names a blob, pack, tree, or
 /// snapshot object in a repository (see `DESIGN.md` §3).
 ///
 /// `Id` is an opaque 32-byte value with a lowercase-hex textual form. Ordering is
 /// lexicographic over the raw bytes, which matches the sorted on-disk index
-/// segment layout.
+/// segment layout. It serializes as a compact CBOR byte string.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id([u8; Self::LEN]);
 
@@ -72,6 +75,64 @@ impl FromStr for Id {
     }
 }
 
+impl Serialize for Id {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Id {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct IdVisitor;
+
+        impl<'de> Visitor<'de> for IdVisitor {
+            type Value = Id;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a {}-byte content address", Id::LEN)
+            }
+
+            fn visit_bytes<E>(self, v: &[u8]) -> Result<Id, E>
+            where
+                E: de::Error,
+            {
+                let arr: [u8; Id::LEN] = v
+                    .try_into()
+                    .map_err(|_| E::invalid_length(v.len(), &self))?;
+                Ok(Id::from_bytes(arr))
+            }
+
+            fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Id, E>
+            where
+                E: de::Error,
+            {
+                self.visit_bytes(&v)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Id, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut arr = [0u8; Id::LEN];
+                for (i, slot) in arr.iter_mut().enumerate() {
+                    *slot = seq
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(i, &self))?;
+                }
+                Ok(Id::from_bytes(arr))
+            }
+        }
+
+        deserializer.deserialize_bytes(IdVisitor)
+    }
+}
+
 /// Error returned when parsing an [`Id`] from its hex form fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdParseError {
@@ -119,6 +180,7 @@ const fn unhex(c: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{from_cbor, to_cbor};
 
     #[test]
     fn hex_roundtrips() {
@@ -170,5 +232,15 @@ mod tests {
         let mut bytes = [0u8; Id::LEN];
         bytes[..4].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(format!("{:?}", Id::from_bytes(bytes)), "Id(deadbeef…)");
+    }
+
+    #[test]
+    fn serde_roundtrips_as_compact_byte_string() {
+        let id = Id::from_bytes([0x42; Id::LEN]);
+        let bytes = to_cbor(&id).unwrap();
+        // CBOR byte string of 32 bytes: 0x58 0x20 + 32 bytes = 34 bytes total.
+        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes[0], 0x58);
+        assert_eq!(from_cbor::<Id>(&bytes).unwrap(), id);
     }
 }
