@@ -245,12 +245,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Prune { repo, dry_run } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let count = prune(&mut repository, dry_run).await?;
-            if dry_run {
-                println!("would prune {count} packs");
-            } else {
-                println!("pruned {count} packs");
-            }
+            let report = prune(&mut repository, dry_run).await?;
+            let verb = if dry_run { "would prune" } else { "pruned" };
+            println!(
+                "{verb} {} packs, {} repacked",
+                report.deleted, report.repacked
+            );
         }
         Command::Ls { repo, snapshot } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;

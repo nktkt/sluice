@@ -17,7 +17,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use sluice_core::{
     EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
 };
-use sluice_repo::{RepoError, Repository};
+use sluice_repo::{PruneReport, RepoError, Repository};
 use sluice_store::{FileType, StorageBackend};
 
 /// Errors from engine operations.
@@ -280,9 +280,12 @@ pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -
 }
 
 /// Delete packs no longer referenced by any surviving snapshot, returning the
-/// number removed (mark-and-sweep GC; see `DESIGN.md` §8). With `dry_run`, count
-/// the packs that would be removed without deleting anything.
-pub async fn prune<B: StorageBackend>(repo: &mut Repository<B>, dry_run: bool) -> Result<usize> {
+/// counts of packs deleted and repacked (mark-and-sweep GC; see `DESIGN.md` §8).
+/// With `dry_run`, report what would happen without touching storage.
+pub async fn prune<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    dry_run: bool,
+) -> Result<PruneReport> {
     // MARK: collect every blob reachable from a surviving snapshot.
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
@@ -884,11 +887,11 @@ mod tests {
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
         forget(&repo, &snap1).await.unwrap();
-        let removed = prune(&mut repo, false).await.unwrap();
+        let report = prune(&mut repo, false).await.unwrap();
         let after = repo.backend().list(FileType::Pack).await.unwrap().len();
 
-        assert!(removed >= 1, "expected to reclaim packs");
-        assert_eq!(before - after, removed);
+        assert!(report.deleted >= 1, "expected to reclaim packs");
+        assert_eq!(before - after, report.deleted);
         // The surviving snapshot still verifies.
         assert!(verify(&repo).await.is_ok());
     }
@@ -1294,7 +1297,7 @@ mod tests {
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
         let would = prune(&mut repo, true).await.unwrap();
-        assert!(would >= 1, "dry-run should find packs to prune");
+        assert!(would.deleted >= 1, "dry-run should find packs to prune");
         assert_eq!(
             repo.backend().list(FileType::Pack).await.unwrap().len(),
             before,
@@ -1302,7 +1305,7 @@ mod tests {
         );
 
         let removed = prune(&mut repo, false).await.unwrap();
-        assert_eq!(removed, would);
+        assert_eq!(removed.deleted, would.deleted);
         assert!(repo.backend().list(FileType::Pack).await.unwrap().len() < before);
     }
 
