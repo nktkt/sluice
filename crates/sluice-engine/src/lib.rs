@@ -453,26 +453,43 @@ pub struct VerifyReport {
     pub blobs: usize,
 }
 
+/// Concurrent content-blob reads during [`verify`].
+const VERIFY_CONCURRENCY: usize = 16;
+
 /// Verify every snapshot in `repo` by reading and authenticating all reachable
 /// trees and content blobs (a full read-data check; see `DESIGN.md` §5.7).
 ///
-/// Returns the counts on success, or the first error identifying a missing or
-/// corrupt object.
+/// The trees are walked and authenticated first (counting them and collecting
+/// the referenced content blobs); the content blobs are then read and
+/// AEAD-authenticated concurrently, which is far faster on a high-latency
+/// (object-store) backend. Returns the counts on success, or an error
+/// identifying a missing or corrupt object.
 pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyReport> {
+    use futures::stream::{StreamExt, TryStreamExt};
+
     let mut report = VerifyReport::default();
+    let mut content: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
         let snap = repo.load_snapshot(&snapshot).await?;
         report.snapshots += 1;
-        verify_tree(repo, snap.tree, &mut report).await?;
+        collect_verify(repo, snap.tree, &mut report, &mut content).await?;
     }
+    // Read and authenticate every referenced content blob concurrently; load_blob
+    // checks the AEAD tag, so any corrupt or missing blob surfaces as an error.
+    futures::stream::iter(content.iter().map(|id| repo.load_blob(id)))
+        .buffer_unordered(VERIFY_CONCURRENCY)
+        .try_for_each(|_| async { Ok(()) })
+        .await?;
     Ok(report)
 }
 
-/// Recursively read and authenticate the tree `tree_id` and its content blobs.
-fn verify_tree<'a, B: StorageBackend>(
+/// Recursively authenticate the tree `tree_id` (counting trees) and collect the
+/// ids of every content blob it references; the blobs are read by [`verify`].
+fn collect_verify<'a, B: StorageBackend>(
     repo: &'a Repository<B>,
     tree_id: Id,
     report: &'a mut VerifyReport,
+    content: &'a mut HashSet<Id>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let tree = repo.load_tree(&tree_id).await?;
@@ -481,14 +498,13 @@ fn verify_tree<'a, B: StorageBackend>(
             match node.kind {
                 EntryKind::Dir => {
                     if let Some(subtree) = node.subtree {
-                        verify_tree(repo, subtree, report).await?;
+                        collect_verify(repo, subtree, report, content).await?;
                     }
                 }
                 EntryKind::File => {
                     for id in &node.content {
-                        // load_blob authenticates (AEAD) and decompresses.
-                        repo.load_blob(id).await?;
                         report.blobs += 1;
+                        content.insert(*id);
                     }
                 }
                 _ => {}
@@ -1486,6 +1502,69 @@ mod tests {
             .await
             .unwrap();
         assert!(verify(&repo).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_fails_on_a_missing_content_blob() {
+        use sluice_core::BlobKind;
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let mut repo = Repository::init(backend.clone(), b"pw", fast())
+            .await
+            .unwrap();
+        // A content blob alone in its own pack.
+        let chunk = repo
+            .save_blob(BlobKind::Data, b"file contents")
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let content_pack = repo.backend().list(FileType::Pack).await.unwrap()[0];
+        // A tree referencing it (in a separate pack) and a snapshot.
+        let node = Node {
+            name: b"f".to_vec(),
+            kind: EntryKind::File,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 13,
+            content: vec![chunk],
+            subtree: None,
+            link_target: None,
+        };
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![node],
+            })
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        repo.commit_snapshot(&Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns: 0,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        })
+        .await
+        .unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        // Remove the content blob's pack (the tree's pack stays): the tree loads
+        // during the walk, but the concurrent content read then fails.
+        backend.remove(FileType::Pack, &content_pack).await.unwrap();
+        let reopened = Repository::open(backend.clone(), b"pw").await.unwrap();
+        assert!(verify(&reopened).await.is_err());
     }
 
     #[tokio::test]

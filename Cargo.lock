@@ -1837,6 +1837,7 @@ name = "sluice-engine"
 version = "0.0.0"
 dependencies = [
  "filetime",
+ "futures",
  "globset",
  "sluice-core",
  "sluice-crypto",
