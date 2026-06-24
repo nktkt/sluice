@@ -547,6 +547,16 @@ async fn prune_marked<B: StorageBackend>(
     Ok(repo.sweep(&live, dry_run).await?)
 }
 
+/// Repair the repository's index segments by rescanning packs (see
+/// [`Repository::rebuild_index`]). Holds the exclusive lock for the rewrite and
+/// returns the number of packs indexed.
+pub async fn rebuild_index<B: StorageBackend>(repo: &mut Repository<B>) -> Result<usize> {
+    let lock = repo.acquire_lock(true).await?;
+    let result = repo.rebuild_index().await;
+    let _ = repo.release_lock(&lock).await;
+    Ok(result?)
+}
+
 /// Mark the tree `tree_id` and everything it references as live.
 fn mark_tree<'a, B: StorageBackend>(
     repo: &'a Repository<B>,

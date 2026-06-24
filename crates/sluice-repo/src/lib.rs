@@ -518,6 +518,43 @@ impl<B: StorageBackend> Repository<B> {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Rebuild every index segment by rescanning packs: rewrite each pack's
+    /// segment from its footer, drop orphan segments (whose pack is gone), and
+    /// refresh the in-memory index. Repairs missing, corrupt, or stale segments
+    /// (see `DESIGN.md` §5.2). Returns the number of packs indexed.
+    pub async fn rebuild_index(&mut self) -> Result<usize> {
+        let packs: HashSet<Id> = self
+            .backend
+            .list(FileType::Pack)
+            .await?
+            .into_iter()
+            .collect();
+
+        // Drop index segments whose pack no longer exists.
+        for idx_id in self.backend.list(FileType::Index).await? {
+            if !packs.contains(&idx_id) {
+                let _ = self.backend.remove(FileType::Index, &idx_id).await;
+            }
+        }
+
+        // Rewrite each pack's segment from its plaintext footer.
+        for pack_id in &packs {
+            let bytes = self.backend.get(FileType::Pack, pack_id).await?;
+            let reader = PackReader::parse(&bytes)?;
+            let directory: Vec<BlobEntry> = reader.entries().to_vec();
+            let _ = self.backend.remove(FileType::Index, pack_id).await;
+            let index_bytes = to_cbor(&directory).map_err(codec)?;
+            self.backend
+                .put(FileType::Index, pack_id, index_bytes.into())
+                .await?;
+        }
+
+        // Refresh the in-memory index from the now-consistent segments.
+        let index = build_index(&self.backend).await?;
+        self.index = index;
+        Ok(packs.len())
+    }
 }
 
 /// Build the chunk index, preferring persisted per-pack index segments and
@@ -927,6 +964,57 @@ mod tests {
         assert_eq!(indexes, packs);
         assert_eq!(repo.load_blob(&keep).await.unwrap(), vec![1u8; 4000]);
         assert!(repo.load_blob(&drop).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rebuild_index_repairs_damaged_segments() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let id1 = repo
+            .save_blob(BlobKind::Data, &vec![1u8; 3000])
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let id2 = repo
+            .save_blob(BlobKind::Data, &vec![2u8; 3000])
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let packs = repo.backend().list(FileType::Pack).await.unwrap();
+        assert_eq!(packs.len(), 2);
+
+        // Damage the index: delete one segment, corrupt another, add an orphan.
+        repo.backend()
+            .remove(FileType::Index, &packs[0])
+            .await
+            .unwrap();
+        repo.backend()
+            .remove(FileType::Index, &packs[1])
+            .await
+            .unwrap();
+        repo.backend()
+            .put(FileType::Index, &packs[1], b"garbage".to_vec().into())
+            .await
+            .unwrap();
+        let orphan = Id::from_bytes([0xAB; Id::LEN]);
+        repo.backend()
+            .put(FileType::Index, &orphan, b"orphan".to_vec().into())
+            .await
+            .unwrap();
+
+        let n = repo.rebuild_index().await.unwrap();
+        assert_eq!(n, 2);
+
+        // Segments now correspond 1:1 with packs and the orphan is gone.
+        let mut idx = repo.backend().list(FileType::Index).await.unwrap();
+        let mut pk = repo.backend().list(FileType::Pack).await.unwrap();
+        idx.sort();
+        pk.sort();
+        assert_eq!(idx, pk);
+        // The refreshed in-memory index still serves both blobs.
+        assert_eq!(repo.load_blob(&id1).await.unwrap(), vec![1u8; 3000]);
+        assert_eq!(repo.load_blob(&id2).await.unwrap(), vec![2u8; 3000]);
     }
 
     #[tokio::test]

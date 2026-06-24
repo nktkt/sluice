@@ -15,7 +15,7 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, RetentionPolicy, backup_excluding, check, diff, dump, forget, forget_tagged,
-    forget_with_policy, list_files, prune, prune_excluding, restore_subpath, verify,
+    forget_with_policy, list_files, prune, prune_excluding, rebuild_index, restore_subpath, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -154,6 +154,11 @@ enum Command {
     },
     /// Remove advisory locks left behind by an interrupted operation.
     Unlock {
+        /// Repository path or object-store URL.
+        repo: String,
+    },
+    /// Rebuild index segments by rescanning packs (repairs a damaged index).
+    RebuildIndex {
         /// Repository path or object-store URL.
         repo: String,
     },
@@ -421,6 +426,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 repository.release_lock(id).await?;
             }
             println!("removed {} lock(s)", locks.len());
+        }
+        Command::RebuildIndex { repo } => {
+            let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let n = rebuild_index(&mut repository).await?;
+            println!("rebuilt index for {n} pack(s)");
         }
     }
     Ok(())
