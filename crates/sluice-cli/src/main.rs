@@ -1,8 +1,8 @@
 //! `sluice` — command-line interface for the encrypted, deduplicating backup
 //! and disaster-recovery tool (see `DESIGN.md` §7).
 //!
-//! The passphrase is read from the `SLUICE_PASSWORD` environment variable; an
-//! interactive prompt and the wider command surface are follow-up work.
+//! The passphrase comes from the `SLUICE_PASSWORD` environment variable, or an
+//! interactive no-echo prompt when a terminal is attached.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -72,8 +72,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
-    let passphrase = std::env::var("SLUICE_PASSWORD")
-        .map_err(|_| "set the SLUICE_PASSWORD environment variable")?;
+    let confirm = matches!(cli.command, Command::Init { .. });
+    let passphrase = read_passphrase(confirm)?;
     let pw = passphrase.as_bytes();
 
     match cli.command {
@@ -204,6 +204,23 @@ fn format_utc(ns: i64) -> String {
     let year = yoe + era * 400 + i64::from(month <= 2);
 
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Read the passphrase from `SLUICE_PASSWORD`, or prompt with no echo when a
+/// terminal is attached. With `confirm` set (for `init`), it is entered twice.
+fn read_passphrase(confirm: bool) -> Result<String, Box<dyn Error>> {
+    use std::io::IsTerminal;
+    if let Ok(passphrase) = std::env::var("SLUICE_PASSWORD") {
+        return Ok(passphrase);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err("no passphrase: set SLUICE_PASSWORD or run in a terminal".into());
+    }
+    let passphrase = rpassword::prompt_password("Passphrase: ")?;
+    if confirm && passphrase != rpassword::prompt_password("Confirm passphrase: ")? {
+        return Err("passphrases do not match".into());
+    }
+    Ok(passphrase)
 }
 
 #[cfg(test)]
