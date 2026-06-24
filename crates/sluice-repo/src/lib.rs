@@ -243,6 +243,15 @@ impl<B: StorageBackend> Repository<B> {
         self.backend
             .put(FileType::Pack, &pack_id, bytes.into())
             .await?;
+        // Persist the pack's blob directory as an index segment (id == pack id)
+        // so a later open need not re-scan the pack. Best-effort: the pack footer
+        // stays the source of truth and open falls back to scanning if absent.
+        if let Ok(index_bytes) = to_cbor(&directory) {
+            let _ = self
+                .backend
+                .put(FileType::Index, &pack_id, index_bytes.into())
+                .await;
+        }
         for entry in &directory {
             self.index.insert(entry.id, (pack_id, *entry));
         }
@@ -268,6 +277,7 @@ impl<B: StorageBackend> Repository<B> {
                 report.reclaimed_bytes += bytes.len() as u64;
                 if !dry_run {
                     self.backend.remove(FileType::Pack, &pack_id).await?;
+                    let _ = self.backend.remove(FileType::Index, &pack_id).await;
                     for entry in &entries {
                         self.index.remove(&entry.id);
                     }
@@ -290,7 +300,14 @@ impl<B: StorageBackend> Repository<B> {
                     self.backend
                         .put(FileType::Pack, &new_pack_id, new_bytes.into())
                         .await?;
+                    if let Ok(index_bytes) = to_cbor(&directory) {
+                        let _ = self
+                            .backend
+                            .put(FileType::Index, &new_pack_id, index_bytes.into())
+                            .await;
+                    }
                     self.backend.remove(FileType::Pack, &pack_id).await?;
+                    let _ = self.backend.remove(FileType::Index, &pack_id).await;
                     for entry in &entries {
                         self.index.remove(&entry.id);
                     }
@@ -503,14 +520,38 @@ impl<B: StorageBackend> Repository<B> {
     }
 }
 
-/// Rebuild the chunk index by reading every pack's plaintext directory footer.
+/// Build the chunk index, preferring persisted per-pack index segments and
+/// falling back to scanning any pack not covered by a valid, current segment.
+/// Packs are the source of truth, so missing or stale segments are self-healing.
 async fn build_index<B: StorageBackend>(backend: &B) -> Result<HashMap<Id, (Id, BlobEntry)>> {
+    let packs: HashSet<Id> = backend.list(FileType::Pack).await?.into_iter().collect();
     let mut index = HashMap::new();
-    for pack_id in backend.list(FileType::Pack).await? {
-        let bytes = backend.get(FileType::Pack, &pack_id).await?;
+    let mut covered: HashSet<Id> = HashSet::new();
+
+    // Fast path: read each index segment whose pack still exists (id == pack id).
+    for idx_id in backend.list(FileType::Index).await? {
+        if !packs.contains(&idx_id) {
+            continue; // segment for a pack that is gone
+        }
+        let bytes = backend.get(FileType::Index, &idx_id).await?;
+        let Ok(entries) = from_cbor::<Vec<BlobEntry>>(&bytes) else {
+            continue; // unreadable segment: scan the pack instead
+        };
+        for entry in &entries {
+            index.insert(entry.id, (idx_id, *entry));
+        }
+        covered.insert(idx_id);
+    }
+
+    // Fallback: scan packs with no usable index segment (legacy or failed write).
+    for pack_id in &packs {
+        if covered.contains(pack_id) {
+            continue;
+        }
+        let bytes = backend.get(FileType::Pack, pack_id).await?;
         let reader = PackReader::parse(&bytes)?;
         for entry in reader.entries() {
-            index.insert(entry.id, (pack_id, *entry));
+            index.insert(entry.id, (*pack_id, *entry));
         }
     }
     Ok(index)
@@ -820,6 +861,72 @@ mod tests {
             let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
             assert_eq!(repo.load_blob(&id).await.unwrap(), data);
         }
+    }
+
+    #[tokio::test]
+    async fn flush_persists_pack_index_and_open_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = vec![7u8; 5000];
+        let blob_id = {
+            let mut repo = Repository::init(
+                LocalBackend::create(dir.path()).await.unwrap(),
+                b"pw",
+                fast(),
+            )
+            .await
+            .unwrap();
+            let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
+            repo.flush().await.unwrap();
+            // An index segment was written, one per pack, keyed by pack id.
+            let packs = repo.backend().list(FileType::Pack).await.unwrap();
+            let indexes = repo.backend().list(FileType::Index).await.unwrap();
+            assert_eq!(packs.len(), 1);
+            assert_eq!(indexes, packs);
+            id
+        };
+
+        // Reopen: the index is built from the persisted segment and serves blobs.
+        let repo = Repository::open(LocalBackend::open(dir.path()), b"pw")
+            .await
+            .unwrap();
+        assert_eq!(repo.load_blob(&blob_id).await.unwrap(), data);
+
+        // Delete every index segment; a reopen must fall back to scanning packs.
+        for id in repo.backend().list(FileType::Index).await.unwrap() {
+            repo.backend().remove(FileType::Index, &id).await.unwrap();
+        }
+        let rescanned = Repository::open(LocalBackend::open(dir.path()), b"pw")
+            .await
+            .unwrap();
+        assert_eq!(rescanned.load_blob(&blob_id).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn sweep_rewrites_index_segments_on_repack() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let keep = repo
+            .save_blob(BlobKind::Data, &vec![1u8; 4000])
+            .await
+            .unwrap();
+        let drop = repo
+            .save_blob(BlobKind::Data, &vec![2u8; 4000])
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+
+        // Only `keep` is live, so the shared pack is repacked into a fresh one.
+        let report = repo.sweep(&HashSet::from([keep]), false).await.unwrap();
+        assert_eq!(report.repacked, 1);
+
+        // The old pack's index segment is gone and the new pack's is present.
+        let packs = repo.backend().list(FileType::Pack).await.unwrap();
+        let indexes = repo.backend().list(FileType::Index).await.unwrap();
+        assert_eq!(packs.len(), 1);
+        assert_eq!(indexes, packs);
+        assert_eq!(repo.load_blob(&keep).await.unwrap(), vec![1u8; 4000]);
+        assert!(repo.load_blob(&drop).await.is_err());
     }
 
     #[tokio::test]
