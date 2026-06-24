@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Init { repo } => {
             let backend = LocalBackend::create(&repo).await?;
-            let repository = Repository::init(backend, pw, KdfParams::DEFAULT).await?;
+            let repository = Repository::init(backend, pw, kdf_params()).await?;
             println!(
                 "initialized repository {} at {}",
                 repository.id(),
@@ -126,4 +126,23 @@ async fn resolve_snapshot<B: StorageBackend>(
         [] => Err(format!("no snapshot matches '{needle}'").into()),
         _ => Err(format!("ambiguous snapshot prefix '{needle}'").into()),
     }
+}
+
+/// Argon2id parameters for `init`, tunable via the environment for power users
+/// and tests (`SLUICE_KDF_MEMORY_KIB`, `SLUICE_KDF_PASSES`); defaults otherwise.
+fn kdf_params() -> KdfParams {
+    let mut params = KdfParams::DEFAULT;
+    if let Some(memory) = std::env::var("SLUICE_KDF_MEMORY_KIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        params.m_cost_kib = memory;
+    }
+    if let Some(passes) = std::env::var("SLUICE_KDF_PASSES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        params.t_cost = passes;
+    }
+    params
 }
