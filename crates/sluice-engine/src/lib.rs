@@ -130,13 +130,25 @@ pub async fn backup_sources<B: StorageBackend>(
     tags: &[String],
     dry_run: bool,
 ) -> Result<BackupOutcome> {
-    backup_sources_with_progress(repo, sources, exclude_globs, tags, dry_run, None, None).await
+    backup_sources_with_progress(
+        repo,
+        sources,
+        exclude_globs,
+        tags,
+        dry_run,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 /// Like [`backup_sources`], but `progress` (if any) is invoked once per regular
-/// file as it is processed (for `--verbose`/progress output), and a regular file
+/// file as it is processed (for `--verbose`/progress output); a regular file
 /// discovered during a directory walk larger than `max_file_size` is skipped
-/// (explicitly named single-file sources are always backed up).
+/// (explicitly named single-file sources are always backed up); and with
+/// `one_file_system`, the walk does not descend into subdirectories on a
+/// different filesystem than their source root.
 pub async fn backup_sources_with_progress<B: StorageBackend>(
     repo: &mut Repository<B>,
     sources: &[PathBuf],
@@ -144,6 +156,7 @@ pub async fn backup_sources_with_progress<B: StorageBackend>(
     tags: &[String],
     dry_run: bool,
     max_file_size: Option<u64>,
+    one_file_system: bool,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     if sources.is_empty() {
@@ -168,6 +181,7 @@ pub async fn backup_sources_with_progress<B: StorageBackend>(
         tags,
         dry_run,
         max_file_size,
+        one_file_system,
         progress,
     )
     .await;
@@ -185,9 +199,25 @@ async fn backup_sources_inner<B: StorageBackend>(
     tags: &[String],
     dry_run: bool,
     max_file_size: Option<u64>,
+    one_file_system: bool,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     let excludes = build_globset(exclude_globs)?;
+    let base_ctx = BackupCtx {
+        excludes: &excludes,
+        dry_run,
+        max_file_size,
+        root_dev: None,
+        progress,
+    };
+    // The device of a directory source, for --one-file-system.
+    let root_dev = |dir: &Path| -> Option<u64> {
+        one_file_system.then(|| {
+            std::fs::symlink_metadata(dir)
+                .map(|m| dev_of(&m))
+                .unwrap_or(0)
+        })
+    };
     let parent = latest_snapshot(repo).await?;
     let mut summary = SnapshotStats::default();
 
@@ -215,8 +245,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                 &meta,
                 parent_node.as_ref(),
                 &mut summary,
-                dry_run,
-                progress,
+                base_ctx,
             )
             .await?;
             let tree = Tree {
@@ -231,17 +260,11 @@ async fn backup_sources_inner<B: StorageBackend>(
         } else {
             // Single directory: its tree is the snapshot root.
             let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
-            backup_dir(
-                repo,
-                source.clone(),
-                parent_tree,
-                &excludes,
-                &mut summary,
-                dry_run,
-                max_file_size,
-                progress,
-            )
-            .await?
+            let ctx = BackupCtx {
+                root_dev: root_dev(source),
+                ..base_ctx
+            };
+            backup_dir(repo, source.clone(), parent_tree, &mut summary, ctx).await?
         }
     } else {
         // Multiple sources: a synthetic root with one directory entry per source.
@@ -280,8 +303,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                         &meta,
                         parent_node,
                         &mut summary,
-                        dry_run,
-                        progress,
+                        base_ctx,
                     )
                     .await?,
                 );
@@ -289,17 +311,12 @@ async fn backup_sources_inner<B: StorageBackend>(
                 let parent_sub = parent_root
                     .get(&name)
                     .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-                let subtree = backup_dir(
-                    repo,
-                    source.clone(),
-                    parent_sub,
-                    &excludes,
-                    &mut summary,
-                    dry_run,
-                    max_file_size,
-                    progress,
-                )
-                .await?;
+                let ctx = BackupCtx {
+                    root_dev: root_dev(source),
+                    ..base_ctx
+                };
+                let subtree =
+                    backup_dir(repo, source.clone(), parent_sub, &mut summary, ctx).await?;
                 summary.dirs += 1;
                 nodes.push(Node {
                     name,
@@ -1552,6 +1569,23 @@ async fn find_node<B: StorageBackend>(
 /// `parent` (the matching node from the previous snapshot) has the same size and
 /// mtime, its chunk list is reused without re-reading; otherwise the file is read
 /// and chunked (unless `dry_run`). Updates `stats`.
+/// Read-only configuration threaded through the recursive backup walk, bundled
+/// to keep [`backup_dir`]/[`backup_file`] signatures small.
+#[derive(Clone, Copy)]
+struct BackupCtx<'a> {
+    /// Entry-name globs to skip.
+    excludes: &'a GlobSet,
+    /// Preview only — read and count, but write nothing.
+    dry_run: bool,
+    /// Skip a discovered regular file larger than this.
+    max_file_size: Option<u64>,
+    /// With `--one-file-system`, the device of the source root; a subdirectory on
+    /// a different device is not descended into.
+    root_dev: Option<u64>,
+    /// Per-file progress callback (`--verbose`).
+    progress: Option<ProgressFn<'a>>,
+}
+
 async fn backup_file<B: StorageBackend>(
     repo: &mut Repository<B>,
     path: &Path,
@@ -1559,8 +1593,7 @@ async fn backup_file<B: StorageBackend>(
     meta: &std::fs::Metadata,
     parent: Option<&Node>,
     stats: &mut SnapshotStats,
-    dry_run: bool,
-    progress: Option<ProgressFn<'_>>,
+    ctx: BackupCtx<'_>,
 ) -> Result<Node> {
     let mtime = mtime_ns(meta);
     let reuse = parent.and_then(|prev| {
@@ -1574,7 +1607,7 @@ async fn backup_file<B: StorageBackend>(
     } else {
         FileStatus::New
     };
-    if let Some(report) = progress {
+    if let Some(report) = ctx.progress {
         report(path, status);
     }
     let (content, size) = if let Some(content) = reuse {
@@ -1586,7 +1619,7 @@ async fn backup_file<B: StorageBackend>(
         } else {
             stats.files_new += 1;
         }
-        if dry_run {
+        if ctx.dry_run {
             (Vec::new(), meta.len())
         } else {
             // Stream the file through the chunker so peak memory is bounded by the
@@ -1626,11 +1659,8 @@ fn backup_dir<'a, B: StorageBackend>(
     repo: &'a mut Repository<B>,
     dir: PathBuf,
     parent: Option<Id>,
-    excludes: &'a GlobSet,
     stats: &'a mut SnapshotStats,
-    dry_run: bool,
-    max_file_size: Option<u64>,
-    progress: Option<ProgressFn<'a>>,
+    ctx: BackupCtx<'a>,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
         // Load the parent directory's entries for incremental reuse.
@@ -1656,7 +1686,7 @@ fn backup_dir<'a, B: StorageBackend>(
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
             let file_name = entry.file_name();
-            if excludes.is_match(&file_name) {
+            if ctx.excludes.is_match(&file_name) {
                 continue;
             }
             let path = entry.path();
@@ -1666,8 +1696,14 @@ fn backup_dir<'a, B: StorageBackend>(
             let mtime = mtime_ns(&meta);
 
             // Skip regular files over the size limit (--exclude-larger-than).
-            if let Some(limit) = max_file_size {
+            if let Some(limit) = ctx.max_file_size {
                 if kind.is_file() && meta.len() > limit {
+                    continue;
+                }
+            }
+            // With --one-file-system, don't descend into a mounted subdirectory.
+            if let Some(root_dev) = ctx.root_dev {
+                if kind.is_dir() && dev_of(&meta) != root_dev {
                     continue;
                 }
             }
@@ -1676,17 +1712,7 @@ fn backup_dir<'a, B: StorageBackend>(
                 let parent_sub = parent_nodes
                     .get(&name)
                     .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-                let subtree = backup_dir(
-                    repo,
-                    path.clone(),
-                    parent_sub,
-                    excludes,
-                    stats,
-                    dry_run,
-                    max_file_size,
-                    progress,
-                )
-                .await?;
+                let subtree = backup_dir(repo, path.clone(), parent_sub, stats, ctx).await?;
                 stats.dirs += 1;
                 Node {
                     name,
@@ -1708,17 +1734,7 @@ fn backup_dir<'a, B: StorageBackend>(
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
-                backup_file(
-                    repo,
-                    &path,
-                    name,
-                    &meta,
-                    parent_node,
-                    stats,
-                    dry_run,
-                    progress,
-                )
-                .await?
+                backup_file(repo, &path, name, &meta, parent_node, stats, ctx).await?
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&path).map_err(|e| io_err(&path, e))?;
                 Node {
@@ -1772,7 +1788,7 @@ fn backup_dir<'a, B: StorageBackend>(
             version: TREE_VERSION,
             nodes,
         };
-        if dry_run {
+        if ctx.dry_run {
             // No snapshot is committed, so the tree id is never referenced.
             Ok(Id::from_bytes([0u8; 32]))
         } else {
@@ -2166,6 +2182,18 @@ fn is_sparse(meta: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_sparse(_meta: &std::fs::Metadata) -> bool {
     false
+}
+
+/// The id of the filesystem `meta` lives on, for `--one-file-system`.
+#[cfg(unix)]
+fn dev_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.dev()
+}
+
+#[cfg(not(unix))]
+fn dev_of(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// A [`Read`] over a file's content that skips reading holes: it consults
@@ -2700,9 +2728,18 @@ mod tests {
         // First backup: both files are new.
         let first = Mutex::new(Vec::new());
         let report = |p: &Path, s: FileStatus| collect(&first, p, s);
-        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, None, Some(&report))
-            .await
-            .unwrap();
+        backup_sources_with_progress(
+            &mut repo,
+            &sources,
+            &[],
+            &[],
+            false,
+            None,
+            false,
+            Some(&report),
+        )
+        .await
+        .unwrap();
         let mut got = first.into_inner().unwrap();
         got.sort_by(|x, y| x.0.cmp(&y.0));
         assert_eq!(
@@ -2714,9 +2751,18 @@ mod tests {
         std::fs::write(src.path().join("a"), b"alpha is now longer").unwrap();
         let second = Mutex::new(Vec::new());
         let report2 = |p: &Path, s: FileStatus| collect(&second, p, s);
-        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, None, Some(&report2))
-            .await
-            .unwrap();
+        backup_sources_with_progress(
+            &mut repo,
+            &sources,
+            &[],
+            &[],
+            false,
+            None,
+            false,
+            Some(&report2),
+        )
+        .await
+        .unwrap();
         let mut got = second.into_inner().unwrap();
         got.sort_by(|x, y| x.0.cmp(&y.0));
         assert_eq!(
@@ -2744,6 +2790,7 @@ mod tests {
             &[],
             false,
             Some(1024),
+            false,
             None,
         )
         .await
@@ -2759,6 +2806,65 @@ mod tests {
         assert!(
             !names.iter().any(|p| p == "big"),
             "the oversized file must be skipped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_one_file_system_skips_mount_points() {
+        use std::process::Command;
+        // Mounting a tmpfs needs root; skip when unprivileged.
+        if rustix::process::geteuid().as_raw() != 0 {
+            return;
+        }
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("local.txt"), b"on the root fs").unwrap();
+        let mnt = src.path().join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        // A tmpfs at `mnt` is a different filesystem; skip if mount is denied.
+        let mounted = Command::new("mount")
+            .args(["-t", "tmpfs", "tmpfs"])
+            .arg(&mnt)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !mounted {
+            return;
+        }
+        std::fs::write(mnt.join("on_tmpfs.txt"), b"different fs").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let outcome = backup_sources_with_progress(
+            &mut repo,
+            &[src.path().to_path_buf()],
+            &[],
+            &[],
+            false,
+            None,
+            true,
+            None,
+        )
+        .await;
+        // Always unmount before asserting (and before the tempdir is dropped).
+        let _ = Command::new("umount").arg(&mnt).status();
+
+        let snap = outcome.unwrap().snapshot.unwrap();
+        let names: Vec<String> = list_files(&repo, &snap)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(names.iter().any(|p| p == "local.txt"));
+        assert!(
+            !names.iter().any(|p| p.contains("on_tmpfs")),
+            "files on the mounted filesystem must be skipped"
+        );
+        assert!(
+            !names.iter().any(|p| p == "mnt"),
+            "the mount-point directory is not descended into"
         );
     }
 

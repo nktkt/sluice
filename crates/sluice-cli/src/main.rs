@@ -62,6 +62,10 @@ enum Command {
         /// binary; explicitly named single-file sources are always backed up).
         #[arg(long = "exclude-larger-than", value_name = "SIZE")]
         exclude_larger_than: Option<String>,
+        /// Do not cross filesystem boundaries: skip subdirectories that are on a
+        /// different filesystem than their source root (e.g. mount points).
+        #[arg(long)]
+        one_file_system: bool,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -408,6 +412,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude_from,
             tags,
             exclude_larger_than,
+            one_file_system,
             dry_run,
             verbose,
             json,
@@ -440,6 +445,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 &tags,
                 dry_run,
                 max_size,
+                one_file_system,
                 progress,
             )
             .await?;
