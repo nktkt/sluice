@@ -269,6 +269,41 @@ fn backup_exclude_from_file() {
 }
 
 #[test]
+fn restore_dry_run_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("top.txt"), b"t").unwrap();
+    std::fs::write(src.join("sub/a"), b"aa").unwrap();
+    std::fs::write(src.join("sub/b"), b"bbb").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would restore 3 files"))
+        .stdout(predicate::str::contains("nothing written"));
+    assert!(!out.exists(), "a dry run must not create the target");
+}
+
+#[test]
 fn ls_lists_a_subpath() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

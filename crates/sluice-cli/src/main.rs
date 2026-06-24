@@ -69,6 +69,9 @@ enum Command {
         /// Restore only this path within the snapshot.
         #[arg(long)]
         path: Option<String>,
+        /// Report what would be restored (file count and bytes) without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Copy snapshots to another repository, re-encrypting under its keys.
     Copy {
@@ -400,11 +403,28 @@ async fn run() -> Result<(), Box<dyn Error>> {
             snapshot,
             target,
             path,
+            dry_run,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
-            restore_subpath(&repository, &id, path.as_deref(), &target).await?;
-            println!("restored {id} into {}", target.display());
+            if dry_run {
+                let mut entries = list_files(&repository, &id).await?;
+                if let Some(p) = &path {
+                    let p = p.trim_matches('/');
+                    let prefix = format!("{p}/");
+                    entries.retain(|e| e.path == p || e.path.starts_with(&prefix));
+                }
+                let files = entries.iter().filter(|e| e.kind == EntryKind::File);
+                let count = files.clone().count();
+                let bytes: u64 = files.map(|e| e.size).sum();
+                println!(
+                    "would restore {count} files ({bytes} bytes) into {} (nothing written)",
+                    target.display()
+                );
+            } else {
+                restore_subpath(&repository, &id, path.as_deref(), &target).await?;
+                println!("restored {id} into {}", target.display());
+            }
         }
         Command::Copy { src, dst, snapshot } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
