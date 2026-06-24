@@ -590,9 +590,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         format!("  [{}]", snap.tags.join(","))
                     };
                     println!(
-                        "{}  {}  {files} files  {}{tags}",
+                        "{}  {}  {files} files, {}  {}{tags}",
                         &hex[..16],
                         format_utc(snap.time_ns),
+                        format_bytes(snap.summary.bytes_processed),
                         paths.join(", ")
                     );
                 }
@@ -971,7 +972,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("snapshots:   {snapshots}");
                 println!("packs:       {}", pack_ids.len());
                 println!("keys:        {keys}");
-                println!("stored:      {stored} bytes");
+                println!("stored:      {}", format_bytes(stored));
             }
         }
         Command::Stats { repo, json } => {
@@ -1005,8 +1006,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             } else {
                 println!("snapshots:     {}", snapshots.len());
                 println!("packs:         {}", pack_ids.len());
-                println!("logical bytes: {logical}");
-                println!("stored bytes:  {stored}");
+                println!("logical bytes: {}", format_bytes(logical));
+                println!("stored bytes:  {}", format_bytes(stored));
                 println!("saved:         {saved}% (dedup + compression)");
             }
         }
@@ -1299,6 +1300,22 @@ fn major_minor(rdev: u64) -> (u64, u64) {
     (major, minor)
 }
 
+/// Render a byte count with a binary unit for human-readable output (`1.5 GiB`).
+/// JSON output keeps raw byte counts; this is for the text listings only.
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 fn format_utc(ns: i64) -> String {
     let secs = ns.div_euclid(1_000_000_000);
     let days = secs.div_euclid(86_400);
@@ -1321,7 +1338,19 @@ fn format_utc(ns: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EntryKind, format_utc, major_minor, mode_string};
+    use super::{EntryKind, format_bytes, format_utc, major_minor, mode_string};
+
+    #[test]
+    fn formats_byte_counts_with_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes(3 * 1024_u64.pow(4)), "3.0 TiB");
+    }
 
     #[test]
     fn formats_epoch_in_utc() {
