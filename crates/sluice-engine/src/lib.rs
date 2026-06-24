@@ -7,7 +7,7 @@
 //! uses blocking `std::fs` for now; offloading to a thread pool is a later
 //! refinement.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ use sluice_core::{
     EntryKind, Id, Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree,
 };
 use sluice_repo::{RepoError, Repository};
-use sluice_store::StorageBackend;
+use sluice_store::{FileType, PackReader, StorageBackend};
 
 /// Errors from engine operations.
 #[derive(Debug, thiserror::Error)]
@@ -146,6 +146,79 @@ fn verify_tree<'a, B: StorageBackend>(
                         // load_blob authenticates (AEAD) and decompresses.
                         repo.load_blob(id).await?;
                         report.blobs += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Remove a snapshot so it can no longer be restored. The data it referenced is
+/// reclaimed only by a subsequent [`prune`].
+pub async fn forget<B: StorageBackend>(repo: &Repository<B>, snapshot: &Id) -> Result<()> {
+    repo.backend()
+        .remove(FileType::Snapshot, snapshot)
+        .await
+        .map_err(RepoError::from)?;
+    Ok(())
+}
+
+/// Delete packs no longer referenced by any surviving snapshot, returning the
+/// number removed (mark-and-sweep GC; see `DESIGN.md` §8).
+pub async fn prune<B: StorageBackend>(repo: &Repository<B>) -> Result<usize> {
+    // MARK: collect every blob reachable from a surviving snapshot.
+    let mut live: HashSet<Id> = HashSet::new();
+    for snapshot in repo.list_snapshots().await? {
+        let snap = repo.load_snapshot(&snapshot).await?;
+        mark_tree(repo, snap.tree, &mut live).await?;
+    }
+
+    // SWEEP: delete any pack whose blobs are all unreferenced.
+    let mut removed = 0;
+    for pack_id in repo
+        .backend()
+        .list(FileType::Pack)
+        .await
+        .map_err(RepoError::from)?
+    {
+        let bytes = repo
+            .backend()
+            .get(FileType::Pack, &pack_id)
+            .await
+            .map_err(RepoError::from)?;
+        let reader = PackReader::parse(&bytes).map_err(RepoError::from)?;
+        if !reader.entries().iter().any(|e| live.contains(&e.id)) {
+            repo.backend()
+                .remove(FileType::Pack, &pack_id)
+                .await
+                .map_err(RepoError::from)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Mark the tree `tree_id` and everything it references as live.
+fn mark_tree<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    live: &'a mut HashSet<Id>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        live.insert(tree_id);
+        let tree = repo.load_tree(&tree_id).await?;
+        for node in &tree.nodes {
+            match node.kind {
+                EntryKind::Dir => {
+                    if let Some(subtree) = node.subtree {
+                        mark_tree(repo, subtree, live).await?;
+                    }
+                }
+                EntryKind::File => {
+                    for id in &node.content {
+                        live.insert(*id);
                     }
                 }
                 _ => {}
@@ -467,5 +540,43 @@ mod tests {
             std::fs::read(dst.path().join("f.txt")).unwrap(),
             b"v2 with more content"
         );
+    }
+
+    #[tokio::test]
+    async fn forget_removes_a_snapshot() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap]);
+
+        forget(&repo, &snap).await.unwrap();
+        assert!(repo.list_snapshots().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prune_reclaims_unreferenced_packs() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        std::fs::write(&f, b"unique content for the first snapshot").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+
+        std::fs::write(&f, b"completely different bytes for the second snapshot").unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let before = repo.backend().list(FileType::Pack).await.unwrap().len();
+        forget(&repo, &snap1).await.unwrap();
+        let removed = prune(&repo).await.unwrap();
+        let after = repo.backend().list(FileType::Pack).await.unwrap().len();
+
+        assert!(removed >= 1, "expected to reclaim packs");
+        assert_eq!(before - after, removed);
+        // The surviving snapshot still verifies.
+        assert!(verify(&repo).await.is_ok());
     }
 }

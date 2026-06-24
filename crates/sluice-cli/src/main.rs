@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use sluice_core::Id;
 use sluice_crypto::KdfParams;
-use sluice_engine::{backup, restore, verify};
+use sluice_engine::{backup, forget, prune, restore, verify};
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
 
@@ -52,6 +52,18 @@ enum Command {
     },
     /// Verify the integrity of all snapshots.
     Verify {
+        /// Path of the repository.
+        repo: PathBuf,
+    },
+    /// Forget (remove) a snapshot; reclaim its data later with `prune`.
+    Forget {
+        /// Path of the repository.
+        repo: PathBuf,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
+    },
+    /// Reclaim storage no longer referenced by any snapshot.
+    Prune {
         /// Path of the repository.
         repo: PathBuf,
     },
@@ -102,6 +114,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "ok: {} snapshots, {} trees, {} blobs verified",
                 report.snapshots, report.trees, report.blobs
             );
+        }
+        Command::Forget { repo, snapshot } => {
+            let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
+            let id = resolve_snapshot(&repository, &snapshot).await?;
+            forget(&repository, &id).await?;
+            println!("forgot {id}");
+        }
+        Command::Prune { repo } => {
+            let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
+            let removed = prune(&repository).await?;
+            println!("pruned {removed} packs");
         }
     }
     Ok(())
