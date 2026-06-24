@@ -67,6 +67,45 @@ fn init_backup_snapshots_verify_restore_roundtrip() {
 }
 
 #[test]
+fn backup_emits_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"one").unwrap();
+    std::fs::write(src.join("b.txt"), b"two").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+
+    let out = sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(v["files_new"], 2);
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["bytes"], 6);
+    assert_eq!(v["snapshot"].as_str().unwrap().len(), 64);
+
+    // A dry-run reports a null snapshot, and the unchanged files as unmodified.
+    let out = sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .args(["--json", "--dry-run"])
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert!(v["snapshot"].is_null());
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["files_unmodified"], 2);
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -61,6 +61,9 @@ enum Command {
         /// Print each new (+) and changed (M) file as it is backed up.
         #[arg(short, long)]
         verbose: bool,
+        /// Emit the outcome (snapshot id and counts) as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Restore a snapshot into a target directory.
     Restore {
@@ -394,6 +397,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             tags,
             dry_run,
             verbose,
+            json,
         } => {
             // Append patterns read from each --exclude-from file.
             for file in &exclude_from {
@@ -425,19 +429,42 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             )
             .await?;
             let s = outcome.summary;
-            match outcome.snapshot {
-                Some(id) => {
-                    println!("{id}");
-                    eprintln!(
-                        "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
-                        s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
-                    );
-                }
-                None => {
-                    println!(
-                        "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
-                        s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
-                    );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "snapshot": outcome.snapshot.map(|id| id.to_string()),
+                        "dry_run": outcome.snapshot.is_none(),
+                        "files_new": s.files_new,
+                        "files_changed": s.files_changed,
+                        "files_unmodified": s.files_unmodified,
+                        "dirs": s.dirs,
+                        "bytes": s.bytes_processed,
+                    }))?
+                );
+            } else {
+                match outcome.snapshot {
+                    Some(id) => {
+                        println!("{id}");
+                        eprintln!(
+                            "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
+                            s.files_new,
+                            s.files_changed,
+                            s.files_unmodified,
+                            s.dirs,
+                            s.bytes_processed
+                        );
+                    }
+                    None => {
+                        println!(
+                            "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
+                            s.files_new,
+                            s.files_changed,
+                            s.files_unmodified,
+                            s.dirs,
+                            s.bytes_processed
+                        );
+                    }
                 }
             }
         }
