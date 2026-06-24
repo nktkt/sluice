@@ -26,6 +26,8 @@ const CONFIG_ID: Id = Id::from_bytes([0u8; 32]);
 const CONFIG_AAD: &[u8] = b"sluice.v1 config";
 /// Default target pack size (16 MiB).
 const PACK_TARGET: u64 = 16 * 1024 * 1024;
+/// Concurrent chunk reads when reassembling a file in [`Repository::load_file`].
+const LOAD_CONCURRENCY: usize = 16;
 
 /// Errors from repository operations.
 #[derive(Debug, thiserror::Error)]
@@ -407,9 +409,18 @@ impl<B: StorageBackend> Repository<B> {
 
     /// Reassemble a file from its ordered chunk ids.
     pub async fn load_file(&self, content: &[Id]) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        for id in content {
-            out.extend_from_slice(&self.load_blob(id).await?);
+        use futures::stream::{StreamExt, TryStreamExt};
+        // Read the chunks concurrently while preserving order (`buffered`), then
+        // concatenate — much faster for multi-chunk files on a high-latency
+        // (object-store) backend, where the reads are round-trip bound.
+        let chunks: Vec<Vec<u8>> =
+            futures::stream::iter(content.iter().map(|id| self.load_blob(id)))
+                .buffered(LOAD_CONCURRENCY)
+                .try_collect()
+                .await?;
+        let mut out = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+        for chunk in chunks {
+            out.extend_from_slice(&chunk);
         }
         Ok(out)
     }
@@ -1001,6 +1012,26 @@ mod tests {
             let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
             assert_eq!(repo.load_blob(&id).await.unwrap(), data);
         }
+    }
+
+    #[tokio::test]
+    async fn load_file_reassembles_multichunk_files_in_order() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // ~5 MiB of incompressible data so the chunker emits several chunks.
+        let mut data = vec![0u8; 5 * 1024 * 1024];
+        let mut state = 0x9E37_79B9u32;
+        for b in data.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (state >> 24) as u8;
+        }
+        let ids = repo.save_file(&data).await.unwrap();
+        assert!(ids.len() > 1, "expected the file to span multiple chunks");
+        repo.flush().await.unwrap();
+
+        // The concurrent reads must reassemble the bytes in their original order.
+        assert_eq!(repo.load_file(&ids).await.unwrap(), data);
     }
 
     #[tokio::test]

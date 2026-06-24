@@ -1856,6 +1856,7 @@ version = "0.0.0"
 name = "sluice-repo"
 version = "0.0.0"
 dependencies = [
+ "futures",
  "serde",
  "sluice-chunk",
  "sluice-core",
