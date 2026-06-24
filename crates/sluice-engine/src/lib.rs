@@ -1090,4 +1090,51 @@ mod tests {
         assert_eq!(forgotten.len(), 2);
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn lifecycle_old_snapshots_survive_new_backups_and_prune() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha v1").unwrap();
+        std::fs::write(src.path().join("b"), b"bravo unchanged").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+
+        // Change "a", add "c"; "b" is untouched (its chunk is shared via dedup).
+        std::fs::write(src.path().join("a"), b"alpha v2 changed and longer").unwrap();
+        std::fs::write(src.path().join("c"), b"charlie new").unwrap();
+        let snap2 = backup(&mut repo, src.path()).await.unwrap();
+
+        // The older snapshot still restores to its own (v1) state.
+        let out1 = tempfile::tempdir().unwrap();
+        restore(&repo, &snap1, out1.path()).await.unwrap();
+        assert_eq!(std::fs::read(out1.path().join("a")).unwrap(), b"alpha v1");
+        assert_eq!(
+            std::fs::read(out1.path().join("b")).unwrap(),
+            b"bravo unchanged"
+        );
+        assert!(!out1.path().join("c").exists());
+
+        // Forget the old snapshot and prune; the survivor must stay intact —
+        // including "b", whose chunk is still referenced by snap2.
+        forget(&repo, &snap1).await.unwrap();
+        prune(&repo).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        let out2 = tempfile::tempdir().unwrap();
+        restore(&repo, &snap2, out2.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out2.path().join("a")).unwrap(),
+            b"alpha v2 changed and longer"
+        );
+        assert_eq!(
+            std::fs::read(out2.path().join("b")).unwrap(),
+            b"bravo unchanged"
+        );
+        assert_eq!(
+            std::fs::read(out2.path().join("c")).unwrap(),
+            b"charlie new"
+        );
+    }
 }
