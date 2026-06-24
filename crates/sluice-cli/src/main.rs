@@ -224,6 +224,9 @@ enum Command {
     Info {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Show repository storage statistics.
     Stats {
@@ -832,19 +835,49 @@ async fn run() -> Result<(), Box<dyn Error>> {
             use std::io::Write;
             std::io::stdout().write_all(&data)?;
         }
-        Command::Info { repo } => {
+        Command::Info { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let config = repository.config();
             let snapshots = repository.list_snapshots().await?.len();
-            println!("repository:  {}", repository.id());
-            println!("created:     {}", format_utc(config.created_ns));
-            println!("cipher:      {:?}", config.cipher);
-            println!(
-                "chunker:     min {} / avg {} / max {} bytes",
-                config.chunker.min, config.chunker.avg, config.chunker.max
-            );
-            println!("pack target: {} bytes", config.pack_target);
-            println!("snapshots:   {snapshots}");
+            let keys = repository.list_keys().await?.len();
+            let pack_ids = repository.backend().list(FileType::Pack).await?;
+            let mut stored = 0u64;
+            for pid in &pack_ids {
+                stored += repository.backend().size(FileType::Pack, pid).await?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "repository": repository.id().to_string(),
+                        "created_ns": config.created_ns,
+                        "cipher": format!("{:?}", config.cipher),
+                        "chunker": {
+                            "min": config.chunker.min,
+                            "avg": config.chunker.avg,
+                            "max": config.chunker.max,
+                        },
+                        "pack_target": config.pack_target,
+                        "snapshots": snapshots,
+                        "packs": pack_ids.len(),
+                        "keys": keys,
+                        "stored_bytes": stored,
+                    }))?
+                );
+            } else {
+                println!("repository:  {}", repository.id());
+                println!("created:     {}", format_utc(config.created_ns));
+                println!("cipher:      {:?}", config.cipher);
+                println!(
+                    "chunker:     min {} / avg {} / max {} bytes",
+                    config.chunker.min, config.chunker.avg, config.chunker.max
+                );
+                println!("pack target: {} bytes", config.pack_target);
+                println!("snapshots:   {snapshots}");
+                println!("packs:       {}", pack_ids.len());
+                println!("keys:        {keys}");
+                println!("stored:      {stored} bytes");
+            }
         }
         Command::Stats { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;

@@ -142,6 +142,37 @@ fn info_shows_repository_metadata() {
 }
 
 #[test]
+fn info_json_reports_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hi").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    let out = sluice()
+        .arg("info")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    assert_eq!(v["repository"].as_str().unwrap().len(), 64);
+    assert_eq!(v["snapshots"], 1);
+    assert_eq!(v["keys"], 1);
+    assert!(v["packs"].as_u64().unwrap() >= 1);
+    assert!(v["chunker"]["avg"].is_number());
+}
+
+#[test]
 fn backup_of_missing_source_reports_clearly() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
