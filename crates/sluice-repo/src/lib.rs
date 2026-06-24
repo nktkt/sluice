@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use sluice_chunk::{Chunker, ChunkerParams, Gear};
 use sluice_core::{
-    BlobKind, CONFIG_VERSION, ChunkerConfig, CipherSuite, Id, REPO_MAGIC, RepoConfig, from_cbor,
-    to_cbor,
+    BlobKind, CONFIG_VERSION, ChunkerConfig, CipherSuite, Id, REPO_MAGIC, RepoConfig, Snapshot,
+    Tree, from_cbor, to_cbor,
 };
 use sluice_crypto::{
     KdfParams, KeyError, KeySet, fill_random, hash, keyed_hash, open, random_key, seal,
@@ -248,6 +248,54 @@ impl<B: StorageBackend> Repository<B> {
             },
             Gear::from_seed_bytes(&c.gear_seed),
         )
+    }
+
+    /// Serialize and store a directory `tree` as a `Tree` blob, returning its
+    /// id. Identical trees deduplicate.
+    pub async fn save_tree(&mut self, tree: &Tree) -> Result<Id> {
+        let cbor = to_cbor(tree).map_err(codec)?;
+        self.save_blob(BlobKind::Tree, &cbor).await
+    }
+
+    /// Load and deserialize a tree by id.
+    pub async fn load_tree(&self, id: &Id) -> Result<Tree> {
+        let bytes = self.load_blob(id).await?;
+        from_cbor(&bytes).map_err(codec)
+    }
+
+    /// Commit a `snapshot` as a sealed object, returning its id. Committing an
+    /// identical snapshot again is idempotent.
+    pub async fn commit_snapshot(&self, snapshot: &Snapshot) -> Result<Id> {
+        let cbor = to_cbor(snapshot).map_err(codec)?;
+        let id = keyed_hash(&self.keys.id_key, &cbor);
+        if self.backend.exists(FileType::Snapshot, &id).await? {
+            return Ok(id);
+        }
+        let sealed = seal(&self.keys.meta_key, &self.snapshot_aad(), &cbor);
+        self.backend
+            .put(FileType::Snapshot, &id, sealed.into())
+            .await?;
+        Ok(id)
+    }
+
+    /// Load and decrypt a snapshot by id.
+    pub async fn load_snapshot(&self, id: &Id) -> Result<Snapshot> {
+        let sealed = self.backend.get(FileType::Snapshot, id).await?;
+        let cbor = open(&self.keys.meta_key, &self.snapshot_aad(), &sealed)
+            .map_err(|_| RepoError::Blob)?;
+        from_cbor(&cbor).map_err(codec)
+    }
+
+    /// List the ids of all snapshots in the repository.
+    pub async fn list_snapshots(&self) -> Result<Vec<Id>> {
+        Ok(self.backend.list(FileType::Snapshot).await?)
+    }
+
+    /// Associated data binding a sealed snapshot to this repository.
+    fn snapshot_aad(&self) -> Vec<u8> {
+        let mut aad = self.config.repo_id.as_bytes().to_vec();
+        aad.push(2);
+        aad
     }
 
     /// Whether a blob with the given id is present.
@@ -504,5 +552,45 @@ mod tests {
         let content = repo.save_file(b"").await.unwrap();
         assert!(content.is_empty());
         assert_eq!(repo.load_file(&content).await.unwrap(), b"");
+    }
+
+    #[tokio::test]
+    async fn save_tree_load_tree_roundtrips_and_dedups() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = Tree {
+            version: sluice_core::TREE_VERSION,
+            nodes: Vec::new(),
+        };
+        let id = repo.save_tree(&tree).await.unwrap();
+        assert_eq!(repo.load_tree(&id).await.unwrap(), tree);
+        assert_eq!(repo.save_tree(&tree).await.unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn commit_load_and_list_snapshots() {
+        let repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = Snapshot {
+            version: sluice_core::SNAPSHOT_VERSION,
+            time_ns: 0,
+            tree: Id::from_bytes([1u8; 32]),
+            paths: vec![b"/data".to_vec()],
+            hostname: "host".into(),
+            username: "user".into(),
+            uid: 0,
+            gid: 0,
+            tags: Vec::new(),
+            parent: None,
+            program_version: "0.0.0".into(),
+            summary: Default::default(),
+        };
+        let id = repo.commit_snapshot(&snap).await.unwrap();
+        assert_eq!(repo.load_snapshot(&id).await.unwrap(), snap);
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![id]);
+        // Re-committing the same snapshot is idempotent.
+        assert_eq!(repo.commit_snapshot(&snap).await.unwrap(), id);
     }
 }
