@@ -41,7 +41,7 @@ pub enum EngineError {
     #[error("path not found in snapshot: {0}")]
     NotInSnapshot(String),
     /// The backup source is not an existing directory.
-    #[error("backup source is not a directory: {0}")]
+    #[error("backup source is not a file or directory: {0}")]
     NotADirectory(String),
     /// Two backup sources share the same final path component.
     #[error("duplicate source name: {0}")]
@@ -114,7 +114,7 @@ pub async fn backup_sources<B: StorageBackend>(
         return Err(EngineError::NotADirectory("(no source given)".to_string()));
     }
     for source in sources {
-        if !source.is_dir() {
+        if !source.is_dir() && !source.is_file() {
             return Err(EngineError::NotADirectory(source.display().to_string()));
         }
     }
@@ -145,17 +145,54 @@ async fn backup_sources_inner<B: StorageBackend>(
     let mut summary = SnapshotStats::default();
 
     let root_tree = if let [source] = sources {
-        // Single source: its tree is the snapshot root.
-        let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
-        backup_dir(
-            repo,
-            source.clone(),
-            parent_tree,
-            &excludes,
-            &mut summary,
-            dry_run,
-        )
-        .await?
+        if source.is_file() {
+            // Single file: the snapshot root is a tree holding one File node.
+            let meta = std::fs::symlink_metadata(source).map_err(|e| io_err(source, e))?;
+            let name = source
+                .file_name()
+                .ok_or_else(|| EngineError::NotADirectory(source.display().to_string()))?
+                .as_encoded_bytes()
+                .to_vec();
+            let parent_node = match &parent {
+                Some((_, snap)) => repo
+                    .load_tree(&snap.tree)
+                    .await
+                    .ok()
+                    .and_then(|t| t.nodes.into_iter().find(|n| n.name == name)),
+                None => None,
+            };
+            let node = backup_file(
+                repo,
+                source,
+                name,
+                &meta,
+                parent_node.as_ref(),
+                &mut summary,
+                dry_run,
+            )
+            .await?;
+            let tree = Tree {
+                version: TREE_VERSION,
+                nodes: vec![node],
+            };
+            if dry_run {
+                Id::from_bytes([0u8; 32])
+            } else {
+                repo.save_tree(&tree).await?
+            }
+        } else {
+            // Single directory: its tree is the snapshot root.
+            let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
+            backup_dir(
+                repo,
+                source.clone(),
+                parent_tree,
+                &excludes,
+                &mut summary,
+                dry_run,
+            )
+            .await?
+        }
     } else {
         // Multiple sources: a synthetic root with one directory entry per source.
         let parent_root: HashMap<Vec<u8>, Node> = match &parent {
@@ -182,33 +219,49 @@ async fn backup_sources_inner<B: StorageBackend>(
                     String::from_utf8_lossy(&name).into_owned(),
                 ));
             }
-            let parent_sub = parent_root
-                .get(&name)
-                .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-            let subtree = backup_dir(
-                repo,
-                source.clone(),
-                parent_sub,
-                &excludes,
-                &mut summary,
-                dry_run,
-            )
-            .await?;
             let meta = std::fs::symlink_metadata(source).map_err(|e| io_err(source, e))?;
-            summary.dirs += 1;
-            nodes.push(Node {
-                name,
-                kind: EntryKind::Dir,
-                mode: mode_of(&meta),
-                uid: 0,
-                gid: 0,
-                mtime_ns: mtime_ns(&meta),
-                ctime_ns: 0,
-                size: 0,
-                content: Vec::new(),
-                subtree: Some(subtree),
-                link_target: None,
-            });
+            if source.is_file() {
+                let parent_node = parent_root.get(&name);
+                nodes.push(
+                    backup_file(
+                        repo,
+                        source,
+                        name,
+                        &meta,
+                        parent_node,
+                        &mut summary,
+                        dry_run,
+                    )
+                    .await?,
+                );
+            } else {
+                let parent_sub = parent_root
+                    .get(&name)
+                    .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
+                let subtree = backup_dir(
+                    repo,
+                    source.clone(),
+                    parent_sub,
+                    &excludes,
+                    &mut summary,
+                    dry_run,
+                )
+                .await?;
+                summary.dirs += 1;
+                nodes.push(Node {
+                    name,
+                    kind: EntryKind::Dir,
+                    mode: mode_of(&meta),
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: mtime_ns(&meta),
+                    ctime_ns: 0,
+                    size: 0,
+                    content: Vec::new(),
+                    subtree: Some(subtree),
+                    link_target: None,
+                });
+            }
         }
         nodes.sort_by(|a, b| a.name.cmp(&b.name));
         let tree = Tree {
@@ -1163,6 +1216,57 @@ async fn find_node<B: StorageBackend>(
     Err(EngineError::NotInSnapshot(path.to_string()))
 }
 
+/// Back up the regular file at `path` into a `File` [`Node`] named `name`. If
+/// `parent` (the matching node from the previous snapshot) has the same size and
+/// mtime, its chunk list is reused without re-reading; otherwise the file is read
+/// and chunked (unless `dry_run`). Updates `stats`.
+async fn backup_file<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    path: &Path,
+    name: Vec<u8>,
+    meta: &std::fs::Metadata,
+    parent: Option<&Node>,
+    stats: &mut SnapshotStats,
+    dry_run: bool,
+) -> Result<Node> {
+    let mtime = mtime_ns(meta);
+    let reuse = parent.and_then(|prev| {
+        (prev.kind == EntryKind::File && prev.size == meta.len() && prev.mtime_ns == mtime)
+            .then(|| prev.content.clone())
+    });
+    let (content, size) = if let Some(content) = reuse {
+        stats.files_unmodified += 1;
+        (content, meta.len())
+    } else {
+        if parent.is_some() {
+            stats.files_changed += 1;
+        } else {
+            stats.files_new += 1;
+        }
+        if dry_run {
+            (Vec::new(), meta.len())
+        } else {
+            let data = std::fs::read(path).map_err(|e| io_err(path, e))?;
+            let len = data.len() as u64;
+            (repo.save_file(&data).await?, len)
+        }
+    };
+    stats.bytes_processed += size;
+    Ok(Node {
+        name,
+        kind: EntryKind::File,
+        mode: mode_of(meta),
+        uid: 0,
+        gid: 0,
+        mtime_ns: mtime,
+        ctime_ns: 0,
+        size,
+        content,
+        subtree: None,
+        link_target: None,
+    })
+}
+
 /// Recursively back up `dir`, returning the id of its `Tree` object. `parent`
 /// is the id of the same directory's tree in the previous snapshot, if any, and
 /// `stats` accumulates new/changed/unmodified counters.
@@ -1228,45 +1332,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     link_target: None,
                 }
             } else if kind.is_file() {
-                // Reuse the parent's chunks if size and mtime are unchanged.
-                let reuse = parent_nodes.get(&name).and_then(|prev| {
-                    (prev.kind == EntryKind::File
-                        && prev.size == meta.len()
-                        && prev.mtime_ns == mtime)
-                        .then(|| prev.content.clone())
-                });
-                let (content, size) = if let Some(content) = reuse {
-                    stats.files_unmodified += 1;
-                    (content, meta.len())
-                } else {
-                    if parent_nodes.contains_key(&name) {
-                        stats.files_changed += 1;
-                    } else {
-                        stats.files_new += 1;
-                    }
-                    if dry_run {
-                        // Count it, but read nothing and store nothing.
-                        (Vec::new(), meta.len())
-                    } else {
-                        let data = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
-                        let len = data.len() as u64;
-                        (repo.save_file(&data).await?, len)
-                    }
-                };
-                stats.bytes_processed += size;
-                Node {
-                    name,
-                    kind: EntryKind::File,
-                    mode: mode_of(&meta),
-                    uid: 0,
-                    gid: 0,
-                    mtime_ns: mtime,
-                    ctime_ns: 0,
-                    size,
-                    content,
-                    subtree: None,
-                    link_target: None,
-                }
+                let parent_node = parent_nodes.get(&name);
+                backup_file(repo, &path, name, &meta, parent_node, stats, dry_run).await?
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&path).map_err(|e| io_err(&path, e))?;
                 Node {
@@ -2360,22 +2427,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backup_of_non_directory_errors_clearly() {
+    async fn backup_of_a_nonexistent_source_errors() {
         let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
             .await
             .unwrap();
-        // A path that does not exist.
         let missing = std::path::Path::new("/no/such/path/sluice-xyz");
         assert!(matches!(
             backup(&mut repo, missing).await,
             Err(EngineError::NotADirectory(_))
         ));
-        // A file is not a directory.
-        let file = tempfile::NamedTempFile::new().unwrap();
-        assert!(matches!(
-            backup(&mut repo, file.path()).await,
-            Err(EngineError::NotADirectory(_))
-        ));
+    }
+
+    #[tokio::test]
+    async fn backup_restores_a_single_file_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, b"key = 1\n").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+
+        let snap = backup(&mut repo, &file).await.unwrap();
+        assert_eq!(
+            repo.load_snapshot(&snap).await.unwrap().summary.files_new,
+            1
+        );
+        assert!(verify(&repo).await.is_ok());
+
+        // It restores under the target by its base name.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("config.toml")).unwrap(),
+            b"key = 1\n"
+        );
+
+        // A re-backup with the file unchanged reports it unmodified.
+        let again = backup(&mut repo, &file).await.unwrap();
+        assert_eq!(
+            repo.load_snapshot(&again)
+                .await
+                .unwrap()
+                .summary
+                .files_unmodified,
+            1
+        );
     }
 
     #[tokio::test]

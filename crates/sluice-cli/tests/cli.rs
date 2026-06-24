@@ -152,7 +152,7 @@ fn backup_of_missing_source_reports_clearly() {
         .arg(dir.path().join("nope"))
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not a directory"));
+        .stderr(predicate::str::contains("not a file or directory"));
 }
 
 #[test]
