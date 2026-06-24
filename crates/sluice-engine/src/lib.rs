@@ -2,8 +2,8 @@
 //!
 //! This first cut walks a directory tree, storing each regular file as
 //! deduplicated chunks and each directory as a `Tree`, then commits a snapshot;
-//! restore rebuilds the tree. Files and directories are handled; symlinks,
-//! special files, and metadata replay (mode/mtime) are follow-up work. The walk
+//! restore rebuilds the tree. Files, directories, and symlinks are handled;
+//! special files and metadata replay (mode/mtime) are follow-up work. The walk
 //! uses blocking `std::fs` for now; offloading to a thread pool is a later
 //! refinement.
 
@@ -391,8 +391,23 @@ fn backup_dir<'a, B: StorageBackend>(
                     subtree: None,
                     link_target: None,
                 }
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path).map_err(|e| io_err(&path, e))?;
+                Node {
+                    name,
+                    kind: EntryKind::Symlink,
+                    mode: mode_of(&meta),
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: mtime,
+                    ctime_ns: 0,
+                    size: 0,
+                    content: Vec::new(),
+                    subtree: None,
+                    link_target: Some(target.into_os_string().into_encoded_bytes()),
+                }
             } else {
-                continue; // symlinks and special files: follow-up work
+                continue; // special files (fifo, socket, device): follow-up work
             };
             nodes.push(node);
         }
@@ -426,7 +441,12 @@ fn restore_tree<'a, B: StorageBackend>(
                     let data = repo.load_file(&node.content).await?;
                     std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
                 }
-                _ => continue, // symlinks and special files: follow-up work
+                EntryKind::Symlink => {
+                    if let Some(target) = &node.link_target {
+                        symlink(&osstring_from_bytes(target), &path)?;
+                    }
+                }
+                _ => continue, // special files (fifo, socket, device): follow-up work
             }
         }
         Ok(())
@@ -438,6 +458,22 @@ fn osstring_from_bytes(bytes: &[u8]) -> OsString {
     // SAFETY: `bytes` were produced by `OsStr::as_encoded_bytes` during backup,
     // which is exactly the precondition of `from_encoded_bytes_unchecked`.
     unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) }
+}
+
+#[cfg(unix)]
+fn symlink(target: &std::ffi::OsStr, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| io_err(link, e))
+}
+
+#[cfg(not(unix))]
+fn symlink(_target: &std::ffi::OsStr, link: &Path) -> Result<()> {
+    Err(io_err(
+        link,
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlinks are not supported on this platform",
+        ),
+    ))
 }
 
 #[cfg(unix)]
@@ -693,5 +729,35 @@ mod tests {
 
         // Keeping more than exist forgets nothing.
         assert!(forget_keep_last(&repo, 5).await.unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("target.txt"), b"the target").unwrap();
+        std::os::unix::fs::symlink("target.txt", src.path().join("link")).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+
+        let link = dst.path().join("link");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("target.txt")
+        );
+        // Reading through the link yields the target's content.
+        assert_eq!(std::fs::read(&link).unwrap(), b"the target");
     }
 }
