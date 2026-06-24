@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 179 tests across
+machine-readable JSON output, and stable exit codes. Backed by 181 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -74,7 +74,14 @@ sluice cat       ./repo snapshot <id>           # decrypted object as JSON (conf
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
+sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
+sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
 ```
+
+`--skip-existing` makes a restore idempotent and resumable: an entry already
+present and matching (for files, same size and mtime) is left untouched, so
+re-running after an interruption only fills the gaps. `--verify` re-reads each
+file after writing and fails if its contents do not match the snapshot.
 
 Every listing and result command accepts `--json` for machine-readable output,
 and commands return stable exit codes (3 restore finished with warnings, 10 repo
@@ -264,7 +271,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 179 tests
+cargo test     # 181 tests
 ```
 
 ## Caveats

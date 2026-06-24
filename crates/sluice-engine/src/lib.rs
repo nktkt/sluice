@@ -46,6 +46,9 @@ pub enum EngineError {
     /// Two backup sources share the same final path component.
     #[error("duplicate source name: {0}")]
     DuplicateSource(String),
+    /// A restored file's contents did not match the snapshot (`restore --verify`).
+    #[error("verification failed: restored {0} does not match the snapshot")]
+    VerifyFailed(String),
 }
 
 /// Convenience alias for fallible engine operations.
@@ -465,6 +468,18 @@ pub struct RestoreReport {
     pub messages: Vec<String>,
 }
 
+/// Tunables for a restore; see [`restore_with`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RestoreOptions {
+    /// Skip an entry whose target already exists and (for files) matches the
+    /// snapshot's size and mtime. Makes a restore idempotent and resumable: a
+    /// re-run after an interruption leaves finished entries untouched.
+    pub skip_existing: bool,
+    /// After writing each file, re-read it and confirm its contents match the
+    /// snapshot, failing with [`EngineError::VerifyFailed`] if not.
+    pub verify: bool,
+}
+
 /// Concurrent collector for [`RestoreReport`] entries during a restore.
 type Reporter = std::sync::Mutex<RestoreReport>;
 
@@ -487,7 +502,7 @@ pub async fn restore<B: StorageBackend>(
     snapshot: &Id,
     target: &Path,
 ) -> Result<RestoreReport> {
-    restore_subpath(repo, snapshot, None, target).await
+    restore_with(repo, snapshot, None, target, RestoreOptions::default()).await
 }
 
 /// Restore a snapshot into `target`. With `subpath`, restore only that entry
@@ -497,6 +512,18 @@ pub async fn restore_subpath<B: StorageBackend>(
     snapshot: &Id,
     subpath: Option<&str>,
     target: &Path,
+) -> Result<RestoreReport> {
+    restore_with(repo, snapshot, subpath, target, RestoreOptions::default()).await
+}
+
+/// Restore a snapshot (optionally just `subpath`) into `target` under `options`.
+/// [`restore`] and [`restore_subpath`] are thin wrappers with default options.
+pub async fn restore_with<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    subpath: Option<&str>,
+    target: &Path,
+    options: RestoreOptions,
 ) -> Result<RestoreReport> {
     let snap = repo.load_snapshot(snapshot).await?;
     std::fs::create_dir_all(target).map_err(|e| io_err(target, e))?;
@@ -512,40 +539,115 @@ pub async fn restore_subpath<B: StorageBackend>(
             EntryKind::Dir => {
                 std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
                 if let Some(subtree) = node.subtree {
-                    restore_tree(repo, subtree, dest.clone(), &links, &reporter).await?;
+                    restore_tree(repo, subtree, dest.clone(), &links, &reporter, options).await?;
                 }
                 apply_metadata(&dest, &node, &reporter);
             }
             EntryKind::File => {
-                restore_file_streaming(repo, &dest, &node.content, node.sparse).await?;
-                apply_metadata(&dest, &node, &reporter);
+                restore_file(repo, &dest, &node, &reporter, options).await?;
             }
             EntryKind::Symlink => {
                 if let Some(link_target) = &node.link_target {
-                    symlink(&osstring_from_bytes(link_target), &dest)?;
-                    set_owner(&dest, node.uid, node.gid, false, &reporter);
-                    write_xattrs(&dest, &node.xattrs, &reporter);
+                    if !(options.skip_existing && exists(&dest)) {
+                        symlink(&osstring_from_bytes(link_target), &dest)?;
+                        set_owner(&dest, node.uid, node.gid, false, &reporter);
+                        write_xattrs(&dest, &node.xattrs, &reporter);
+                    }
                 }
             }
             EntryKind::Fifo => {
-                make_fifo(&dest, node.mode)?;
-                apply_special_metadata(&dest, &node, &reporter);
+                if !(options.skip_existing && exists(&dest)) {
+                    make_fifo(&dest, node.mode)?;
+                    apply_special_metadata(&dest, &node, &reporter);
+                }
             }
             EntryKind::CharDevice | EntryKind::BlockDevice => {
-                match make_device(&dest, node.mode, node.kind, node.rdev) {
-                    Ok(()) => apply_special_metadata(&dest, &node, &reporter),
-                    Err(e) => record_warning(
-                        &reporter,
-                        format!("skipped device node {}: {e}", dest.display()),
-                    ),
+                if !(options.skip_existing && exists(&dest)) {
+                    match make_device(&dest, node.mode, node.kind, node.rdev) {
+                        Ok(()) => apply_special_metadata(&dest, &node, &reporter),
+                        Err(e) => record_warning(
+                            &reporter,
+                            format!("skipped device node {}: {e}", dest.display()),
+                        ),
+                    }
                 }
             }
             _ => {}
         }
     } else {
-        restore_tree(repo, snap.tree, target.to_path_buf(), &links, &reporter).await?;
+        restore_tree(
+            repo,
+            snap.tree,
+            target.to_path_buf(),
+            &links,
+            &reporter,
+            options,
+        )
+        .await?;
     }
     Ok(reporter.into_inner().expect("restore reporter poisoned"))
+}
+
+/// Whether anything exists at `path` (a final symlink counts, not its target).
+fn exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether `path` is an existing regular file with the node's size and mtime —
+/// the cheap "already restored" check used by skip-existing.
+fn file_matches(path: &Path, node: &Node) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.is_file() && meta.len() == node.size && mtime_ns(&meta) == node.mtime_ns,
+        Err(_) => false,
+    }
+}
+
+/// Restore one regular file's content and metadata, honoring skip-existing and
+/// (post-write) verify. Used by the full restore, the hardlink path, and subpath.
+async fn restore_file<B: StorageBackend>(
+    repo: &Repository<B>,
+    path: &Path,
+    node: &Node,
+    reporter: &Reporter,
+    options: RestoreOptions,
+) -> Result<()> {
+    if options.skip_existing && file_matches(path, node) {
+        return Ok(());
+    }
+    restore_file_streaming(repo, path, &node.content, node.sparse).await?;
+    apply_metadata(path, node, reporter);
+    if options.verify {
+        verify_restored_file(repo, path, &node.content).await?;
+    }
+    Ok(())
+}
+
+/// Re-read a just-restored file and confirm it matches the snapshot content,
+/// streaming so peak memory stays bounded. A holey sparse file reads its holes
+/// back as zeros, matching the stored zero chunks.
+async fn verify_restored_file<B: StorageBackend>(
+    repo: &Repository<B>,
+    path: &Path,
+    content: &[Id],
+) -> Result<()> {
+    use futures::stream::{StreamExt, TryStreamExt};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+    let mut chunks = futures::stream::iter(content.iter().map(|id| repo.load_blob(id)))
+        .buffered(RESTORE_FILE_CONCURRENCY);
+    let mut buf = Vec::new();
+    while let Some(expected) = chunks.try_next().await? {
+        buf.resize(expected.len(), 0);
+        file.read_exact(&mut buf).map_err(|e| io_err(path, e))?;
+        if buf != expected {
+            return Err(EngineError::VerifyFailed(path.display().to_string()));
+        }
+    }
+    // No trailing bytes beyond the snapshot's content.
+    if file.read(&mut [0u8; 1]).map_err(|e| io_err(path, e))? != 0 {
+        return Err(EngineError::VerifyFailed(path.display().to_string()));
+    }
+    Ok(())
 }
 
 /// A summary produced by [`verify`].
@@ -1488,6 +1590,7 @@ fn restore_tree<'a, B: StorageBackend>(
     dir: PathBuf,
     links: &'a std::sync::Mutex<HashMap<(u64, u64), PathBuf>>,
     reporter: &'a Reporter,
+    options: RestoreOptions,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         use futures::stream::{StreamExt, TryStreamExt};
@@ -1497,26 +1600,28 @@ fn restore_tree<'a, B: StorageBackend>(
         // structure. A subdirectory's mtime is replayed after its own subtree.
         for node in &tree.nodes {
             let path = dir.join(osstring_from_bytes(&node.name));
+            // For non-file entries, skip-existing means "leave it if already there".
+            let present = options.skip_existing && exists(&path);
             match node.kind {
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(repo, subtree, path.clone(), links, reporter).await?;
+                        restore_tree(repo, subtree, path.clone(), links, reporter, options).await?;
                     }
                     apply_metadata(&path, node, reporter);
                 }
                 EntryKind::Symlink => {
-                    if let Some(target) = &node.link_target {
+                    if let (false, Some(target)) = (present, &node.link_target) {
                         symlink(&osstring_from_bytes(target), &path)?;
                         set_owner(&path, node.uid, node.gid, false, reporter);
                         write_xattrs(&path, &node.xattrs, reporter);
                     }
                 }
-                EntryKind::Fifo => {
+                EntryKind::Fifo if !present => {
                     make_fifo(&path, node.mode)?;
                     apply_special_metadata(&path, node, reporter);
                 }
-                EntryKind::CharDevice | EntryKind::BlockDevice => {
+                EntryKind::CharDevice | EntryKind::BlockDevice if !present => {
                     // Device nodes need CAP_MKNOD; warn and skip (rather than fail
                     // the restore) when unprivileged, replaying metadata only if
                     // the node was actually created.
@@ -1529,7 +1634,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     }
                 }
                 // Files are handled below; sockets are runtime-only and are
-                // recorded but not recreated.
+                // recorded but not recreated; already-present specials are kept.
                 _ => {}
             }
         }
@@ -1544,8 +1649,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 .map(|node| {
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
-                        restore_file_streaming(repo, &path, &node.content, node.sparse).await?;
-                        apply_metadata(&path, node, reporter);
+                        restore_file(repo, &path, node, reporter, options).await?;
                         Ok::<(), EngineError>(())
                     }
                 }),
@@ -1576,11 +1680,13 @@ fn restore_tree<'a, B: StorageBackend>(
             };
             match target {
                 Some(existing) => {
-                    std::fs::hard_link(&existing, &path).map_err(|e| io_err(&path, e))?;
+                    // Leave an already-present link in place when resuming.
+                    if !(options.skip_existing && exists(&path)) {
+                        std::fs::hard_link(&existing, &path).map_err(|e| io_err(&path, e))?;
+                    }
                 }
                 None => {
-                    restore_file_streaming(repo, &path, &node.content, node.sparse).await?;
-                    apply_metadata(&path, node, reporter);
+                    restore_file(repo, &path, node, reporter, options).await?;
                 }
             }
         }
@@ -2877,6 +2983,80 @@ mod tests {
         assert_eq!(got, want);
         // And exactly what a plain read returns.
         assert_eq!(got, std::fs::read(&path).unwrap());
+    }
+
+    #[tokio::test]
+    async fn restore_skip_existing_leaves_matching_files() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"hello").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let target = out.path().join("f");
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+
+        // Replace the content but keep the size and mtime, so the cheap
+        // "already restored" check still matches.
+        let mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&target).unwrap());
+        std::fs::write(&target, b"world").unwrap(); // same length
+        filetime::set_file_mtime(&target, mtime).unwrap();
+
+        // skip-existing keeps the matching file untouched...
+        let opts = RestoreOptions {
+            skip_existing: true,
+            verify: false,
+        };
+        restore_with(&repo, &snap, None, out.path(), opts)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"world");
+
+        // ...while a default restore overwrites it with the snapshot content.
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn verify_restored_file_detects_mismatch() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"correct content here").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        let tree = repo.load_tree(&snap_obj.tree).await.unwrap();
+        let node = tree.nodes.iter().find(|n| n.name == b"f").unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        // A faithful copy verifies.
+        let good = dir.path().join("good");
+        std::fs::write(&good, b"correct content here").unwrap();
+        assert!(
+            verify_restored_file(&repo, &good, &node.content)
+                .await
+                .is_ok()
+        );
+        // Wrong bytes (same length) fail with VerifyFailed.
+        let bad = dir.path().join("bad");
+        std::fs::write(&bad, b"WRONG content here..").unwrap();
+        assert!(matches!(
+            verify_restored_file(&repo, &bad, &node.content).await,
+            Err(EngineError::VerifyFailed(_))
+        ));
+        // A short file fails too (it can't supply enough bytes).
+        let short = dir.path().join("short");
+        std::fs::write(&short, b"correct").unwrap();
+        assert!(
+            verify_restored_file(&repo, &short, &node.content)
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

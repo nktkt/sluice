@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, GroupBy, RestoreReport, RetentionPolicy, backup_sources, check,
-    copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
-    list_files, prune, prune_excluding, rebuild_index, restore_subpath, retag, verify,
+    DiffKind, EngineError, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy, backup_sources,
+    check, copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
+    list_files, prune, prune_excluding, rebuild_index, restore_with, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -72,6 +72,12 @@ enum Command {
         /// Report what would be restored (file count and bytes) without writing.
         #[arg(long)]
         dry_run: bool,
+        /// Leave entries already present and matching in place (resume a restore).
+        #[arg(long)]
+        skip_existing: bool,
+        /// After writing each file, re-read it and verify it matches the snapshot.
+        #[arg(long)]
+        verify: bool,
     },
     /// Copy snapshots to another repository, re-encrypting under its keys.
     Copy {
@@ -418,6 +424,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             target,
             paths,
             dry_run,
+            skip_existing,
+            verify,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
@@ -447,12 +455,16 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     target.display()
                 );
             } else {
+                let options = RestoreOptions {
+                    skip_existing,
+                    verify,
+                };
                 let mut report = RestoreReport::default();
                 if paths.is_empty() {
-                    report = restore_subpath(&repository, &id, None, &target).await?;
+                    report = restore_with(&repository, &id, None, &target, options).await?;
                 } else {
                     for p in &paths {
-                        let r = restore_subpath(&repository, &id, Some(p), &target).await?;
+                        let r = restore_with(&repository, &id, Some(p), &target, options).await?;
                         report.warnings += r.warnings;
                         report.messages.extend(r.messages);
                     }
