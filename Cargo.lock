@@ -488,6 +488,15 @@ dependencies = [
 [[package]]
 name = "sluice-engine"
 version = "0.0.0"
+dependencies = [
+ "sluice-core",
+ "sluice-crypto",
+ "sluice-repo",
+ "sluice-store",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "sluice-index"
