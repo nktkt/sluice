@@ -1211,4 +1211,66 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(dst.path().join("f")).unwrap(), b"content");
     }
+
+    fn rnd(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *s
+    }
+
+    fn build_random_tree(dir: &Path, depth: u32, s: &mut u64) {
+        for i in 0..(rnd(s) % 4) {
+            let len = (rnd(s) % 3000) as usize;
+            let data: Vec<u8> = (0..len).map(|_| (rnd(s) >> 33) as u8).collect();
+            std::fs::write(dir.join(format!("f{i}")), data).unwrap();
+        }
+        if depth > 0 {
+            for i in 0..(rnd(s) % 3) {
+                let sub = dir.join(format!("d{i}"));
+                std::fs::create_dir(&sub).unwrap();
+                build_random_tree(&sub, depth - 1, s);
+            }
+        }
+    }
+
+    fn collect_files(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn random_tree_backup_restore_roundtrips() {
+        for seed in [1u64, 42, 12_345, 9_999] {
+            let src = tempfile::tempdir().unwrap();
+            let mut s = seed;
+            build_random_tree(src.path(), 3, &mut s);
+
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+                .await
+                .unwrap();
+            let snap = backup(&mut repo, src.path()).await.unwrap();
+
+            let dst = tempfile::tempdir().unwrap();
+            restore(&repo, &snap, dst.path()).await.unwrap();
+
+            assert_eq!(
+                collect_files(src.path()),
+                collect_files(dst.path()),
+                "tree mismatch for seed {seed}"
+            );
+        }
+    }
 }
