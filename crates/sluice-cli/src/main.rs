@@ -89,6 +89,9 @@ enum Command {
     Prune {
         /// Repository path or object-store URL.
         repo: String,
+        /// Show what would be reclaimed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List the contents of a snapshot without restoring.
     Ls {
@@ -240,10 +243,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Prune { repo } => {
+        Command::Prune { repo, dry_run } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let removed = prune(&repository).await?;
-            println!("pruned {removed} packs");
+            let count = prune(&repository, dry_run).await?;
+            if dry_run {
+                println!("would prune {count} packs");
+            } else {
+                println!("pruned {count} packs");
+            }
         }
         Command::Ls { repo, snapshot } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;

@@ -280,8 +280,9 @@ pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -
 }
 
 /// Delete packs no longer referenced by any surviving snapshot, returning the
-/// number removed (mark-and-sweep GC; see `DESIGN.md` §8).
-pub async fn prune<B: StorageBackend>(repo: &Repository<B>) -> Result<usize> {
+/// number removed (mark-and-sweep GC; see `DESIGN.md` §8). With `dry_run`, count
+/// the packs that would be removed without deleting anything.
+pub async fn prune<B: StorageBackend>(repo: &Repository<B>, dry_run: bool) -> Result<usize> {
     // MARK: collect every blob reachable from a surviving snapshot.
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
@@ -304,10 +305,12 @@ pub async fn prune<B: StorageBackend>(repo: &Repository<B>) -> Result<usize> {
             .map_err(RepoError::from)?;
         let reader = PackReader::parse(&bytes).map_err(RepoError::from)?;
         if !reader.entries().iter().any(|e| live.contains(&e.id)) {
-            repo.backend()
-                .remove(FileType::Pack, &pack_id)
-                .await
-                .map_err(RepoError::from)?;
+            if !dry_run {
+                repo.backend()
+                    .remove(FileType::Pack, &pack_id)
+                    .await
+                    .map_err(RepoError::from)?;
+            }
             removed += 1;
         }
     }
@@ -905,7 +908,7 @@ mod tests {
 
         let before = repo.backend().list(FileType::Pack).await.unwrap().len();
         forget(&repo, &snap1).await.unwrap();
-        let removed = prune(&repo).await.unwrap();
+        let removed = prune(&repo, false).await.unwrap();
         let after = repo.backend().list(FileType::Pack).await.unwrap().len();
 
         assert!(removed >= 1, "expected to reclaim packs");
@@ -1163,7 +1166,7 @@ mod tests {
         // Forget the old snapshot and prune; the survivor must stay intact —
         // including "b", whose chunk is still referenced by snap2.
         forget(&repo, &snap1).await.unwrap();
-        prune(&repo).await.unwrap();
+        prune(&repo, false).await.unwrap();
         assert!(verify(&repo).await.is_ok());
 
         let out2 = tempfile::tempdir().unwrap();
@@ -1298,5 +1301,32 @@ mod tests {
             backup(&mut repo, file.path()).await,
             Err(EngineError::NotADirectory(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn prune_dry_run_removes_nothing() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        std::fs::write(&f, b"first").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+        std::fs::write(&f, b"second, different content").unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+        forget(&repo, &snap1).await.unwrap();
+
+        let before = repo.backend().list(FileType::Pack).await.unwrap().len();
+        let would = prune(&repo, true).await.unwrap();
+        assert!(would >= 1, "dry-run should find packs to prune");
+        assert_eq!(
+            repo.backend().list(FileType::Pack).await.unwrap().len(),
+            before,
+            "dry-run must not delete anything"
+        );
+
+        let removed = prune(&repo, false).await.unwrap();
+        assert_eq!(removed, would);
+        assert!(repo.backend().list(FileType::Pack).await.unwrap().len() < before);
     }
 }
