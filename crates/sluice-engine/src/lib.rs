@@ -350,6 +350,33 @@ pub async fn forget<B: StorageBackend>(repo: &Repository<B>, snapshot: &Id) -> R
     Ok(())
 }
 
+/// Rewrite a snapshot's tags: drop every tag in `remove`, then add every tag in
+/// `add` not already present. Because snapshots are immutable and content-
+/// addressed, this commits a new snapshot (same tree, time, and history) and
+/// forgets the old one, returning the new id. The shared tree keeps the data
+/// live, so no `prune` is needed. A no-op change returns the original id.
+pub async fn retag<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    add: &[String],
+    remove: &[String],
+) -> Result<Id> {
+    let snap = repo.load_snapshot(snapshot).await?;
+    let mut tags = snap.tags.clone();
+    tags.retain(|t| !remove.contains(t));
+    for tag in add {
+        if !tags.contains(tag) {
+            tags.push(tag.clone());
+        }
+    }
+    if tags == snap.tags {
+        return Ok(*snapshot);
+    }
+    let new_id = repo.commit_snapshot(&Snapshot { tags, ..snap }).await?;
+    forget(repo, snapshot).await?;
+    Ok(new_id)
+}
+
 /// A snapshot retention policy. A snapshot is kept if it satisfies *any* enabled
 /// rule (the union, as in restic); a rule with a count of 0 is disabled. See
 /// `DESIGN.md` §8.
@@ -1923,6 +1950,39 @@ mod tests {
         assert_eq!(again.files_unmodified, 2);
         // The dry run added no second snapshot.
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retag_rewrites_a_snapshots_tags() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let id = backup_excluding(&mut repo, src.path(), &[], &["keep".into()])
+            .await
+            .unwrap();
+
+        let new_id = retag(&repo, &id, &["weekly".into()], &["keep".into()])
+            .await
+            .unwrap();
+        assert_ne!(new_id, id);
+        // The old snapshot is gone; the new one carries the rewritten tags.
+        assert!(repo.load_snapshot(&id).await.is_err());
+        assert_eq!(
+            repo.load_snapshot(&new_id).await.unwrap().tags,
+            vec!["weekly".to_string()]
+        );
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![new_id]);
+        // The data is untouched: the tree is shared and still referenced.
+        assert!(verify(&repo).await.is_ok());
+
+        // A change that adds nothing new returns the same id (no rewrite).
+        let same = retag(&repo, &new_id, &["weekly".into()], &[])
+            .await
+            .unwrap();
+        assert_eq!(same, new_id);
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![new_id]);
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, EngineError, RetentionPolicy, backup_dry_run, backup_excluding, check, diff, dump,
     forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
-    restore_subpath, verify,
+    restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -71,6 +71,19 @@ enum Command {
         /// Only show snapshots with this tag.
         #[arg(long)]
         tag: Option<String>,
+    },
+    /// Add or remove tags on a snapshot (rewrites it under a new id).
+    Tag {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
+        /// Tag to add (repeatable).
+        #[arg(long = "add", value_name = "TAG")]
+        add: Vec<String>,
+        /// Tag to remove (repeatable).
+        #[arg(long = "remove", value_name = "TAG")]
+        remove: Vec<String>,
     },
     /// Verify the integrity of all snapshots.
     Verify {
@@ -311,6 +324,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     format_utc(snap.time_ns),
                     paths.join(", ")
                 );
+            }
+        }
+        Command::Tag {
+            repo,
+            snapshot,
+            add,
+            remove,
+        } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let id = resolve_snapshot(&repository, &snapshot).await?;
+            let new_id = retag(&repository, &id, &add, &remove).await?;
+            if new_id == id {
+                println!("no change");
+            } else {
+                println!("{new_id}");
             }
         }
         Command::Verify { repo } => {
