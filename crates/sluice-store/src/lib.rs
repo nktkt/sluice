@@ -16,6 +16,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use sluice_core::Id;
 
+mod local;
+pub use local::LocalBackend;
+
 /// The category of object stored in a repository; determines its path prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileType {

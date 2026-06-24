@@ -13,6 +13,7 @@ sluice-core = { path = "../sluice-core" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tempfile = { workspace = true }
