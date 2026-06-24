@@ -453,12 +453,40 @@ async fn latest_snapshot<B: StorageBackend>(
     Ok(best)
 }
 
-/// Restore the snapshot `snapshot` from `repo` into the directory `target`.
+/// Best-effort metadata a restore could not fully apply: ownership it could not
+/// set, extended attributes it could not write, or device nodes it had to skip
+/// (e.g. an unprivileged restore lacking `CAP_MKNOD`). File data and tree
+/// structure are still restored — these are warnings, not failures.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RestoreReport {
+    /// Total number of best-effort operations that failed.
+    pub warnings: u64,
+    /// A bounded sample of the warning messages, for display.
+    pub messages: Vec<String>,
+}
+
+/// Concurrent collector for [`RestoreReport`] entries during a restore.
+type Reporter = std::sync::Mutex<RestoreReport>;
+
+/// How many distinct messages to retain. The count stays exact; only the sample
+/// is bounded, so a flood of failures cannot exhaust memory.
+const WARN_SAMPLE_CAP: usize = 20;
+
+fn record_warning(reporter: &Reporter, msg: String) {
+    let mut report = reporter.lock().expect("restore reporter poisoned");
+    report.warnings += 1;
+    if report.messages.len() < WARN_SAMPLE_CAP {
+        report.messages.push(msg);
+    }
+}
+
+/// Restore the snapshot `snapshot` from `repo` into the directory `target`,
+/// returning any best-effort metadata that could not be applied.
 pub async fn restore<B: StorageBackend>(
     repo: &Repository<B>,
     snapshot: &Id,
     target: &Path,
-) -> Result<()> {
+) -> Result<RestoreReport> {
     restore_subpath(repo, snapshot, None, target).await
 }
 
@@ -469,50 +497,56 @@ pub async fn restore_subpath<B: StorageBackend>(
     snapshot: &Id,
     subpath: Option<&str>,
     target: &Path,
-) -> Result<()> {
+) -> Result<RestoreReport> {
     let snap = repo.load_snapshot(snapshot).await?;
     std::fs::create_dir_all(target).map_err(|e| io_err(target, e))?;
     // Maps a source (dev, ino) to the first path restored for it, so hardlinked
     // files are recreated as links rather than duplicated.
     let links = std::sync::Mutex::new(HashMap::new());
-    let Some(path) = subpath else {
-        return restore_tree(repo, snap.tree, target.to_path_buf(), &links).await;
-    };
+    let reporter = Reporter::default();
 
-    let node = find_node(repo, snap.tree, path).await?;
-    let dest = target.join(osstring_from_bytes(&node.name));
-    match node.kind {
-        EntryKind::Dir => {
-            std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
-            if let Some(subtree) = node.subtree {
-                restore_tree(repo, subtree, dest.clone(), &links).await?;
+    if let Some(path) = subpath {
+        let node = find_node(repo, snap.tree, path).await?;
+        let dest = target.join(osstring_from_bytes(&node.name));
+        match node.kind {
+            EntryKind::Dir => {
+                std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
+                if let Some(subtree) = node.subtree {
+                    restore_tree(repo, subtree, dest.clone(), &links, &reporter).await?;
+                }
+                apply_metadata(&dest, &node, &reporter);
             }
-            apply_metadata(&dest, &node);
-        }
-        EntryKind::File => {
-            let data = repo.load_file(&node.content).await?;
-            write_file_content(&dest, &data, node.sparse)?;
-            apply_metadata(&dest, &node);
-        }
-        EntryKind::Symlink => {
-            if let Some(link_target) = &node.link_target {
-                symlink(&osstring_from_bytes(link_target), &dest)?;
-                set_owner(&dest, node.uid, node.gid, false);
-                write_xattrs(&dest, &node.xattrs);
+            EntryKind::File => {
+                let data = repo.load_file(&node.content).await?;
+                write_file_content(&dest, &data, node.sparse)?;
+                apply_metadata(&dest, &node, &reporter);
             }
-        }
-        EntryKind::Fifo => {
-            make_fifo(&dest, node.mode)?;
-            apply_special_metadata(&dest, &node);
-        }
-        EntryKind::CharDevice | EntryKind::BlockDevice => {
-            if make_device(&dest, node.mode, node.kind, node.rdev).is_ok() {
-                apply_special_metadata(&dest, &node);
+            EntryKind::Symlink => {
+                if let Some(link_target) = &node.link_target {
+                    symlink(&osstring_from_bytes(link_target), &dest)?;
+                    set_owner(&dest, node.uid, node.gid, false, &reporter);
+                    write_xattrs(&dest, &node.xattrs, &reporter);
+                }
             }
+            EntryKind::Fifo => {
+                make_fifo(&dest, node.mode)?;
+                apply_special_metadata(&dest, &node, &reporter);
+            }
+            EntryKind::CharDevice | EntryKind::BlockDevice => {
+                match make_device(&dest, node.mode, node.kind, node.rdev) {
+                    Ok(()) => apply_special_metadata(&dest, &node, &reporter),
+                    Err(e) => record_warning(
+                        &reporter,
+                        format!("skipped device node {}: {e}", dest.display()),
+                    ),
+                }
+            }
+            _ => {}
         }
-        _ => {}
+    } else {
+        restore_tree(repo, snap.tree, target.to_path_buf(), &links, &reporter).await?;
     }
-    Ok(())
+    Ok(reporter.into_inner().expect("restore reporter poisoned"))
 }
 
 /// A summary produced by [`verify`].
@@ -1433,6 +1467,7 @@ fn restore_tree<'a, B: StorageBackend>(
     tree_id: Id,
     dir: PathBuf,
     links: &'a std::sync::Mutex<HashMap<(u64, u64), PathBuf>>,
+    reporter: &'a Reporter,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         use futures::stream::{StreamExt, TryStreamExt};
@@ -1446,27 +1481,31 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(repo, subtree, path.clone(), links).await?;
+                        restore_tree(repo, subtree, path.clone(), links, reporter).await?;
                     }
-                    apply_metadata(&path, node);
+                    apply_metadata(&path, node, reporter);
                 }
                 EntryKind::Symlink => {
                     if let Some(target) = &node.link_target {
                         symlink(&osstring_from_bytes(target), &path)?;
-                        set_owner(&path, node.uid, node.gid, false);
-                        write_xattrs(&path, &node.xattrs);
+                        set_owner(&path, node.uid, node.gid, false, reporter);
+                        write_xattrs(&path, &node.xattrs, reporter);
                     }
                 }
                 EntryKind::Fifo => {
                     make_fifo(&path, node.mode)?;
-                    apply_special_metadata(&path, node);
+                    apply_special_metadata(&path, node, reporter);
                 }
                 EntryKind::CharDevice | EntryKind::BlockDevice => {
-                    // Device nodes need CAP_MKNOD; skip (rather than fail the
-                    // restore) when unprivileged, replaying metadata only if the
-                    // node was actually created.
-                    if make_device(&path, node.mode, node.kind, node.rdev).is_ok() {
-                        apply_special_metadata(&path, node);
+                    // Device nodes need CAP_MKNOD; warn and skip (rather than fail
+                    // the restore) when unprivileged, replaying metadata only if
+                    // the node was actually created.
+                    match make_device(&path, node.mode, node.kind, node.rdev) {
+                        Ok(()) => apply_special_metadata(&path, node, reporter),
+                        Err(e) => record_warning(
+                            reporter,
+                            format!("skipped device node {}: {e}", path.display()),
+                        ),
                     }
                 }
                 // Files are handled below; sockets are runtime-only and are
@@ -1487,7 +1526,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     async move {
                         let data = repo.load_file(&node.content).await?;
                         write_file_content(&path, &data, node.sparse)?;
-                        apply_metadata(&path, node);
+                        apply_metadata(&path, node, reporter);
                         Ok::<(), EngineError>(())
                     }
                 }),
@@ -1523,7 +1562,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 None => {
                     let data = repo.load_file(&node.content).await?;
                     write_file_content(&path, &data, node.sparse)?;
-                    apply_metadata(&path, node);
+                    apply_metadata(&path, node, reporter);
                 }
             }
         }
@@ -1651,15 +1690,15 @@ fn make_device(_path: &Path, _mode: u32, _kind: EntryKind, _rdev: u64) -> Result
 }
 
 /// Best-effort replay of a node's owner (Unix), mode (Unix), and mtime onto `path`.
-fn apply_metadata(path: &Path, node: &Node) {
+fn apply_metadata(path: &Path, node: &Node, reporter: &Reporter) {
     #[cfg(unix)]
     {
         // chown before chmod: chown can clear setuid/setgid bits.
-        set_owner(path, node.uid, node.gid, true);
+        set_owner(path, node.uid, node.gid, true, reporter);
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode));
     }
-    write_xattrs(path, &node.xattrs);
+    write_xattrs(path, &node.xattrs, reporter);
     let mtime = filetime::FileTime::from_unix_time(
         node.mtime_ns.div_euclid(1_000_000_000),
         node.mtime_ns.rem_euclid(1_000_000_000) as u32,
@@ -1675,13 +1714,13 @@ fn apply_metadata(path: &Path, node: &Node) {
 /// via `UTIME_OMIT`. The explicit `chmod` also corrects for umask applied by
 /// `mknodat`.
 #[cfg(unix)]
-fn apply_special_metadata(path: &Path, node: &Node) {
+fn apply_special_metadata(path: &Path, node: &Node, reporter: &Reporter) {
     use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, utimensat};
     use std::os::unix::fs::PermissionsExt;
     // chown before chmod: chown can clear setuid/setgid bits.
-    set_owner(path, node.uid, node.gid, true);
+    set_owner(path, node.uid, node.gid, true, reporter);
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode & 0o7777));
-    write_xattrs(path, &node.xattrs);
+    write_xattrs(path, &node.xattrs, reporter);
     let times = Timestamps {
         last_access: Timespec {
             tv_sec: 0,
@@ -1696,7 +1735,7 @@ fn apply_special_metadata(path: &Path, node: &Node) {
 }
 
 #[cfg(not(unix))]
-fn apply_special_metadata(_path: &Path, _node: &Node) {}
+fn apply_special_metadata(_path: &Path, _node: &Node, _reporter: &Reporter) {}
 
 #[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
@@ -1791,28 +1830,34 @@ fn process_owner() -> (u32, u32) {
 }
 
 /// Best-effort replay of ownership onto a restored entry. `chown` requires
-/// privilege (CAP_CHOWN), so failures are ignored — an unprivileged restore
-/// keeps the running user's ownership, matching restic/borg. `follow` controls
-/// whether a symlink is dereferenced (false = `lchown` the link itself).
+/// privilege (CAP_CHOWN); a failure is recorded as a warning (an unprivileged
+/// restore keeps the running user's ownership, matching restic/borg) rather than
+/// aborting. `follow` controls whether a symlink is dereferenced (false =
+/// `lchown` the link itself).
 #[cfg(unix)]
-fn set_owner(path: &Path, uid: u32, gid: u32, follow: bool) {
+fn set_owner(path: &Path, uid: u32, gid: u32, follow: bool, reporter: &Reporter) {
     use rustix::fs::{AtFlags, CWD, Gid, Uid, chownat};
     let flags = if follow {
         AtFlags::empty()
     } else {
         AtFlags::SYMLINK_NOFOLLOW
     };
-    let _ = chownat(
+    if let Err(e) = chownat(
         CWD,
         path,
         Some(Uid::from_raw(uid)),
         Some(Gid::from_raw(gid)),
         flags,
-    );
+    ) {
+        record_warning(
+            reporter,
+            format!("could not set owner of {}: {e}", path.display()),
+        );
+    }
 }
 
 #[cfg(not(unix))]
-fn set_owner(_path: &Path, _uid: u32, _gid: u32, _follow: bool) {}
+fn set_owner(_path: &Path, _uid: u32, _gid: u32, _follow: bool, _reporter: &Reporter) {}
 
 /// Read all extended attributes of `path` without following symlinks, as a
 /// list of `(name, value)` byte pairs sorted by name. Best-effort: returns
@@ -1861,20 +1906,29 @@ fn read_xattrs(_path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Replay extended attributes onto a restored `path` without following symlinks.
-/// Best-effort: `security.*`/`trusted.*` may need privilege, so failures are
-/// ignored, matching restic/borg.
+/// Best-effort: `security.*`/`trusted.*` may need privilege, so a failure is
+/// recorded as a warning rather than aborting, matching restic/borg.
 #[cfg(unix)]
-fn write_xattrs(path: &Path, xattrs: &[(Vec<u8>, Vec<u8>)]) {
+fn write_xattrs(path: &Path, xattrs: &[(Vec<u8>, Vec<u8>)], reporter: &Reporter) {
     use rustix::fs::{XattrFlags, lsetxattr};
     for (name, value) in xattrs {
         if let Ok(cname) = std::ffi::CString::new(name.clone()) {
-            let _ = lsetxattr(path, cname.as_c_str(), value, XattrFlags::empty());
+            if let Err(e) = lsetxattr(path, cname.as_c_str(), value, XattrFlags::empty()) {
+                record_warning(
+                    reporter,
+                    format!(
+                        "could not set xattr {} on {}: {e}",
+                        String::from_utf8_lossy(name),
+                        path.display()
+                    ),
+                );
+            }
         }
     }
 }
 
 #[cfg(not(unix))]
-fn write_xattrs(_path: &Path, _xattrs: &[(Vec<u8>, Vec<u8>)]) {}
+fn write_xattrs(_path: &Path, _xattrs: &[(Vec<u8>, Vec<u8>)], _reporter: &Reporter) {}
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -1923,7 +1977,8 @@ mod tests {
         let snap = backup(&mut repo, src.path()).await.unwrap();
 
         let dst = tempfile::tempdir().unwrap();
-        restore(&repo, &snap, dst.path()).await.unwrap();
+        let report = restore(&repo, &snap, dst.path()).await.unwrap();
+        assert_eq!(report.warnings, 0, "clean restore should have no warnings");
 
         assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"alpha");
         assert_eq!(
@@ -2627,6 +2682,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn reporter_records_best_effort_metadata_failures() {
+        // A path whose parent does not exist makes chown and setxattr fail with
+        // ENOENT regardless of privilege, so this exercises the warning path even
+        // when the tests run as root.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-dir").join("entry");
+        let reporter = Reporter::default();
+        set_owner(&missing, 0, 0, true, &reporter);
+        write_xattrs(&missing, &[(b"user.x".to_vec(), b"v".to_vec())], &reporter);
+        let report = reporter.into_inner().unwrap();
+        assert!(
+            report.warnings >= 2,
+            "expected the failures to be recorded, got {}",
+            report.warnings
+        );
+        assert!(!report.messages.is_empty());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn backup_restore_preserves_sparse_files() {
         use std::io::{Seek, SeekFrom, Write};
@@ -2685,7 +2760,7 @@ mod tests {
         let src = tempfile::tempdir().unwrap();
         let f = src.path().join("owned");
         std::fs::write(&f, b"data").unwrap();
-        set_owner(&f, 1, 2, true);
+        set_owner(&f, 1, 2, true, &Reporter::default());
         assert_eq!(
             std::fs::metadata(&f).unwrap().uid(),
             1,

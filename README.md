@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 172 tests across
+machine-readable JSON output, and stable exit codes. Backed by 173 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -71,8 +71,11 @@ sluice restore   ./repo <snapshot> ./out --dry-run                   # preview f
 ```
 
 Every listing and result command accepts `--json` for machine-readable output,
-and commands return stable exit codes (10 repo not found, 11 wrong passphrase,
-12 lock held, 13 corruption) for scripting.
+and commands return stable exit codes (3 restore finished with warnings, 10 repo
+not found, 11 wrong passphrase, 12 lock held, 13 corruption) for scripting. A
+restore always writes the file data and tree structure; best-effort metadata it
+could not apply — ownership, extended attributes, or device nodes it had to skip
+(e.g. an unprivileged restore) — is reported as warnings and yields exit code 3.
 
 ### Integrity
 
@@ -250,7 +253,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 172 tests
+cargo test     # 173 tests
 ```
 
 ## Caveats

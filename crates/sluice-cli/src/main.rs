@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, GroupBy, RetentionPolicy, backup_sources, check, copy_all,
-    copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
-    prune_excluding, rebuild_index, restore_subpath, retag, verify,
+    DiffKind, EngineError, GroupBy, RestoreReport, RetentionPolicy, backup_sources, check,
+    copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
+    list_files, prune, prune_excluding, rebuild_index, restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -319,9 +319,12 @@ enum KeyCmd {
 }
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error}");
-        std::process::exit(exit_code(error.as_ref()));
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(exit_code(error.as_ref()));
+        }
     }
 }
 
@@ -353,12 +356,14 @@ fn exit_code(error: &(dyn Error + 'static)) -> i32 {
 }
 
 #[tokio::main]
-async fn run() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<i32, Box<dyn Error>> {
     let cli = Cli::parse();
     let confirm = matches!(cli.command, Command::Init { .. });
     let passphrase = read_passphrase(confirm)?;
     let pw = passphrase.as_bytes();
 
+    // 0 = success; set to 3 when a restore completes with best-effort warnings.
+    let mut exit = 0;
     match cli.command {
         Command::Init { repo } => {
             let repository =
@@ -439,14 +444,31 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     target.display()
                 );
             } else {
+                let mut report = RestoreReport::default();
                 if paths.is_empty() {
-                    restore_subpath(&repository, &id, None, &target).await?;
+                    report = restore_subpath(&repository, &id, None, &target).await?;
                 } else {
                     for p in &paths {
-                        restore_subpath(&repository, &id, Some(p), &target).await?;
+                        let r = restore_subpath(&repository, &id, Some(p), &target).await?;
+                        report.warnings += r.warnings;
+                        report.messages.extend(r.messages);
                     }
                 }
                 println!("restored {id} into {}", target.display());
+                if report.warnings > 0 {
+                    eprintln!(
+                        "warning: {} metadata operation(s) could not be applied:",
+                        report.warnings
+                    );
+                    for m in report.messages.iter().take(20) {
+                        eprintln!("  {m}");
+                    }
+                    let shown = report.messages.len().min(20) as u64;
+                    if report.warnings > shown {
+                        eprintln!("  ... and {} more", report.warnings - shown);
+                    }
+                    exit = 3;
+                }
             }
         }
         Command::Copy { src, dst, snapshot } => {
@@ -1033,7 +1055,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
     }
-    Ok(())
+    Ok(exit)
 }
 
 /// Open (or, when `create`, create) the storage backend for `repo` — a local
