@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, RetentionPolicy, backup_dry_run, backup_excluding, check, diff, dump,
-    find, forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
-    rebuild_index, restore_subpath, retag, verify,
+    DiffKind, EngineError, RetentionPolicy, backup_sources, check, diff, dump, find, forget,
+    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -36,12 +36,14 @@ enum Command {
         /// Repository path or object-store URL (e.g. s3://bucket/prefix).
         repo: String,
     },
-    /// Back up a directory into the repository.
+    /// Back up one or more directories into a single snapshot.
     Backup {
         /// Repository path or object-store URL.
         repo: String,
-        /// Directory to back up.
-        source: PathBuf,
+        /// Directories to back up (one or more; multiple sources land under a
+        /// synthetic root named by each source's final path component).
+        #[arg(required = true, num_args = 1..)]
+        sources: Vec<PathBuf>,
         /// Glob of entry names to exclude (repeatable), e.g. --exclude '*.log'.
         #[arg(long = "exclude", value_name = "GLOB")]
         excludes: Vec<String>,
@@ -287,26 +289,29 @@ async fn run() -> Result<(), Box<dyn Error>> {
         }
         Command::Backup {
             repo,
-            source,
+            sources,
             excludes,
             tags,
             dry_run,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            if dry_run {
-                let s = backup_dry_run(&mut repository, &source, &excludes).await?;
-                println!(
-                    "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
-                    s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
-                );
-            } else {
-                let snapshot = backup_excluding(&mut repository, &source, &excludes, &tags).await?;
-                println!("{snapshot}");
-                let s = repository.load_snapshot(&snapshot).await?.summary;
-                eprintln!(
-                    "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
-                    s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
-                );
+            let outcome =
+                backup_sources(&mut repository, &sources, &excludes, &tags, dry_run).await?;
+            let s = outcome.summary;
+            match outcome.snapshot {
+                Some(id) => {
+                    println!("{id}");
+                    eprintln!(
+                        "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
+                        s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
+                    );
+                }
+                None => {
+                    println!(
+                        "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
+                        s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
+                    );
+                }
             }
         }
         Command::Restore {

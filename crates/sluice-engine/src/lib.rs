@@ -43,6 +43,9 @@ pub enum EngineError {
     /// The backup source is not an existing directory.
     #[error("backup source is not a directory: {0}")]
     NotADirectory(String),
+    /// Two backup sources share the same final path component.
+    #[error("duplicate source name: {0}")]
+    DuplicateSource(String),
 }
 
 /// Convenience alias for fallible engine operations.
@@ -71,43 +74,169 @@ pub async fn backup_excluding<B: StorageBackend>(
     exclude_globs: &[String],
     tags: &[String],
 ) -> Result<Id> {
-    if !source.is_dir() {
-        return Err(EngineError::NotADirectory(source.display().to_string()));
-    }
-    // Hold a shared lock for the run: it blocks a concurrent prune from deleting
-    // data this snapshot will reference, while letting other backups proceed.
-    let lock = repo.acquire_lock(false).await?;
-    let result = backup_inner(repo, source, exclude_globs, tags).await;
-    let _ = repo.release_lock(&lock).await;
-    result
-}
-
-/// The body of [`backup_excluding`], run while holding a shared lock.
-async fn backup_inner<B: StorageBackend>(
-    repo: &mut Repository<B>,
-    source: &Path,
-    exclude_globs: &[String],
-    tags: &[String],
-) -> Result<Id> {
-    let excludes = build_globset(exclude_globs)?;
-    let parent = latest_snapshot(repo).await?;
-    let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
-    let mut summary = SnapshotStats::default();
-    let root_tree = backup_dir(
+    let outcome = backup_sources(
         repo,
-        source.to_path_buf(),
-        parent_tree,
-        &excludes,
-        &mut summary,
+        std::slice::from_ref(&source.to_path_buf()),
+        exclude_globs,
+        tags,
         false,
     )
     .await?;
+    Ok(outcome
+        .snapshot
+        .expect("a non-dry-run backup commits a snapshot"))
+}
+
+/// The result of a backup: the committed snapshot id (absent for a dry run) and
+/// the new/changed/unmodified summary.
+#[derive(Debug, Clone, Copy)]
+pub struct BackupOutcome {
+    /// The committed snapshot id, or `None` under `dry_run`.
+    pub snapshot: Option<Id>,
+    /// What the backup did (or, under `dry_run`, would do).
+    pub summary: SnapshotStats,
+}
+
+/// Back up one or more `sources` into a single snapshot, skipping entries whose
+/// name matches one of `exclude_globs`. A single source becomes the snapshot
+/// root directly (backward-compatible); multiple sources are placed under a
+/// synthetic root, one directory entry per source named by its final path
+/// component — duplicate names are rejected. With `dry_run`, nothing is written
+/// and the returned `snapshot` is `None`.
+pub async fn backup_sources<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    sources: &[PathBuf],
+    exclude_globs: &[String],
+    tags: &[String],
+    dry_run: bool,
+) -> Result<BackupOutcome> {
+    if sources.is_empty() {
+        return Err(EngineError::NotADirectory("(no source given)".to_string()));
+    }
+    for source in sources {
+        if !source.is_dir() {
+            return Err(EngineError::NotADirectory(source.display().to_string()));
+        }
+    }
+    // A real backup holds a shared lock (it blocks a concurrent prune from
+    // deleting data this snapshot references); a dry run only reads, so takes none.
+    let lock = if dry_run {
+        None
+    } else {
+        Some(repo.acquire_lock(false).await?)
+    };
+    let result = backup_sources_inner(repo, sources, exclude_globs, tags, dry_run).await;
+    if let Some(lock) = lock {
+        let _ = repo.release_lock(&lock).await;
+    }
+    result
+}
+
+/// The body of [`backup_sources`], run while holding the shared lock (if any).
+async fn backup_sources_inner<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    sources: &[PathBuf],
+    exclude_globs: &[String],
+    tags: &[String],
+    dry_run: bool,
+) -> Result<BackupOutcome> {
+    let excludes = build_globset(exclude_globs)?;
+    let parent = latest_snapshot(repo).await?;
+    let mut summary = SnapshotStats::default();
+
+    let root_tree = if let [source] = sources {
+        // Single source: its tree is the snapshot root.
+        let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
+        backup_dir(
+            repo,
+            source.clone(),
+            parent_tree,
+            &excludes,
+            &mut summary,
+            dry_run,
+        )
+        .await?
+    } else {
+        // Multiple sources: a synthetic root with one directory entry per source.
+        let parent_root: HashMap<Vec<u8>, Node> = match &parent {
+            Some((_, snap)) => match repo.load_tree(&snap.tree).await {
+                Ok(tree) => tree
+                    .nodes
+                    .into_iter()
+                    .map(|n| (n.name.clone(), n))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            },
+            None => HashMap::new(),
+        };
+        let mut names = HashSet::new();
+        let mut nodes = Vec::with_capacity(sources.len());
+        for source in sources {
+            let name = source
+                .file_name()
+                .ok_or_else(|| EngineError::NotADirectory(source.display().to_string()))?
+                .as_encoded_bytes()
+                .to_vec();
+            if !names.insert(name.clone()) {
+                return Err(EngineError::DuplicateSource(
+                    String::from_utf8_lossy(&name).into_owned(),
+                ));
+            }
+            let parent_sub = parent_root
+                .get(&name)
+                .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
+            let subtree = backup_dir(
+                repo,
+                source.clone(),
+                parent_sub,
+                &excludes,
+                &mut summary,
+                dry_run,
+            )
+            .await?;
+            let meta = std::fs::symlink_metadata(source).map_err(|e| io_err(source, e))?;
+            summary.dirs += 1;
+            nodes.push(Node {
+                name,
+                kind: EntryKind::Dir,
+                mode: mode_of(&meta),
+                uid: 0,
+                gid: 0,
+                mtime_ns: mtime_ns(&meta),
+                ctime_ns: 0,
+                size: 0,
+                content: Vec::new(),
+                subtree: Some(subtree),
+                link_target: None,
+            });
+        }
+        nodes.sort_by(|a, b| a.name.cmp(&b.name));
+        let tree = Tree {
+            version: TREE_VERSION,
+            nodes,
+        };
+        if dry_run {
+            Id::from_bytes([0u8; 32])
+        } else {
+            repo.save_tree(&tree).await?
+        }
+    };
+
+    if dry_run {
+        return Ok(BackupOutcome {
+            snapshot: None,
+            summary,
+        });
+    }
     repo.flush().await?;
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
         time_ns: now_ns(),
         tree: root_tree,
-        paths: vec![source.as_os_str().as_encoded_bytes().to_vec()],
+        paths: sources
+            .iter()
+            .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+            .collect(),
         hostname: env_or("HOSTNAME", "localhost"),
         username: env_or("USER", "unknown"),
         uid: 0,
@@ -117,7 +246,11 @@ async fn backup_inner<B: StorageBackend>(
         program_version: env!("CARGO_PKG_VERSION").to_string(),
         summary,
     };
-    Ok(repo.commit_snapshot(&snapshot).await?)
+    let id = repo.commit_snapshot(&snapshot).await?;
+    Ok(BackupOutcome {
+        snapshot: Some(id),
+        summary,
+    })
 }
 
 /// Preview a backup of `source`: walk the tree against the latest snapshot and
@@ -129,23 +262,15 @@ pub async fn backup_dry_run<B: StorageBackend>(
     source: &Path,
     exclude_globs: &[String],
 ) -> Result<SnapshotStats> {
-    if !source.is_dir() {
-        return Err(EngineError::NotADirectory(source.display().to_string()));
-    }
-    let excludes = build_globset(exclude_globs)?;
-    let parent = latest_snapshot(repo).await?;
-    let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
-    let mut summary = SnapshotStats::default();
-    backup_dir(
+    Ok(backup_sources(
         repo,
-        source.to_path_buf(),
-        parent_tree,
-        &excludes,
-        &mut summary,
+        std::slice::from_ref(&source.to_path_buf()),
+        exclude_globs,
+        &[],
         true,
     )
-    .await?;
-    Ok(summary)
+    .await?
+    .summary)
 }
 
 /// Compile exclude globs (matched against entry names) into a [`GlobSet`].
@@ -1990,6 +2115,49 @@ mod tests {
         assert_eq!(again.files_unmodified, 2);
         // The dry run added no second snapshot.
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backup_sources_combines_multiple_dirs() {
+        let base = tempfile::tempdir().unwrap();
+        let one = base.path().join("one");
+        std::fs::create_dir(&one).unwrap();
+        std::fs::write(one.join("a"), b"A").unwrap();
+        let two = base.path().join("two");
+        std::fs::create_dir(&two).unwrap();
+        std::fs::write(two.join("b"), b"B").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let outcome = backup_sources(&mut repo, &[one.clone(), two.clone()], &[], &[], false)
+            .await
+            .unwrap();
+        let snap = outcome.snapshot.unwrap();
+        assert_eq!(outcome.summary.files_new, 2);
+
+        // Each source is restored under its own basename.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("one/a")).unwrap(), b"A");
+        assert_eq!(std::fs::read(out.path().join("two/b")).unwrap(), b"B");
+
+        // A second run is incremental across the synthetic root: all unmodified.
+        let again = backup_sources(&mut repo, &[one.clone(), two.clone()], &[], &[], false)
+            .await
+            .unwrap();
+        assert_eq!(again.summary.files_new, 0);
+        assert_eq!(again.summary.files_unmodified, 2);
+
+        // Two sources with the same final component are rejected.
+        let x = base.path().join("x/data");
+        std::fs::create_dir_all(&x).unwrap();
+        let y = base.path().join("y/data");
+        std::fs::create_dir_all(&y).unwrap();
+        assert!(matches!(
+            backup_sources(&mut repo, &[x, y], &[], &[], false).await,
+            Err(EngineError::DuplicateSource(_))
+        ));
     }
 
     #[tokio::test]
