@@ -252,8 +252,8 @@ async fn backup_sources_inner<B: StorageBackend>(
                     name,
                     kind: EntryKind::Dir,
                     mode: mode_of(&meta),
-                    uid: 0,
-                    gid: 0,
+                    uid: uid_of(&meta),
+                    gid: gid_of(&meta),
                     mtime_ns: mtime_ns(&meta),
                     ctime_ns: 0,
                     size: 0,
@@ -282,6 +282,7 @@ async fn backup_sources_inner<B: StorageBackend>(
         });
     }
     repo.flush().await?;
+    let (snapshot_uid, snapshot_gid) = process_owner();
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
         time_ns: now_ns(),
@@ -292,8 +293,8 @@ async fn backup_sources_inner<B: StorageBackend>(
             .collect(),
         hostname: env_or("HOSTNAME", "localhost"),
         username: env_or("USER", "unknown"),
-        uid: 0,
-        gid: 0,
+        uid: snapshot_uid,
+        gid: snapshot_gid,
         tags: tags.to_vec(),
         parent: parent.map(|(id, _)| id),
         program_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1256,8 +1257,8 @@ async fn backup_file<B: StorageBackend>(
         name,
         kind: EntryKind::File,
         mode: mode_of(meta),
-        uid: 0,
-        gid: 0,
+        uid: uid_of(meta),
+        gid: gid_of(meta),
         mtime_ns: mtime,
         ctime_ns: 0,
         size,
@@ -1322,8 +1323,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     name,
                     kind: EntryKind::Dir,
                     mode: mode_of(&meta),
-                    uid: 0,
-                    gid: 0,
+                    uid: uid_of(&meta),
+                    gid: gid_of(&meta),
                     mtime_ns: mtime,
                     ctime_ns: 0,
                     size: 0,
@@ -1340,8 +1341,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     name,
                     kind: EntryKind::Symlink,
                     mode: mode_of(&meta),
-                    uid: 0,
-                    gid: 0,
+                    uid: uid_of(&meta),
+                    gid: gid_of(&meta),
                     mtime_ns: mtime,
                     ctime_ns: 0,
                     size: 0,
@@ -1357,8 +1358,8 @@ fn backup_dir<'a, B: StorageBackend>(
                     name,
                     kind: special,
                     mode: mode_of(&meta),
-                    uid: 0,
-                    gid: 0,
+                    uid: uid_of(&meta),
+                    gid: gid_of(&meta),
                     mtime_ns: mtime,
                     ctime_ns: 0,
                     size: 0,
@@ -1410,6 +1411,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Symlink => {
                     if let Some(target) = &node.link_target {
                         symlink(&osstring_from_bytes(target), &path)?;
+                        set_owner(&path, node.uid, node.gid, false);
                     }
                 }
                 EntryKind::Fifo => {
@@ -1506,10 +1508,12 @@ fn make_fifo(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort replay of a node's mode (Unix) and mtime onto `path`.
+/// Best-effort replay of a node's owner (Unix), mode (Unix), and mtime onto `path`.
 fn apply_metadata(path: &Path, node: &Node) {
     #[cfg(unix)]
     {
+        // chown before chmod: chown can clear setuid/setgid bits.
+        set_owner(path, node.uid, node.gid, true);
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode));
     }
@@ -1531,6 +1535,8 @@ fn apply_metadata(path: &Path, node: &Node) {
 fn apply_special_metadata(path: &Path, node: &Node) {
     use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, utimensat};
     use std::os::unix::fs::PermissionsExt;
+    // chown before chmod: chown can clear setuid/setgid bits.
+    set_owner(path, node.uid, node.gid, true);
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode & 0o7777));
     let times = Timestamps {
         last_access: Timespec {
@@ -1558,6 +1564,66 @@ fn mode_of(meta: &std::fs::Metadata) -> u32 {
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
     if meta.is_dir() { 0o755 } else { 0o644 }
 }
+
+#[cfg(unix)]
+fn uid_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    meta.uid()
+}
+
+#[cfg(not(unix))]
+fn uid_of(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn gid_of(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    meta.gid()
+}
+
+#[cfg(not(unix))]
+fn gid_of(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// The effective owner of the running process, recorded on the snapshot object.
+#[cfg(unix)]
+fn process_owner() -> (u32, u32) {
+    (
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getegid().as_raw(),
+    )
+}
+
+#[cfg(not(unix))]
+fn process_owner() -> (u32, u32) {
+    (0, 0)
+}
+
+/// Best-effort replay of ownership onto a restored entry. `chown` requires
+/// privilege (CAP_CHOWN), so failures are ignored — an unprivileged restore
+/// keeps the running user's ownership, matching restic/borg. `follow` controls
+/// whether a symlink is dereferenced (false = `lchown` the link itself).
+#[cfg(unix)]
+fn set_owner(path: &Path, uid: u32, gid: u32, follow: bool) {
+    use rustix::fs::{AtFlags, CWD, Gid, Uid, chownat};
+    let flags = if follow {
+        AtFlags::empty()
+    } else {
+        AtFlags::SYMLINK_NOFOLLOW
+    };
+    let _ = chownat(
+        CWD,
+        path,
+        Some(Uid::from_raw(uid)),
+        Some(Gid::from_raw(gid)),
+        flags,
+    );
+}
+
+#[cfg(not(unix))]
+fn set_owner(_path: &Path, _uid: u32, _gid: u32, _follow: bool) {}
 
 fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
     meta.modified()
@@ -2262,6 +2328,43 @@ mod tests {
             "restored entry should be a FIFO"
         );
         assert_eq!(std::fs::read(out.path().join("normal")).unwrap(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        // Assigning an arbitrary owner (and chown on restore) needs privilege;
+        // skip the assertion when unprivileged rather than fail in CI.
+        if rustix::process::geteuid().as_raw() != 0 {
+            return;
+        }
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("owned");
+        std::fs::write(&f, b"data").unwrap();
+        set_owner(&f, 1, 2, true);
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().uid(),
+            1,
+            "test setup chown failed"
+        );
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        // Backup recorded the real owner, not a hardcoded zero.
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        let tree = repo.load_tree(&snap_obj.tree).await.unwrap();
+        let node = tree.nodes.iter().find(|n| n.name == b"owned").unwrap();
+        assert_eq!((node.uid, node.gid), (1, 2));
+
+        // Restore replays it.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let m = std::fs::metadata(out.path().join("owned")).unwrap();
+        assert_eq!((m.uid(), m.gid()), (1, 2));
     }
 
     #[cfg(unix)]

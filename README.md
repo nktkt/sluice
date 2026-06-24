@@ -4,15 +4,15 @@
 
 **Status: alpha.** `sluice` creates encrypted repositories and performs
 deduplicated, compressed, **incremental** backups and restores — of files,
-directories, symlinks, and FIFOs (named pipes), with mode and mtime preserved —
-to a local path **or any S3-compatible object store**. It offers point-in-time snapshots (of one or
+directories, symlinks, and FIFOs (named pipes), with owner (uid/gid), mode, and
+mtime preserved — to a local path **or any S3-compatible object store**. It offers point-in-time snapshots (of one or
 many source files and/or directories), full and partial restore, two tiers of
 integrity
 checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 165 tests across
+machine-readable JSON output, and stable exit codes. Backed by 166 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -228,7 +228,7 @@ concurrency model, CLI surface, and threat model — lives in
 ## Roadmap
 
 - **M0** — workspace skeleton, core types, `StorageBackend` trait — ✅
-- **M1** — local backup + restore (incremental, symlinks, mode/mtime, excludes) — ✅
+- **M1** — local backup + restore (incremental, symlinks, FIFOs, owner/mode/mtime, excludes) — ✅
 - **M2** — deduplication (FastCDC) + zstd compression + persisted per-pack index — ✅
 - **M3** — encryption: Argon2id key hierarchy, XChaCha20-Poly1305, keyed BLAKE3 — ✅
 - **M4** — object storage / offsite DR (S3, GCS, Azure, MinIO) — ✅
@@ -249,7 +249,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 165 tests
+cargo test     # 166 tests
 ```
 
 ## Caveats
