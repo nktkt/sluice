@@ -121,6 +121,9 @@ enum Command {
         /// Keep the most recent snapshot of each of the last N calendar years.
         #[arg(long, value_name = "N")]
         keep_yearly: Option<usize>,
+        /// Always keep snapshots with this tag, regardless of count rules (repeatable).
+        #[arg(long = "keep-tag", value_name = "TAG")]
+        keep_tag: Vec<String>,
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -467,6 +470,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_weekly,
             keep_monthly,
             keep_yearly,
+            keep_tag,
             tag,
             dry_run,
             prune: do_prune,
@@ -479,6 +483,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 weekly: keep_weekly.unwrap_or(0),
                 monthly: keep_monthly.unwrap_or(0),
                 yearly: keep_yearly.unwrap_or(0),
+                keep_tags: keep_tag,
             };
             let verb = if dry_run { "would forget" } else { "forgot" };
             let forgotten: Vec<Id> = match (snapshot, tag, policy.is_empty()) {
@@ -500,7 +505,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     forgotten
                 }
                 (None, None, false) => {
-                    let forgotten = forget_with_policy(&repository, policy, dry_run).await?;
+                    let forgotten = forget_with_policy(&repository, &policy, dry_run).await?;
                     if !json {
                         println!("{verb} {} snapshot(s)", forgotten.len());
                     }

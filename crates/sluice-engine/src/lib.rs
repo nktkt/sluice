@@ -505,7 +505,7 @@ pub async fn retag<B: StorageBackend>(
 /// A snapshot retention policy. A snapshot is kept if it satisfies *any* enabled
 /// rule (the union, as in restic); a rule with a count of 0 is disabled. See
 /// `DESIGN.md` §8.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RetentionPolicy {
     /// Keep the N most recent snapshots.
     pub last: usize,
@@ -517,6 +517,8 @@ pub struct RetentionPolicy {
     pub monthly: usize,
     /// Keep the most recent snapshot of each of the last N calendar years.
     pub yearly: usize,
+    /// Always keep snapshots carrying any of these tags, regardless of counts.
+    pub keep_tags: Vec<String>,
 }
 
 impl RetentionPolicy {
@@ -528,6 +530,7 @@ impl RetentionPolicy {
             && self.weekly == 0
             && self.monthly == 0
             && self.yearly == 0
+            && self.keep_tags.is_empty()
     }
 }
 
@@ -581,19 +584,19 @@ fn year_bucket(time_ns: i64) -> i64 {
 /// running list of kept buckets suffices. The kept sets are unioned.
 pub async fn forget_with_policy<B: StorageBackend>(
     repo: &Repository<B>,
-    policy: RetentionPolicy,
+    policy: &RetentionPolicy,
     dry_run: bool,
 ) -> Result<Vec<Id>> {
     let mut snapshots = Vec::new();
     for id in repo.list_snapshots().await? {
-        let time = repo.load_snapshot(&id).await?.time_ns;
-        snapshots.push((id, time));
+        let snap = repo.load_snapshot(&id).await?;
+        snapshots.push((id, snap.time_ns, snap.tags));
     }
     snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
 
     let mut keep: HashSet<Id> = HashSet::new();
     // `--keep-last N`: the N most recent snapshots outright.
-    for (id, _) in snapshots.iter().take(policy.last) {
+    for (id, _, _) in snapshots.iter().take(policy.last) {
         keep.insert(*id);
     }
     // `--keep-daily`/`weekly`/`monthly`/`yearly`: most recent per bucket, last N.
@@ -605,7 +608,7 @@ pub async fn forget_with_policy<B: StorageBackend>(
     ];
     for (budget, bucket_of) in bucketed {
         let mut kept_buckets: Vec<i64> = Vec::new();
-        for (id, time) in &snapshots {
+        for (id, time, _) in &snapshots {
             let bucket = bucket_of(*time);
             if kept_buckets.last() != Some(&bucket) && kept_buckets.len() < budget {
                 kept_buckets.push(bucket);
@@ -613,9 +616,17 @@ pub async fn forget_with_policy<B: StorageBackend>(
             }
         }
     }
+    // `--keep-tag T`: any snapshot carrying a protected tag survives outright.
+    if !policy.keep_tags.is_empty() {
+        for (id, _, tags) in &snapshots {
+            if tags.iter().any(|t| policy.keep_tags.contains(t)) {
+                keep.insert(*id);
+            }
+        }
+    }
 
     let mut forgotten = Vec::new();
-    for (id, _) in &snapshots {
+    for (id, _, _) in &snapshots {
         if !keep.contains(id) {
             if !dry_run {
                 forget(repo, id).await?;
@@ -634,7 +645,7 @@ pub async fn forget_keep_last<B: StorageBackend>(
 ) -> Result<Vec<Id>> {
     forget_with_policy(
         repo,
-        RetentionPolicy {
+        &RetentionPolicy {
             last: keep,
             ..Default::default()
         },
@@ -652,7 +663,7 @@ pub async fn forget_keep_daily<B: StorageBackend>(
 ) -> Result<Vec<Id>> {
     forget_with_policy(
         repo,
-        RetentionPolicy {
+        &RetentionPolicy {
             daily: keep,
             ..Default::default()
         },
@@ -1525,15 +1536,43 @@ mod tests {
             ..Default::default()
         };
         // Dry run previews the same removal without touching the repo.
-        let preview = forget_with_policy(&repo, policy, true).await.unwrap();
+        let preview = forget_with_policy(&repo, &policy, true).await.unwrap();
         assert_eq!(preview, vec![d9]);
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
 
-        let forgotten = forget_with_policy(&repo, policy, false).await.unwrap();
+        let forgotten = forget_with_policy(&repo, &policy, false).await.unwrap();
         assert_eq!(forgotten, vec![d9]);
 
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([d10, d3]));
+    }
+
+    #[tokio::test]
+    async fn forget_with_policy_protects_keep_tagged_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // Three snapshots; the middle one is tagged "important".
+        std::fs::write(&f, b"v1").unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+        std::fs::write(&f, b"v2").unwrap();
+        let important = backup_excluding(&mut repo, src.path(), &[], &["important".into()][..])
+            .await
+            .unwrap();
+        std::fs::write(&f, b"v3").unwrap();
+        let newest = backup(&mut repo, src.path()).await.unwrap();
+
+        // keep-last 1 would drop the older two, but keep-tag rescues "important".
+        let policy = RetentionPolicy {
+            last: 1,
+            keep_tags: vec!["important".into()],
+            ..Default::default()
+        };
+        forget_with_policy(&repo, &policy, false).await.unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([newest, important]));
     }
 
     #[test]
@@ -1587,7 +1626,7 @@ mod tests {
             yearly: 2,
             ..Default::default()
         };
-        let forgotten = forget_with_policy(&repo, policy, false).await.unwrap();
+        let forgotten = forget_with_policy(&repo, &policy, false).await.unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([y1971, feb]));
         // Both January 1970 snapshots are dropped (older year, non-newest month).
