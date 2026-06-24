@@ -257,13 +257,21 @@ pub struct RetentionPolicy {
     pub daily: usize,
     /// Keep the most recent snapshot of each of the last N (Monday-aligned) weeks.
     pub weekly: usize,
+    /// Keep the most recent snapshot of each of the last N calendar months.
+    pub monthly: usize,
+    /// Keep the most recent snapshot of each of the last N calendar years.
+    pub yearly: usize,
 }
 
 impl RetentionPolicy {
     /// Whether every rule is disabled (so the policy would keep nothing).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.last == 0 && self.daily == 0 && self.weekly == 0
+        self.last == 0
+            && self.daily == 0
+            && self.weekly == 0
+            && self.monthly == 0
+            && self.yearly == 0
     }
 }
 
@@ -279,6 +287,32 @@ fn day_bucket(time_ns: i64) -> i64 {
 /// Thursday, so `+3` shifts week boundaries onto Mondays.
 fn week_bucket(time_ns: i64) -> i64 {
     (day_bucket(time_ns) + 3).div_euclid(7)
+}
+
+/// Civil `(year, month)` for a day index (days since 1970-01-01), via Howard
+/// Hinnant's `civil_from_days`. Month is in `1..=12`; handles days before the
+/// epoch. Used to bucket snapshots by calendar month and year.
+fn year_month(day: i64) -> (i64, i64) {
+    let z = day + 719_468; // shift epoch to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // month shifted so March = 0, [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12], Jan/Feb roll to next year
+    (if m <= 2 { y + 1 } else { y }, m)
+}
+
+/// The calendar-month index (months since year 0) containing `time_ns`.
+fn month_bucket(time_ns: i64) -> i64 {
+    let (y, m) = year_month(day_bucket(time_ns));
+    y * 12 + (m - 1)
+}
+
+/// The calendar year containing `time_ns`.
+fn year_bucket(time_ns: i64) -> i64 {
+    year_month(day_bucket(time_ns)).0
 }
 
 /// Apply a retention `policy`, forgetting every snapshot kept by no rule, and
@@ -304,9 +338,13 @@ pub async fn forget_with_policy<B: StorageBackend>(
     for (id, _) in snapshots.iter().take(policy.last) {
         keep.insert(*id);
     }
-    // `--keep-daily`/`--keep-weekly`: most recent per bucket, last N buckets.
-    let bucketed: [(usize, fn(i64) -> i64); 2] =
-        [(policy.daily, day_bucket), (policy.weekly, week_bucket)];
+    // `--keep-daily`/`weekly`/`monthly`/`yearly`: most recent per bucket, last N.
+    let bucketed: [(usize, fn(i64) -> i64); 4] = [
+        (policy.daily, day_bucket),
+        (policy.weekly, week_bucket),
+        (policy.monthly, month_bucket),
+        (policy.yearly, year_bucket),
+    ];
     for (budget, bucket_of) in bucketed {
         let mut kept_buckets: Vec<i64> = Vec::new();
         for (id, time) in &snapshots {
@@ -1121,15 +1159,74 @@ mod tests {
         // daily 1 keeps only d10; weekly 2 additionally keeps d3 (week 0's newest).
         // d9 is the newest of week 1 only after d10, so neither rule keeps it.
         let policy = RetentionPolicy {
-            last: 0,
             daily: 1,
             weekly: 2,
+            ..Default::default()
         };
         let forgotten = forget_with_policy(&repo, policy).await.unwrap();
         assert_eq!(forgotten, vec![d9]);
 
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([d10, d3]));
+    }
+
+    #[test]
+    fn year_month_matches_known_dates() {
+        assert_eq!(year_month(0), (1970, 1)); // 1970-01-01
+        assert_eq!(year_month(31), (1970, 2)); // 1970-02-01
+        assert_eq!(year_month(59), (1970, 3)); // 1970-03-01 (1970 is not a leap year)
+        assert_eq!(year_month(365), (1971, 1)); // 1971-01-01
+        assert_eq!(year_month(10_957), (2000, 1)); // 2000-01-01
+        assert_eq!(year_month(11_016), (2000, 2)); // 2000-02-29 (leap day)
+        assert_eq!(year_month(11_017), (2000, 3)); // 2000-03-01
+        assert_eq!(year_month(-1), (1969, 12)); // 1969-12-31 (pre-epoch)
+    }
+
+    #[tokio::test]
+    async fn forget_with_policy_keeps_monthly_and_yearly() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const DAY: i64 = 86_400_000_000_000;
+        // 1970-01 (two snapshots), 1970-02 (one), 1971-01 (one).
+        let jan_a = repo.commit_snapshot(&at(10)).await.unwrap(); // 1970-01-01
+        let jan_b = repo.commit_snapshot(&at(5 * DAY + 10)).await.unwrap(); // 1970-01-06
+        let feb = repo.commit_snapshot(&at(31 * DAY + 10)).await.unwrap(); // 1970-02-01
+        let y1971 = repo.commit_snapshot(&at(365 * DAY + 10)).await.unwrap(); // 1971-01-01
+
+        // monthly 1 keeps 1971-01 (y1971); yearly 2 adds 1970's newest (feb).
+        let policy = RetentionPolicy {
+            monthly: 1,
+            yearly: 2,
+            ..Default::default()
+        };
+        let forgotten = forget_with_policy(&repo, policy).await.unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([y1971, feb]));
+        // Both January 1970 snapshots are dropped (older year, non-newest month).
+        assert_eq!(forgotten.len(), 2);
+        assert!(forgotten.contains(&jan_a) && forgotten.contains(&jan_b));
     }
 
     #[cfg(unix)]

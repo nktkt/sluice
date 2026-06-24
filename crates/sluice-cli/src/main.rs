@@ -87,6 +87,12 @@ enum Command {
         /// Keep the most recent snapshot of each of the last N (Monday-aligned) weeks.
         #[arg(long, value_name = "N")]
         keep_weekly: Option<usize>,
+        /// Keep the most recent snapshot of each of the last N calendar months.
+        #[arg(long, value_name = "N")]
+        keep_monthly: Option<usize>,
+        /// Keep the most recent snapshot of each of the last N calendar years.
+        #[arg(long, value_name = "N")]
+        keep_yearly: Option<usize>,
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -227,6 +233,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_last,
             keep_daily,
             keep_weekly,
+            keep_monthly,
+            keep_yearly,
             tag,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
@@ -234,6 +242,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 last: keep_last.unwrap_or(0),
                 daily: keep_daily.unwrap_or(0),
                 weekly: keep_weekly.unwrap_or(0),
+                monthly: keep_monthly.unwrap_or(0),
+                yearly: keep_yearly.unwrap_or(0),
             };
             match (snapshot, tag, policy.is_empty()) {
                 (Some(snapshot), None, true) => {
@@ -252,7 +262,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 _ => {
                     return Err(
                         "specify exactly one of: <snapshot>, --tag T, or one or more \
-                         --keep-last/--keep-daily/--keep-weekly rules"
+                         --keep-last/-daily/-weekly/-monthly/-yearly rules"
                             .into(),
                     );
                 }
