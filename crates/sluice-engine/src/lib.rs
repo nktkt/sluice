@@ -99,6 +99,7 @@ async fn backup_inner<B: StorageBackend>(
         parent_tree,
         &excludes,
         &mut summary,
+        false,
     )
     .await?;
     repo.flush().await?;
@@ -117,6 +118,34 @@ async fn backup_inner<B: StorageBackend>(
         summary,
     };
     Ok(repo.commit_snapshot(&snapshot).await?)
+}
+
+/// Preview a backup of `source`: walk the tree against the latest snapshot and
+/// return the new/changed/unmodified summary it *would* produce, **without**
+/// writing any blob, tree, or snapshot (and without taking a lock). New or
+/// changed files are counted from their metadata; their data is not read.
+pub async fn backup_dry_run<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    source: &Path,
+    exclude_globs: &[String],
+) -> Result<SnapshotStats> {
+    if !source.is_dir() {
+        return Err(EngineError::NotADirectory(source.display().to_string()));
+    }
+    let excludes = build_globset(exclude_globs)?;
+    let parent = latest_snapshot(repo).await?;
+    let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
+    let mut summary = SnapshotStats::default();
+    backup_dir(
+        repo,
+        source.to_path_buf(),
+        parent_tree,
+        &excludes,
+        &mut summary,
+        true,
+    )
+    .await?;
+    Ok(summary)
 }
 
 /// Compile exclude globs (matched against entry names) into a [`GlobSet`].
@@ -756,6 +785,7 @@ fn backup_dir<'a, B: StorageBackend>(
     parent: Option<Id>,
     excludes: &'a GlobSet,
     stats: &'a mut SnapshotStats,
+    dry_run: bool,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
         // Load the parent directory's entries for incremental reuse.
@@ -794,7 +824,8 @@ fn backup_dir<'a, B: StorageBackend>(
                 let parent_sub = parent_nodes
                     .get(&name)
                     .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-                let subtree = backup_dir(repo, path.clone(), parent_sub, excludes, stats).await?;
+                let subtree =
+                    backup_dir(repo, path.clone(), parent_sub, excludes, stats, dry_run).await?;
                 stats.dirs += 1;
                 Node {
                     name,
@@ -826,9 +857,14 @@ fn backup_dir<'a, B: StorageBackend>(
                     } else {
                         stats.files_new += 1;
                     }
-                    let data = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
-                    let content = repo.save_file(&data).await?;
-                    (content, data.len() as u64)
+                    if dry_run {
+                        // Count it, but read nothing and store nothing.
+                        (Vec::new(), meta.len())
+                    } else {
+                        let data = std::fs::read(&path).map_err(|e| io_err(&path, e))?;
+                        let len = data.len() as u64;
+                        (repo.save_file(&data).await?, len)
+                    }
                 };
                 stats.bytes_processed += size;
                 Node {
@@ -869,7 +905,12 @@ fn backup_dir<'a, B: StorageBackend>(
             version: TREE_VERSION,
             nodes,
         };
-        Ok(repo.save_tree(&tree).await?)
+        if dry_run {
+            // No snapshot is committed, so the tree id is never referenced.
+            Ok(Id::from_bytes([0u8; 32]))
+        } else {
+            Ok(repo.save_tree(&tree).await?)
+        }
     })
 }
 
@@ -1851,6 +1892,37 @@ mod tests {
         repo.release_lock(&held).await.unwrap();
         assert!(backup(&mut repo, src.path()).await.is_ok());
         assert!(repo.list_locks().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backup_dry_run_counts_without_writing() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha").unwrap();
+        std::fs::write(src.path().join("b"), vec![7u8; 2000]).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+
+        let summary = backup_dry_run(&mut repo, src.path(), &[]).await.unwrap();
+        assert_eq!(summary.files_new, 2);
+        assert_eq!(summary.files_unmodified, 0);
+        // Nothing was persisted.
+        assert!(repo.list_snapshots().await.unwrap().is_empty());
+        assert!(
+            repo.backend()
+                .list(FileType::Pack)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // After a real backup, a dry run sees everything as unmodified.
+        backup(&mut repo, src.path()).await.unwrap();
+        let again = backup_dry_run(&mut repo, src.path(), &[]).await.unwrap();
+        assert_eq!(again.files_new, 0);
+        assert_eq!(again.files_unmodified, 2);
+        // The dry run added no second snapshot.
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

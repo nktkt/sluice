@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, RetentionPolicy, backup_excluding, check, diff, dump, forget,
-    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    DiffKind, EngineError, RetentionPolicy, backup_dry_run, backup_excluding, check, diff, dump,
+    forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
     restore_subpath, verify,
 };
 use sluice_repo::{RepoError, Repository};
@@ -48,6 +48,9 @@ enum Command {
         /// Tag to attach to the snapshot (repeatable).
         #[arg(long = "tag", value_name = "TAG")]
         tags: Vec<String>,
+        /// Report what would be backed up without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Restore a snapshot into a target directory.
     Restore {
@@ -249,15 +252,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
             source,
             excludes,
             tags,
+            dry_run,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let snapshot = backup_excluding(&mut repository, &source, &excludes, &tags).await?;
-            println!("{snapshot}");
-            let s = repository.load_snapshot(&snapshot).await?.summary;
-            eprintln!(
-                "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
-                s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
-            );
+            if dry_run {
+                let s = backup_dry_run(&mut repository, &source, &excludes).await?;
+                println!(
+                    "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
+                    s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
+                );
+            } else {
+                let snapshot = backup_excluding(&mut repository, &source, &excludes, &tags).await?;
+                println!("{snapshot}");
+                let s = repository.load_snapshot(&snapshot).await?.summary;
+                eprintln!(
+                    "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
+                    s.files_new, s.files_changed, s.files_unmodified, s.dirs, s.bytes_processed
+                );
+            }
         }
         Command::Restore {
             repo,
