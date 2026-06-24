@@ -1285,8 +1285,71 @@ pub enum DiffKind {
     Added,
     /// Present only in the older snapshot.
     Removed,
-    /// Present in both, but with a different kind or size.
+    /// Present in both, but with a different kind, size, or metadata.
     Modified,
+}
+
+/// Which aspects of a [`Modified`](DiffKind::Modified) entry changed. Every field
+/// is `false` for added and removed entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DiffDetail {
+    /// The entry type changed (e.g. a file became a symlink).
+    pub kind: bool,
+    /// The logical size changed.
+    pub size: bool,
+    /// The permission bits changed.
+    pub mode: bool,
+    /// The owning uid or gid changed.
+    pub owner: bool,
+    /// The modification time changed.
+    pub mtime: bool,
+    /// A symlink's target or a device node's number changed.
+    pub target: bool,
+}
+
+impl DiffDetail {
+    /// What changed between two entries at the same path.
+    fn between(old: &ListEntry, new: &ListEntry) -> Self {
+        Self {
+            kind: old.kind != new.kind,
+            size: old.size != new.size,
+            mode: old.mode != new.mode,
+            owner: old.uid != new.uid || old.gid != new.gid,
+            mtime: old.mtime_ns != new.mtime_ns,
+            target: old.link_target != new.link_target || old.rdev != new.rdev,
+        }
+    }
+
+    /// Whether any aspect changed.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.kind || self.size || self.mode || self.owner || self.mtime || self.target
+    }
+
+    /// The names of the changed aspects, for display (`["mode", "mtime"]`).
+    #[must_use]
+    pub fn labels(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.kind {
+            out.push("type");
+        }
+        if self.size {
+            out.push("size");
+        }
+        if self.mode {
+            out.push("mode");
+        }
+        if self.owner {
+            out.push("owner");
+        }
+        if self.mtime {
+            out.push("mtime");
+        }
+        if self.target {
+            out.push("target");
+        }
+        out
+    }
 }
 
 /// A single change reported by [`diff`].
@@ -1296,39 +1359,48 @@ pub struct DiffEntry {
     pub path: String,
     /// The kind of change.
     pub change: DiffKind,
+    /// For a [`Modified`](DiffKind::Modified) entry, which aspects changed.
+    pub detail: DiffDetail,
 }
 
-/// Compare two snapshots by path, reporting added, removed, and modified entries
-/// (modification is detected by a change in kind or size). Unchanged entries are
-/// omitted; the result is sorted by path.
+/// Compare two snapshots by path, reporting added, removed, and modified entries.
+/// An entry is modified if its kind, size, mode, owner, mtime, symlink target, or
+/// device number differs; [`DiffEntry::detail`] says which. Unchanged entries are
+/// omitted and the result is sorted by path.
 pub async fn diff<B: StorageBackend>(
     repo: &Repository<B>,
     from: &Id,
     to: &Id,
 ) -> Result<Vec<DiffEntry>> {
-    let old: HashMap<String, (EntryKind, u64)> = list_files(repo, from)
+    let old: HashMap<String, ListEntry> = list_files(repo, from)
         .await?
         .into_iter()
-        .map(|e| (e.path, (e.kind, e.size)))
+        .map(|e| (e.path.clone(), e))
         .collect();
-    let new: HashMap<String, (EntryKind, u64)> = list_files(repo, to)
+    let new: HashMap<String, ListEntry> = list_files(repo, to)
         .await?
         .into_iter()
-        .map(|e| (e.path, (e.kind, e.size)))
+        .map(|e| (e.path.clone(), e))
         .collect();
 
     let mut changes = Vec::new();
-    for (path, meta) in &new {
+    for (path, entry) in &new {
         match old.get(path) {
             None => changes.push(DiffEntry {
                 path: path.clone(),
                 change: DiffKind::Added,
+                detail: DiffDetail::default(),
             }),
-            Some(prev) if prev != meta => changes.push(DiffEntry {
-                path: path.clone(),
-                change: DiffKind::Modified,
-            }),
-            _ => {}
+            Some(prev) => {
+                let detail = DiffDetail::between(prev, entry);
+                if detail.any() {
+                    changes.push(DiffEntry {
+                        path: path.clone(),
+                        change: DiffKind::Modified,
+                        detail,
+                    });
+                }
+            }
         }
     }
     for path in old.keys() {
@@ -1336,6 +1408,7 @@ pub async fn diff<B: StorageBackend>(
             changes.push(DiffEntry {
                 path: path.clone(),
                 change: DiffKind::Removed,
+                detail: DiffDetail::default(),
             });
         }
     }
@@ -3334,6 +3407,40 @@ mod tests {
         assert_eq!(of(DiffKind::Removed), vec!["gone"]);
         assert_eq!(of(DiffKind::Modified), vec!["changes"]);
         assert!(!changes.iter().any(|d| d.path == "stable"));
+        // The size+content change is categorized as such, not as metadata.
+        let changed = changes.iter().find(|d| d.path == "changes").unwrap();
+        assert!(changed.detail.size && !changed.detail.mode && !changed.detail.owner);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn diff_detects_metadata_only_changes() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        std::fs::write(&f, b"content").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let a = backup(&mut repo, src.path()).await.unwrap();
+
+        // chmod only: the content, size, and mtime are untouched.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let b = backup(&mut repo, src.path()).await.unwrap();
+
+        let changes = diff(&repo, &a, &b).await.unwrap();
+        let m = changes
+            .iter()
+            .find(|d| d.path == "f")
+            .expect("f is modified");
+        assert_eq!(m.change, DiffKind::Modified);
+        assert!(m.detail.mode, "a permission change must be detected");
+        assert!(!m.detail.size, "size did not change");
+        assert!(
+            !m.detail.mtime,
+            "mtime did not change (chmod touches ctime)"
+        );
     }
 
     #[tokio::test]

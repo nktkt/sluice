@@ -883,18 +883,19 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                             DiffKind::Removed => "removed",
                             DiffKind::Modified => "modified",
                         };
-                        serde_json::json!({ "change": kind, "path": c.path })
+                        serde_json::json!({ "change": kind, "path": c.path, "changed": c.detail.labels() })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
                 for change in &changes {
-                    let sign = match change.change {
-                        DiffKind::Added => '+',
-                        DiffKind::Removed => '-',
-                        DiffKind::Modified => 'M',
-                    };
-                    println!("{sign} {}", change.path);
+                    match change.change {
+                        DiffKind::Added => println!("+ {}", change.path),
+                        DiffKind::Removed => println!("- {}", change.path),
+                        DiffKind::Modified => {
+                            println!("M {} ({})", change.path, change.detail.labels().join(", "))
+                        }
+                    }
                 }
             }
         }
