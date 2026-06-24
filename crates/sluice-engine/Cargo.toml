@@ -13,6 +13,7 @@ sluice-core = { path = "../sluice-core" }
 sluice-repo = { path = "../sluice-repo" }
 sluice-store = { path = "../sluice-store" }
 thiserror = { workspace = true }
+filetime = { workspace = true }
 
 [dev-dependencies]
 sluice-crypto = { path = "../sluice-crypto" }

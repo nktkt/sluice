@@ -2,8 +2,8 @@
 //!
 //! This first cut walks a directory tree, storing each regular file as
 //! deduplicated chunks and each directory as a `Tree`, then commits a snapshot;
-//! restore rebuilds the tree. Files, directories, and symlinks are handled;
-//! special files and metadata replay (mode/mtime) are follow-up work. The walk
+//! restore rebuilds the tree and replays mode/mtime. Files, directories, and
+//! symlinks are handled; special files (fifo/socket/device) remain. The walk
 //! uses blocking `std::fs` for now; offloading to a thread pool is a later
 //! refinement.
 
@@ -434,12 +434,15 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(repo, subtree, path).await?;
+                        restore_tree(repo, subtree, path.clone()).await?;
                     }
+                    // Replay the directory's mtime after its children are written.
+                    apply_metadata(&path, node);
                 }
                 EntryKind::File => {
                     let data = repo.load_file(&node.content).await?;
                     std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                    apply_metadata(&path, node);
                 }
                 EntryKind::Symlink => {
                     if let Some(target) = &node.link_target {
@@ -474,6 +477,20 @@ fn symlink(_target: &std::ffi::OsStr, link: &Path) -> Result<()> {
             "symlinks are not supported on this platform",
         ),
     ))
+}
+
+/// Best-effort replay of a node's mode (Unix) and mtime onto `path`.
+fn apply_metadata(path: &Path, node: &Node) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode));
+    }
+    let mtime = filetime::FileTime::from_unix_time(
+        node.mtime_ns.div_euclid(1_000_000_000),
+        node.mtime_ns.rem_euclid(1_000_000_000) as u32,
+    );
+    let _ = filetime::set_file_mtime(path, mtime);
 }
 
 #[cfg(unix)]
@@ -759,5 +776,30 @@ mod tests {
         );
         // Reading through the link yields the target's content.
         assert_eq!(std::fs::read(&link).unwrap(), b"the target");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_replays_mode_and_mtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("script.sh");
+        std::fs::write(&f, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_600_000_000, 0)).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+
+        let meta = std::fs::metadata(dst.path().join("script.sh")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&meta).unix_seconds(),
+            1_600_000_000
+        );
     }
 }
