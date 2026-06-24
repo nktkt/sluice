@@ -131,9 +131,46 @@ pub async fn restore<B: StorageBackend>(
     snapshot: &Id,
     target: &Path,
 ) -> Result<()> {
+    restore_subpath(repo, snapshot, None, target).await
+}
+
+/// Restore a snapshot into `target`. With `subpath`, restore only that entry
+/// (a directory subtree, file, or symlink), placed under `target` by base name.
+pub async fn restore_subpath<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    subpath: Option<&str>,
+    target: &Path,
+) -> Result<()> {
     let snap = repo.load_snapshot(snapshot).await?;
     std::fs::create_dir_all(target).map_err(|e| io_err(target, e))?;
-    restore_tree(repo, snap.tree, target.to_path_buf()).await
+    let Some(path) = subpath else {
+        return restore_tree(repo, snap.tree, target.to_path_buf()).await;
+    };
+
+    let node = find_node(repo, snap.tree, path).await?;
+    let dest = target.join(osstring_from_bytes(&node.name));
+    match node.kind {
+        EntryKind::Dir => {
+            std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
+            if let Some(subtree) = node.subtree {
+                restore_tree(repo, subtree, dest.clone()).await?;
+            }
+            apply_metadata(&dest, &node);
+        }
+        EntryKind::File => {
+            let data = repo.load_file(&node.content).await?;
+            std::fs::write(&dest, &data).map_err(|e| io_err(&dest, e))?;
+            apply_metadata(&dest, &node);
+        }
+        EntryKind::Symlink => {
+            if let Some(link_target) = &node.link_target {
+                symlink(&osstring_from_bytes(link_target), &dest)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// A summary produced by [`verify`].
@@ -1136,5 +1173,42 @@ mod tests {
             std::fs::read(out2.path().join("c")).unwrap(),
             b"charlie new"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_subpath_restores_only_a_subtree() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("a/b")).unwrap();
+        std::fs::write(src.path().join("a/b/file"), b"deep").unwrap();
+        std::fs::write(src.path().join("top"), b"top").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        restore_subpath(&repo, &snap, Some("a/b"), dst.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dst.path().join("b/file")).unwrap(), b"deep");
+        assert!(!dst.path().join("top").exists());
+        assert!(!dst.path().join("a").exists());
+    }
+
+    #[tokio::test]
+    async fn restore_subpath_restores_a_single_file() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/f"), b"content").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        restore_subpath(&repo, &snap, Some("d/f"), dst.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(dst.path().join("f")).unwrap(), b"content");
     }
 }

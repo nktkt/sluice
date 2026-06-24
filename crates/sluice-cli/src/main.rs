@@ -14,7 +14,7 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, backup_excluding, diff, dump, forget, forget_keep_last, forget_tagged, list_files,
-    prune, restore, verify,
+    prune, restore_subpath, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -55,6 +55,9 @@ enum Command {
         snapshot: String,
         /// Directory to restore into.
         target: PathBuf,
+        /// Restore only this path within the snapshot.
+        #[arg(long)]
+        path: Option<String>,
     },
     /// List the snapshots in a repository.
     Snapshots {
@@ -151,10 +154,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             repo,
             snapshot,
             target,
+            path,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
-            restore(&repository, &id, &target).await?;
+            restore_subpath(&repository, &id, path.as_deref(), &target).await?;
             println!("restored {id} into {}", target.display());
         }
         Command::Snapshots { repo, tag } => {
