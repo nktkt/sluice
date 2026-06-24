@@ -74,6 +74,10 @@ pub struct Repository<B> {
     config: RepoConfig,
     /// chunk id -> (pack id, directory entry). Rebuilt from pack footers on open.
     index: HashMap<Id, (Id, BlobEntry)>,
+    /// Blobs sealed but not yet flushed to a pack.
+    pending: PackBuilder,
+    /// chunk id -> directory entry within `pending`.
+    pending_index: HashMap<Id, BlobEntry>,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -136,6 +140,8 @@ impl<B: StorageBackend> Repository<B> {
             keys,
             config,
             index: HashMap::new(),
+            pending: PackBuilder::new(),
+            pending_index: HashMap::new(),
         })
     }
 
@@ -166,6 +172,8 @@ impl<B: StorageBackend> Repository<B> {
             keys,
             config,
             index,
+            pending: PackBuilder::new(),
+            pending_index: HashMap::new(),
         })
     }
 
@@ -176,28 +184,51 @@ impl<B: StorageBackend> Repository<B> {
     /// AEAD-sealed under `data_key` and written in a new pack.
     pub async fn save_blob(&mut self, kind: BlobKind, plaintext: &[u8]) -> Result<Id> {
         let id = keyed_hash(&self.keys.id_key, plaintext);
-        if self.index.contains_key(&id) {
+        if self.index.contains_key(&id) || self.pending_index.contains_key(&id) {
             return Ok(id);
         }
 
         let frame = compress(plaintext);
         let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), &frame);
-        let mut builder = PackBuilder::new();
-        builder.add(id, kind, &sealed);
+        let entry = self.pending.add(id, kind, &sealed);
+        self.pending_index.insert(id, entry);
+
+        if self.pending.body_len() as u64 >= self.config.pack_target {
+            self.flush().await?;
+        }
+        Ok(id)
+    }
+
+    /// Flush buffered blobs into a new pack so they become durable. Call this at
+    /// the end of a backup, before committing the snapshot that references them;
+    /// it is also called automatically when the pending pack reaches the target
+    /// size.
+    pub async fn flush(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let builder = std::mem::take(&mut self.pending);
+        self.pending_index.clear();
         let (bytes, directory) = builder.finish()?;
         let pack_id = hash(&bytes);
         self.backend
             .put(FileType::Pack, &pack_id, bytes.into())
             .await?;
-
         for entry in &directory {
             self.index.insert(entry.id, (pack_id, *entry));
         }
-        Ok(id)
+        Ok(())
     }
 
     /// Load and decrypt the blob with the given id.
     pub async fn load_blob(&self, id: &Id) -> Result<Vec<u8>> {
+        // The blob may still be buffered in the pending pack (not yet flushed).
+        if let Some(entry) = self.pending_index.get(id) {
+            let sealed = self.pending.blob_at(entry);
+            let frame = open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed)
+                .map_err(|_| RepoError::Blob)?;
+            return decompress(&frame).map_err(|_| RepoError::Blob);
+        }
         let (pack_id, entry) = self
             .index
             .get(id)
@@ -304,7 +335,7 @@ impl<B: StorageBackend> Repository<B> {
     /// Whether a blob with the given id is present.
     #[must_use]
     pub fn has_blob(&self, id: &Id) -> bool {
-        self.index.contains_key(id)
+        self.index.contains_key(id) || self.pending_index.contains_key(id)
     }
 
     /// Associated data binding a sealed blob to this repository and its kind.
@@ -451,6 +482,7 @@ mod tests {
             .unwrap();
         let a = repo.save_blob(BlobKind::Data, b"dup").await.unwrap();
         let b = repo.save_blob(BlobKind::Data, b"dup").await.unwrap();
+        repo.flush().await.unwrap();
         assert_eq!(a, b);
         assert_eq!(repo.backend().list(FileType::Pack).await.unwrap().len(), 1);
     }
@@ -462,6 +494,7 @@ mod tests {
             .unwrap();
         let secret = b"TOP-SECRET-PLAINTEXT-MARKER";
         repo.save_blob(BlobKind::Data, secret).await.unwrap();
+        repo.flush().await.unwrap();
         for pid in repo.backend().list(FileType::Pack).await.unwrap() {
             let bytes = repo.backend().get(FileType::Pack, &pid).await.unwrap();
             assert!(
@@ -477,9 +510,12 @@ mod tests {
         let id = {
             let be = LocalBackend::create(dir.path()).await.unwrap();
             let mut repo = Repository::init(be, b"pw", fast()).await.unwrap();
-            repo.save_blob(BlobKind::Data, b"persisted blob")
+            let id = repo
+                .save_blob(BlobKind::Data, b"persisted blob")
                 .await
-                .unwrap()
+                .unwrap();
+            repo.flush().await.unwrap();
+            id
         };
         let be = LocalBackend::open(dir.path());
         let repo = Repository::open(be, b"pw").await.unwrap();
@@ -604,6 +640,7 @@ mod tests {
             .unwrap();
         let data = vec![0u8; 100_000]; // highly compressible
         let id = repo.save_blob(BlobKind::Data, &data).await.unwrap();
+        repo.flush().await.unwrap();
 
         let mut stored = 0usize;
         for pid in repo.backend().list(FileType::Pack).await.unwrap() {

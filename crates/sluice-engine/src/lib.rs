@@ -86,6 +86,7 @@ pub async fn backup_excluding<B: StorageBackend>(
         &mut summary,
     )
     .await?;
+    repo.flush().await?;
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
         time_ns: now_ns(),

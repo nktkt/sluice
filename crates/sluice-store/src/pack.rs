@@ -77,6 +77,13 @@ impl PackBuilder {
         self.body.len()
     }
 
+    /// Sealed bytes of a blob recorded by [`PackBuilder::add`], read from the
+    /// in-progress body. Used to serve blobs not yet flushed to a pack.
+    #[must_use]
+    pub fn blob_at(&self, entry: &BlobEntry) -> &[u8] {
+        &self.body[entry.offset as usize..entry.offset as usize + entry.length as usize]
+    }
+
     /// Finish the pack, returning its bytes and the blob directory.
     pub fn finish(self) -> Result<(Vec<u8>, Vec<BlobEntry>), StoreError> {
         let directory =
