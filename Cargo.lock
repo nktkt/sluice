@@ -1839,6 +1839,7 @@ dependencies = [
  "filetime",
  "futures",
  "globset",
+ "rustix",
  "sluice-core",
  "sluice-crypto",
  "sluice-repo",

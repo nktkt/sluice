@@ -17,6 +17,9 @@ filetime = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 sluice-crypto = { path = "../sluice-crypto" }
 tokio = { workspace = true }

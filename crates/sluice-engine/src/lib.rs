@@ -1349,8 +1349,25 @@ fn backup_dir<'a, B: StorageBackend>(
                     subtree: None,
                     link_target: Some(target.into_os_string().into_encoded_bytes()),
                 }
+            } else if let Some(special) = special_kind(&kind) {
+                // FIFO / socket / device: record the node (no content) so the
+                // snapshot faithfully reflects the tree; restore recreates FIFOs.
+                stats.files_new += 1;
+                Node {
+                    name,
+                    kind: special,
+                    mode: mode_of(&meta),
+                    uid: 0,
+                    gid: 0,
+                    mtime_ns: mtime,
+                    ctime_ns: 0,
+                    size: 0,
+                    content: Vec::new(),
+                    subtree: None,
+                    link_target: None,
+                }
             } else {
-                continue; // special files (fifo, socket, device): follow-up work
+                continue; // unknown entry type
             };
             nodes.push(node);
         }
@@ -1395,7 +1412,13 @@ fn restore_tree<'a, B: StorageBackend>(
                         symlink(&osstring_from_bytes(target), &path)?;
                     }
                 }
-                _ => {} // files below; special files (fifo/socket/device) are skipped
+                EntryKind::Fifo => {
+                    make_fifo(&path, node.mode)?;
+                    apply_special_metadata(&path, node);
+                }
+                // Files are handled below; sockets and devices are recorded but
+                // not recreated (ephemeral / require privileges).
+                _ => {}
             }
         }
         // Files: reconstruct concurrently — each reads its chunks and writes a
@@ -1442,6 +1465,47 @@ fn symlink(_target: &std::ffi::OsStr, link: &Path) -> Result<()> {
     ))
 }
 
+/// The [`EntryKind`] of a FIFO, socket, or device file, or `None` for others.
+#[cfg(unix)]
+fn special_kind(kind: &std::fs::FileType) -> Option<EntryKind> {
+    use std::os::unix::fs::FileTypeExt;
+    if kind.is_fifo() {
+        Some(EntryKind::Fifo)
+    } else if kind.is_socket() {
+        Some(EntryKind::Socket)
+    } else if kind.is_char_device() {
+        Some(EntryKind::CharDevice)
+    } else if kind.is_block_device() {
+        Some(EntryKind::BlockDevice)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn special_kind(_kind: &std::fs::FileType) -> Option<EntryKind> {
+    None
+}
+
+/// Recreate a FIFO at `path` with the given mode bits.
+#[cfg(unix)]
+fn make_fifo(path: &Path, mode: u32) -> Result<()> {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    mknodat(
+        CWD,
+        path,
+        FileType::Fifo,
+        Mode::from_raw_mode((mode & 0o7777) as _),
+        0,
+    )
+    .map_err(|e| io_err(path, e.into()))
+}
+
+#[cfg(not(unix))]
+fn make_fifo(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
 /// Best-effort replay of a node's mode (Unix) and mtime onto `path`.
 fn apply_metadata(path: &Path, node: &Node) {
     #[cfg(unix)]
@@ -1455,6 +1519,34 @@ fn apply_metadata(path: &Path, node: &Node) {
     );
     let _ = filetime::set_file_mtime(path, mtime);
 }
+
+/// Replay mode + mtime onto a freshly created special file (FIFO).
+///
+/// Unlike [`apply_metadata`], this never opens the target: `filetime` would
+/// open the path to set times, and opening a FIFO blocks until a writer
+/// appears. We use `utimensat` (path-based, no open) and leave atime untouched
+/// via `UTIME_OMIT`. The explicit `chmod` also corrects for umask applied by
+/// `mknodat`.
+#[cfg(unix)]
+fn apply_special_metadata(path: &Path, node: &Node) {
+    use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, UTIME_OMIT, utimensat};
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.mode & 0o7777));
+    let times = Timestamps {
+        last_access: Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+        last_modification: Timespec {
+            tv_sec: node.mtime_ns.div_euclid(1_000_000_000) as _,
+            tv_nsec: node.mtime_ns.rem_euclid(1_000_000_000) as _,
+        },
+    };
+    let _ = utimensat(CWD, path, &times, AtFlags::empty());
+}
+
+#[cfg(not(unix))]
+fn apply_special_metadata(_path: &Path, _node: &Node) {}
 
 #[cfg(unix)]
 fn mode_of(meta: &std::fs::Metadata) -> u32 {
@@ -2147,6 +2239,29 @@ mod tests {
         // Both January 1970 snapshots are dropped (older year, non-newest month).
         assert_eq!(forgotten.len(), 2);
         assert!(forgotten.contains(&jan_a) && forgotten.contains(&jan_b));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_fifos() {
+        use std::os::unix::fs::FileTypeExt;
+        let src = tempfile::tempdir().unwrap();
+        make_fifo(&src.path().join("pipe"), 0o644).unwrap();
+        std::fs::write(src.path().join("normal"), b"data").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let meta = std::fs::symlink_metadata(out.path().join("pipe")).unwrap();
+        assert!(
+            meta.file_type().is_fifo(),
+            "restored entry should be a FIFO"
+        );
+        assert_eq!(std::fs::read(out.path().join("normal")).unwrap(), b"data");
     }
 
     #[cfg(unix)]
