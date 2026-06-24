@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, RetentionPolicy, backup_sources, check, copy_all, copy_snapshot, diff,
-    dump, find, forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
-    rebuild_index, restore_subpath, retag, verify,
+    DiffKind, EngineError, GroupBy, RetentionPolicy, backup_sources, check, copy_all,
+    copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
+    prune_excluding, rebuild_index, restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -133,6 +133,9 @@ enum Command {
         /// Always keep snapshots with this tag, regardless of count rules (repeatable).
         #[arg(long = "keep-tag", value_name = "TAG")]
         keep_tag: Vec<String>,
+        /// Apply the keep rules per group (host or paths) instead of globally.
+        #[arg(long = "group-by", value_enum)]
+        group_by: Option<GroupByArg>,
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -231,6 +234,15 @@ enum Command {
         #[command(subcommand)]
         object: CatObject,
     },
+}
+
+/// How `forget` partitions snapshots before applying retention.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum GroupByArg {
+    /// Group by source hostname.
+    Host,
+    /// Group by the set of source paths.
+    Paths,
 }
 
 /// Sub-commands of `cat`.
@@ -502,6 +514,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_monthly,
             keep_yearly,
             keep_tag,
+            group_by,
             tag,
             dry_run,
             prune: do_prune,
@@ -515,6 +528,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 monthly: keep_monthly.unwrap_or(0),
                 yearly: keep_yearly.unwrap_or(0),
                 keep_tags: keep_tag,
+            };
+            let group = match group_by {
+                None => GroupBy::None,
+                Some(GroupByArg::Host) => GroupBy::Host,
+                Some(GroupByArg::Paths) => GroupBy::Paths,
             };
             let verb = if dry_run { "would forget" } else { "forgot" };
             let forgotten: Vec<Id> = match (snapshot, tag, policy.is_empty()) {
@@ -536,7 +554,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     forgotten
                 }
                 (None, None, false) => {
-                    let forgotten = forget_with_policy(&repository, &policy, dry_run).await?;
+                    let forgotten =
+                        forget_with_policy(&repository, &policy, group, dry_run).await?;
                     if !json {
                         println!("{verb} {} snapshot(s)", forgotten.len());
                     }

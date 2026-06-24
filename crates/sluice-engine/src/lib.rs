@@ -627,6 +627,74 @@ impl RetentionPolicy {
     }
 }
 
+/// How to partition snapshots before applying a [`RetentionPolicy`]. Retention
+/// rules are applied independently within each group, and the kept sets are
+/// unioned — so e.g. `--keep-last 7 --group-by host` keeps the 7 newest
+/// snapshots *of each host* (see `DESIGN.md` §8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupBy {
+    /// One group of all snapshots (global retention).
+    #[default]
+    None,
+    /// Group snapshots by source hostname.
+    Host,
+    /// Group snapshots by their set of source paths.
+    Paths,
+}
+
+/// The grouping key for a snapshot under `group_by`.
+fn group_key(group_by: GroupBy, snap: &Snapshot) -> String {
+    match group_by {
+        GroupBy::None => String::new(),
+        GroupBy::Host => snap.hostname.clone(),
+        GroupBy::Paths => snap
+            .paths
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect::<Vec<_>>()
+            .join("\u{0}"),
+    }
+}
+
+/// Select the ids to keep from one group's snapshots (sorted newest-first),
+/// adding them to `keep`: the N most recent, the most recent per daily/weekly/
+/// monthly/yearly bucket, and any carrying a protected tag.
+fn select_kept(
+    snapshots: &[(Id, i64, Vec<String>)],
+    policy: &RetentionPolicy,
+    keep: &mut HashSet<Id>,
+) {
+    // `--keep-last N`: the N most recent snapshots outright.
+    for (id, _, _) in snapshots.iter().take(policy.last) {
+        keep.insert(*id);
+    }
+    // `--keep-daily`/`weekly`/`monthly`/`yearly`: most recent per bucket, last N.
+    let bucketed: [(usize, fn(i64) -> i64); 4] = [
+        (policy.daily, day_bucket),
+        (policy.weekly, week_bucket),
+        (policy.monthly, month_bucket),
+        (policy.yearly, year_bucket),
+    ];
+    for (budget, bucket_of) in bucketed {
+        let mut kept_buckets: Vec<i64> = Vec::new();
+        for (id, time, _) in snapshots {
+            let bucket = bucket_of(*time);
+            if kept_buckets.last() != Some(&bucket) && kept_buckets.len() < budget {
+                kept_buckets.push(bucket);
+                keep.insert(*id);
+            }
+        }
+    }
+    // `--keep-tag T`: any snapshot carrying a protected tag survives outright.
+    if !policy.keep_tags.is_empty() {
+        for (id, _, tags) in snapshots {
+            if tags.iter().any(|t| policy.keep_tags.contains(t)) {
+                keep.insert(*id);
+            }
+        }
+    }
+}
+
 /// Nanoseconds per UTC day; `Snapshot::time_ns` is ns since the Unix epoch.
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
@@ -678,48 +746,34 @@ fn year_bucket(time_ns: i64) -> i64 {
 pub async fn forget_with_policy<B: StorageBackend>(
     repo: &Repository<B>,
     policy: &RetentionPolicy,
+    group_by: GroupBy,
     dry_run: bool,
 ) -> Result<Vec<Id>> {
-    let mut snapshots = Vec::new();
+    // (id, time, tags, group key), sorted newest-first across the whole repo.
+    let mut snapshots: Vec<(Id, i64, Vec<String>, String)> = Vec::new();
     for id in repo.list_snapshots().await? {
         let snap = repo.load_snapshot(&id).await?;
-        snapshots.push((id, snap.time_ns, snap.tags));
+        let key = group_key(group_by, &snap);
+        snapshots.push((id, snap.time_ns, snap.tags, key));
     }
     snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
 
+    // Partition into groups (each preserving the global newest-first order) and
+    // apply the policy independently within each, unioning the kept sets.
+    let mut groups: HashMap<String, Vec<(Id, i64, Vec<String>)>> = HashMap::new();
+    for (id, time, tags, key) in &snapshots {
+        groups
+            .entry(key.clone())
+            .or_default()
+            .push((*id, *time, tags.clone()));
+    }
     let mut keep: HashSet<Id> = HashSet::new();
-    // `--keep-last N`: the N most recent snapshots outright.
-    for (id, _, _) in snapshots.iter().take(policy.last) {
-        keep.insert(*id);
-    }
-    // `--keep-daily`/`weekly`/`monthly`/`yearly`: most recent per bucket, last N.
-    let bucketed: [(usize, fn(i64) -> i64); 4] = [
-        (policy.daily, day_bucket),
-        (policy.weekly, week_bucket),
-        (policy.monthly, month_bucket),
-        (policy.yearly, year_bucket),
-    ];
-    for (budget, bucket_of) in bucketed {
-        let mut kept_buckets: Vec<i64> = Vec::new();
-        for (id, time, _) in &snapshots {
-            let bucket = bucket_of(*time);
-            if kept_buckets.last() != Some(&bucket) && kept_buckets.len() < budget {
-                kept_buckets.push(bucket);
-                keep.insert(*id);
-            }
-        }
-    }
-    // `--keep-tag T`: any snapshot carrying a protected tag survives outright.
-    if !policy.keep_tags.is_empty() {
-        for (id, _, tags) in &snapshots {
-            if tags.iter().any(|t| policy.keep_tags.contains(t)) {
-                keep.insert(*id);
-            }
-        }
+    for group in groups.values() {
+        select_kept(group, policy, &mut keep);
     }
 
     let mut forgotten = Vec::new();
-    for (id, _, _) in &snapshots {
+    for (id, _, _, _) in &snapshots {
         if !keep.contains(id) {
             if !dry_run {
                 forget(repo, id).await?;
@@ -742,6 +796,7 @@ pub async fn forget_keep_last<B: StorageBackend>(
             last: keep,
             ..Default::default()
         },
+        GroupBy::None,
         false,
     )
     .await
@@ -760,6 +815,7 @@ pub async fn forget_keep_daily<B: StorageBackend>(
             daily: keep,
             ..Default::default()
         },
+        GroupBy::None,
         false,
     )
     .await
@@ -1629,11 +1685,15 @@ mod tests {
             ..Default::default()
         };
         // Dry run previews the same removal without touching the repo.
-        let preview = forget_with_policy(&repo, &policy, true).await.unwrap();
+        let preview = forget_with_policy(&repo, &policy, GroupBy::None, true)
+            .await
+            .unwrap();
         assert_eq!(preview, vec![d9]);
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
 
-        let forgotten = forget_with_policy(&repo, &policy, false).await.unwrap();
+        let forgotten = forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
         assert_eq!(forgotten, vec![d9]);
 
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
@@ -1663,9 +1723,56 @@ mod tests {
             keep_tags: vec!["important".into()],
             ..Default::default()
         };
-        forget_with_policy(&repo, &policy, false).await.unwrap();
+        forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([newest, important]));
+    }
+
+    #[tokio::test]
+    async fn forget_with_policy_groups_by_host() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |host: &str, time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: host.to_string(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        // host h1 at times 10, 20; host h2 at 30, 40.
+        let _h1_old = repo.commit_snapshot(&at("h1", 10)).await.unwrap();
+        let h1_new = repo.commit_snapshot(&at("h1", 20)).await.unwrap();
+        let _h2_old = repo.commit_snapshot(&at("h2", 30)).await.unwrap();
+        let h2_new = repo.commit_snapshot(&at("h2", 40)).await.unwrap();
+
+        // keep-last 1 grouped by host keeps the newest of *each* host (not just the
+        // single globally-newest, which is what GroupBy::None would keep).
+        let policy = RetentionPolicy {
+            last: 1,
+            ..Default::default()
+        };
+        forget_with_policy(&repo, &policy, GroupBy::Host, false)
+            .await
+            .unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([h1_new, h2_new]));
     }
 
     #[test]
@@ -1719,7 +1826,9 @@ mod tests {
             yearly: 2,
             ..Default::default()
         };
-        let forgotten = forget_with_policy(&repo, &policy, false).await.unwrap();
+        let forgotten = forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([y1971, feb]));
         // Both January 1970 snapshots are dropped (older year, non-newest month).
