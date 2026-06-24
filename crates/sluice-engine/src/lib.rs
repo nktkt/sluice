@@ -266,6 +266,42 @@ pub async fn forget_keep_last<B: StorageBackend>(
     Ok(forgotten)
 }
 
+/// Apply a daily retention policy: for each of the `keep` most recent UTC days
+/// that hold any snapshot, keep only that day's most recent snapshot; forget all
+/// other snapshots (older snapshots within a kept day, and every snapshot on days
+/// beyond the budget). Returns the ids forgotten. Reclaim their data with
+/// [`prune`]. This mirrors restic's `--keep-daily` rule (see `DESIGN.md` §8).
+pub async fn forget_keep_daily<B: StorageBackend>(
+    repo: &Repository<B>,
+    keep: usize,
+) -> Result<Vec<Id>> {
+    /// Nanoseconds per UTC day; `time_ns` is nanoseconds since the Unix epoch.
+    const NS_PER_DAY: i64 = 86_400_000_000_000;
+    let mut snapshots = Vec::new();
+    for id in repo.list_snapshots().await? {
+        let time = repo.load_snapshot(&id).await?.time_ns;
+        snapshots.push((id, time));
+    }
+    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+
+    // Walking newest-first, the first snapshot seen for a day is that day's most
+    // recent. `kept_days` holds the days we have already kept a snapshot for; as
+    // days only decrease, the day we keep is always the last one pushed.
+    let mut kept_days: Vec<i64> = Vec::new();
+    let mut forgotten = Vec::new();
+    for (id, time) in snapshots {
+        let day = time.div_euclid(NS_PER_DAY);
+        let keep_this = kept_days.last() != Some(&day) && kept_days.len() < keep;
+        if keep_this {
+            kept_days.push(day);
+        } else {
+            forget(repo, &id).await?;
+            forgotten.push(id);
+        }
+    }
+    Ok(forgotten)
+}
+
 /// Forget every snapshot tagged `tag`, returning the ids forgotten. Reclaim
 /// their data afterwards with [`prune`].
 pub async fn forget_tagged<B: StorageBackend>(repo: &Repository<B>, tag: &str) -> Result<Vec<Id>> {
@@ -938,6 +974,57 @@ mod tests {
 
         // Keeping more than exist forgets nothing.
         assert!(forget_keep_last(&repo, 5).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_keep_daily_keeps_one_per_day_within_budget() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // An empty tree for the synthetic snapshots to reference.
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const DAY: i64 = 86_400_000_000_000;
+        // day 0: two snapshots; day 1: one; day 2: two.
+        let d0_old = repo.commit_snapshot(&at(10)).await.unwrap();
+        let d0_new = repo.commit_snapshot(&at(20)).await.unwrap();
+        let d1 = repo.commit_snapshot(&at(DAY + 10)).await.unwrap();
+        let d2_old = repo.commit_snapshot(&at(2 * DAY + 10)).await.unwrap();
+        let d2_new = repo.commit_snapshot(&at(2 * DAY + 20)).await.unwrap();
+
+        // keep-daily 2: keep days 2 and 1 (most recent two), one snapshot each.
+        let forgotten = forget_keep_daily(&repo, 2).await.unwrap();
+        assert_eq!(forgotten.len(), 3); // d2_old (same day) + both of evicted day 0
+
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&d2_new)); // day 2's most recent kept
+        assert!(remaining.contains(&d1)); // day 1 kept
+        assert!(!remaining.contains(&d2_old)); // older within a kept day -> gone
+        assert!(!remaining.contains(&d0_old));
+        assert!(!remaining.contains(&d0_new)); // whole day beyond budget -> gone
+
+        // Keeping more days than exist forgets nothing further.
+        assert!(forget_keep_daily(&repo, 9).await.unwrap().is_empty());
     }
 
     #[cfg(unix)]

@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, backup_excluding, diff, dump, forget, forget_keep_last, forget_tagged, list_files,
-    prune, restore_subpath, verify,
+    DiffKind, backup_excluding, diff, dump, forget, forget_keep_daily, forget_keep_last,
+    forget_tagged, list_files, prune, restore_subpath, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -81,6 +81,9 @@ enum Command {
         /// Instead, keep the N most recent snapshots and forget the rest.
         #[arg(long, value_name = "N")]
         keep_last: Option<usize>,
+        /// Instead, keep the most recent snapshot of each of the last N days.
+        #[arg(long, value_name = "N")]
+        keep_daily: Option<usize>,
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -219,26 +222,32 @@ async fn run() -> Result<(), Box<dyn Error>> {
             repo,
             snapshot,
             keep_last,
+            keep_daily,
             tag,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            match (snapshot, keep_last, tag) {
-                (Some(snapshot), None, None) => {
+            match (snapshot, keep_last, keep_daily, tag) {
+                (Some(snapshot), None, None, None) => {
                     let id = resolve_snapshot(&repository, &snapshot).await?;
                     forget(&repository, &id).await?;
                     println!("forgot {id}");
                 }
-                (None, Some(keep), None) => {
+                (None, Some(keep), None, None) => {
                     let forgotten = forget_keep_last(&repository, keep).await?;
                     println!("forgot {} snapshot(s)", forgotten.len());
                 }
-                (None, None, Some(tag)) => {
+                (None, None, Some(keep), None) => {
+                    let forgotten = forget_keep_daily(&repository, keep).await?;
+                    println!("forgot {} snapshot(s)", forgotten.len());
+                }
+                (None, None, None, Some(tag)) => {
                     let forgotten = forget_tagged(&repository, &tag).await?;
                     println!("forgot {} snapshot(s)", forgotten.len());
                 }
                 _ => {
                     return Err(
-                        "specify exactly one of <snapshot>, --keep-last N, or --tag T".into(),
+                        "specify exactly one of <snapshot>, --keep-last N, --keep-daily N, or --tag T"
+                            .into(),
                     );
                 }
             }
