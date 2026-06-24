@@ -1,0 +1,15 @@
+[package]
+name = "sluice-cli"
+description = "Command-line interface for sluice, the encrypted deduplicating backup tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "sluice"
+path = "src/main.rs"
+
+[dependencies]

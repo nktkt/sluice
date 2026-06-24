@@ -1,0 +1,11 @@
+[package]
+name = "sluice-repo"
+description = "Repository handle (init/open, save/load) for sluice."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

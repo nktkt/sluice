@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sluice-core",
+    "crates/sluice-crypto",
+    "crates/sluice-chunk",
+    "crates/sluice-index",
+    "crates/sluice-store",
+    "crates/sluice-scan",
+    "crates/sluice-engine",
+    "crates/sluice-repo",
+    "crates/sluice-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nktkt/sluice"
+authors = ["nktkt"]
+
+# Shared dependency versions (see DESIGN.md §10). These are enabled per-crate via
+# `dep.workspace = true` as each milestone lands; unused entries are inert and are
+# not fetched, so the skeleton builds with no network access.
+[workspace.dependencies]
+thiserror = "2"
+blake3 = "1"
+zstd = "0.13"                # bundled libzstd via the `cc` toolchain (no system lib)
+ciborium = "0.2"
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+redb = "2"
+ignore = "0.4"
+jwalk = "0.8"
+rustix = { version = "1", features = ["fs"] }
+dashmap = "6"
+smallvec = "1"
+roaring = "0.10"
+xorf = "0.11"
+fastbloom = "0.8"
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+argon2 = "0.5"
+secrecy = "0.10"
+zeroize = "1"
+subtle = "2.6"
+getrandom = "0.2"
+rand_core = "0.6"
+# rustls TLS so object storage needs no OpenSSL/system libraries.
+object_store = { version = "0.11", features = ["aws"] }
+bytes = "1"
+flume = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+rayon = "1"
+indicatif = "0.17"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"

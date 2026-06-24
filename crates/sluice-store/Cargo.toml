@@ -1,0 +1,11 @@
+[package]
+name = "sluice-store"
+description = "Storage backends (local, S3-compatible, WORM) and packer for sluice."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
