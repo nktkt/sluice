@@ -1076,6 +1076,18 @@ pub struct ListEntry {
     pub kind: EntryKind,
     /// Logical size in bytes (0 for directories).
     pub size: u64,
+    /// Unix mode bits.
+    pub mode: u32,
+    /// Owner user ID.
+    pub uid: u32,
+    /// Owner group ID.
+    pub gid: u32,
+    /// Modification time, nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+    /// Device number for `CharDevice`/`BlockDevice` entries; `0` otherwise.
+    pub rdev: u64,
+    /// Symlink target as raw bytes, for symlinks.
+    pub link_target: Option<Vec<u8>>,
 }
 
 /// List a snapshot's entries (path, kind, size) without restoring any data.
@@ -1149,6 +1161,12 @@ fn list_tree<'a, B: StorageBackend>(
                 path: path.clone(),
                 kind: node.kind,
                 size: node.size,
+                mode: node.mode,
+                uid: node.uid,
+                gid: node.gid,
+                mtime_ns: node.mtime_ns,
+                rdev: node.rdev,
+                link_target: node.link_target.clone(),
             });
             if let (EntryKind::Dir, Some(subtree)) = (node.kind, node.subtree) {
                 list_tree(repo, subtree, path, out).await?;

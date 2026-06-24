@@ -185,6 +185,9 @@ enum Command {
         snapshot: String,
         /// List only this path within the snapshot (a file or directory subtree).
         path: Option<String>,
+        /// Long format: mode, owner, size (or device numbers), mtime, and symlink targets.
+        #[arg(short, long)]
+        long: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -746,6 +749,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             repo,
             snapshot,
             path,
+            long,
             json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
@@ -761,10 +765,46 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 let arr: Vec<serde_json::Value> = entries
                     .iter()
                     .map(|e| {
-                        serde_json::json!({ "path": e.path, "kind": kind_str(e.kind), "size": e.size })
+                        serde_json::json!({
+                            "path": e.path,
+                            "kind": kind_str(e.kind),
+                            "size": e.size,
+                            "mode": e.mode,
+                            "uid": e.uid,
+                            "gid": e.gid,
+                            "mtime_ns": e.mtime_ns,
+                            "rdev": e.rdev,
+                            "link_target": e.link_target.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()),
+                        })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else if long {
+                for e in &entries {
+                    // Devices report major,minor where a file reports its size.
+                    let size_col = match e.kind {
+                        EntryKind::CharDevice | EntryKind::BlockDevice => {
+                            let (major, minor) = major_minor(e.rdev);
+                            format!("{major}, {minor}")
+                        }
+                        _ => e.size.to_string(),
+                    };
+                    let mut line = format!(
+                        "{} {:>6} {:>6} {:>12} {} {}",
+                        mode_string(e.kind, e.mode),
+                        e.uid,
+                        e.gid,
+                        size_col,
+                        format_utc(e.mtime_ns),
+                        e.path,
+                    );
+                    if e.kind == EntryKind::Symlink {
+                        if let Some(target) = &e.link_target {
+                            line.push_str(&format!(" -> {}", String::from_utf8_lossy(target)));
+                        }
+                    }
+                    println!("{line}");
+                }
             } else {
                 for entry in &entries {
                     let tag = match entry.kind {
@@ -1176,8 +1216,54 @@ fn kind_str(kind: EntryKind) -> &'static str {
         EntryKind::Dir => "dir",
         EntryKind::File => "file",
         EntryKind::Symlink => "symlink",
-        _ => "other",
+        EntryKind::Fifo => "fifo",
+        EntryKind::Socket => "socket",
+        EntryKind::CharDevice => "chardev",
+        EntryKind::BlockDevice => "blockdev",
     }
+}
+
+/// Render Unix mode bits as a 10-character `ls -l` string, e.g. `drwxr-xr-x`,
+/// including setuid/setgid (`s`/`S`) and sticky (`t`/`T`) overlays.
+fn mode_string(kind: EntryKind, mode: u32) -> String {
+    let type_char = match kind {
+        EntryKind::Dir => 'd',
+        EntryKind::Symlink => 'l',
+        EntryKind::Fifo => 'p',
+        EntryKind::Socket => 's',
+        EntryKind::CharDevice => 'c',
+        EntryKind::BlockDevice => 'b',
+        EntryKind::File => '-',
+    };
+    // One rwx triplet; `special` is the setuid/setgid/sticky bit, whose presence
+    // turns the execute slot into `s`/`t` (lowercase if also executable).
+    let triplet = |r: u32, w: u32, x: u32, special: u32, hi: char, lo: char| -> [char; 3] {
+        [
+            if mode & r != 0 { 'r' } else { '-' },
+            if mode & w != 0 { 'w' } else { '-' },
+            match (mode & x != 0, mode & special != 0) {
+                (true, true) => lo,
+                (false, true) => hi,
+                (true, false) => 'x',
+                (false, false) => '-',
+            },
+        ]
+    };
+    let o = triplet(0o400, 0o200, 0o100, 0o4000, 'S', 's');
+    let g = triplet(0o040, 0o020, 0o010, 0o2000, 'S', 's');
+    let p = triplet(0o004, 0o002, 0o001, 0o1000, 'T', 't');
+    format!(
+        "{type_char}{}{}{}{}{}{}{}{}{}",
+        o[0], o[1], o[2], g[0], g[1], g[2], p[0], p[1], p[2]
+    )
+}
+
+/// Split a `st_rdev` device number into `(major, minor)` using the C library's
+/// encoding (which `mknod` round-trips), matching what `ls` prints.
+fn major_minor(rdev: u64) -> (u64, u64) {
+    let major = ((rdev >> 32) & 0xffff_f000) | ((rdev >> 8) & 0x0000_0fff);
+    let minor = ((rdev >> 12) & 0xffff_ff00) | (rdev & 0x0000_00ff);
+    (major, minor)
 }
 
 fn format_utc(ns: i64) -> String {
@@ -1202,7 +1288,7 @@ fn format_utc(ns: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::format_utc;
+    use super::{EntryKind, format_utc, major_minor, mode_string};
 
     #[test]
     fn formats_epoch_in_utc() {
@@ -1211,5 +1297,31 @@ mod tests {
             format_utc(1_700_000_000 * 1_000_000_000),
             "2023-11-14 22:13:20 UTC"
         );
+    }
+
+    #[test]
+    fn renders_ls_style_mode_strings() {
+        assert_eq!(mode_string(EntryKind::File, 0o644), "-rw-r--r--");
+        assert_eq!(mode_string(EntryKind::Dir, 0o755), "drwxr-xr-x");
+        assert_eq!(mode_string(EntryKind::Symlink, 0o777), "lrwxrwxrwx");
+        assert_eq!(mode_string(EntryKind::Fifo, 0o644), "prw-r--r--");
+        assert_eq!(mode_string(EntryKind::CharDevice, 0o600), "crw-------");
+        assert_eq!(mode_string(EntryKind::BlockDevice, 0o660), "brw-rw----");
+        // setuid + setgid + sticky overlays (executable -> lowercase).
+        assert_eq!(mode_string(EntryKind::File, 0o4755), "-rwsr-xr-x");
+        assert_eq!(mode_string(EntryKind::File, 0o2755), "-rwxr-sr-x");
+        assert_eq!(mode_string(EntryKind::Dir, 0o1777), "drwxrwxrwt");
+        // setuid without execute -> uppercase S.
+        assert_eq!(mode_string(EntryKind::File, 0o4644), "-rwSr--r--");
+    }
+
+    #[test]
+    fn splits_device_numbers() {
+        // Small major/minor pack into the low 16 bits (major << 8 | minor).
+        assert_eq!(major_minor(0x105), (1, 5)); // /dev/zero, char 1:5
+        assert_eq!(major_minor(0x103), (1, 3)); // /dev/null, char 1:3
+        assert_eq!(major_minor(0x801), (8, 1)); // sda1, block 8:1
+        // A major beyond 12 bits uses the bits above 32, not the low word.
+        assert_eq!(major_minor(0x1000_0000_0000), (0x1000, 0));
     }
 }
