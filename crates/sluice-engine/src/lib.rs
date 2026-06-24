@@ -432,9 +432,23 @@ pub async fn prune<B: StorageBackend>(
     repo: &mut Repository<B>,
     dry_run: bool,
 ) -> Result<PruneReport> {
-    // MARK: collect every blob reachable from a surviving snapshot.
+    prune_excluding(repo, dry_run, &HashSet::new()).await
+}
+
+/// Like [`prune`], but treat the snapshots in `excluded` as already gone — their
+/// blobs are not marked live. This lets a dry run preview the reclamation of a
+/// pending `forget` (the snapshots it would remove) without removing them first.
+pub async fn prune_excluding<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    dry_run: bool,
+    excluded: &HashSet<Id>,
+) -> Result<PruneReport> {
+    // MARK: collect every blob reachable from a surviving (non-excluded) snapshot.
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
+        if excluded.contains(&snapshot) {
+            continue;
+        }
         let snap = repo.load_snapshot(&snapshot).await?;
         mark_tree(repo, snap.tree, &mut live).await?;
     }
@@ -1669,5 +1683,33 @@ mod tests {
             std::fs::read(dst.path().join("b")).unwrap(),
             vec![2u8; 3000]
         );
+    }
+
+    #[tokio::test]
+    async fn prune_excluding_previews_a_pending_forget() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("f");
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        std::fs::write(&f, vec![1u8; 4000]).unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+        std::fs::write(&f, vec![2u8; 4000]).unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        // Excluding snap1 (still present) previews reclaiming its now-dead data.
+        let excluded = HashSet::from([snap1]);
+        let report = prune_excluding(&mut repo, true, &excluded).await.unwrap();
+        assert!(
+            report.reclaimed_bytes > 0,
+            "should preview reclaimable bytes"
+        );
+        // Nothing was actually removed: both snapshots remain and verify.
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 2);
+        assert!(verify(&repo).await.is_ok());
+
+        // A plain prune (excluding nothing) finds nothing dead yet.
+        let none = prune(&mut repo, true).await.unwrap();
+        assert_eq!(none.reclaimed_bytes, 0);
     }
 }

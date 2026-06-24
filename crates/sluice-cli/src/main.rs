@@ -5,6 +5,7 @@
 //! interactive no-echo prompt when a terminal is attached. A repository is a
 //! local path or an object-store URL such as `s3://bucket/prefix`.
 
+use std::collections::HashSet;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +15,7 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, RetentionPolicy, backup_excluding, diff, dump, forget, forget_tagged,
-    forget_with_policy, list_files, prune, restore_subpath, verify,
+    forget_with_policy, list_files, prune, prune_excluding, restore_subpath, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -99,6 +100,9 @@ enum Command {
         /// Show which snapshots would be forgotten without removing them.
         #[arg(long)]
         dry_run: bool,
+        /// After forgetting, run prune to reclaim the freed storage.
+        #[arg(long)]
+        prune: bool,
     },
     /// Reclaim storage no longer referenced by any snapshot.
     Prune {
@@ -240,8 +244,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
             keep_yearly,
             tag,
             dry_run,
+            prune: do_prune,
         } => {
-            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let policy = RetentionPolicy {
                 last: keep_last.unwrap_or(0),
                 daily: keep_daily.unwrap_or(0),
@@ -250,21 +255,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 yearly: keep_yearly.unwrap_or(0),
             };
             let verb = if dry_run { "would forget" } else { "forgot" };
-            match (snapshot, tag, policy.is_empty()) {
+            let forgotten: Vec<Id> = match (snapshot, tag, policy.is_empty()) {
                 (Some(snapshot), None, true) => {
                     let id = resolve_snapshot(&repository, &snapshot).await?;
                     if !dry_run {
                         forget(&repository, &id).await?;
                     }
                     println!("{verb} {id}");
+                    vec![id]
                 }
                 (None, Some(tag), true) => {
                     let forgotten = forget_tagged(&repository, &tag, dry_run).await?;
                     println!("{verb} {} snapshot(s)", forgotten.len());
+                    forgotten
                 }
                 (None, None, false) => {
                     let forgotten = forget_with_policy(&repository, policy, dry_run).await?;
                     println!("{verb} {} snapshot(s)", forgotten.len());
+                    forgotten
                 }
                 _ => {
                     return Err(
@@ -273,6 +281,25 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             .into(),
                     );
                 }
+            };
+            if do_prune {
+                // Under --dry-run the snapshots are still present, so treat the
+                // would-be-forgotten ones as excluded to preview the reclamation.
+                let report = if dry_run {
+                    let excluded: HashSet<Id> = forgotten.into_iter().collect();
+                    prune_excluding(&mut repository, true, &excluded).await?
+                } else {
+                    prune(&mut repository, false).await?
+                };
+                let pverb = if dry_run {
+                    "would reclaim"
+                } else {
+                    "reclaimed"
+                };
+                println!(
+                    "{pverb} {} bytes ({} packs deleted, {} repacked)",
+                    report.reclaimed_bytes, report.deleted, report.repacked
+                );
             }
         }
         Command::Prune { repo, dry_run } => {
