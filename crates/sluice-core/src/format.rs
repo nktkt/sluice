@@ -66,6 +66,11 @@ pub struct Node {
     /// Captured without following symlinks; empty for entries with none.
     #[serde(default)]
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Represented device number for `CharDevice`/`BlockDevice` nodes (the
+    /// `st_rdev` major/minor); `0` for every other kind. Restore feeds it to
+    /// `mknod`. Appended last so older snapshots without it still decode.
+    #[serde(default)]
+    pub rdev: u64,
 }
 
 /// A point-in-time snapshot: the single commit object of a backup run
@@ -145,6 +150,7 @@ mod tests {
                     dev: 0,
                     ino: 0,
                     xattrs: vec![(b"user.tag".to_vec(), b"v".to_vec())],
+                    rdev: 0,
                 },
                 Node {
                     name: b"subdir".to_vec(),
@@ -161,6 +167,7 @@ mod tests {
                     dev: 0,
                     ino: 0,
                     xattrs: Vec::new(),
+                    rdev: 0,
                 },
             ],
         }
@@ -287,6 +294,7 @@ mod tests {
         assert_eq!(file.dev, 0);
         assert_eq!(file.ino, 0);
         assert!(file.xattrs.is_empty());
+        assert_eq!(file.rdev, 0);
 
         let link = &tree.nodes[1];
         assert_eq!(link.kind, EntryKind::Symlink);
@@ -357,6 +365,7 @@ mod tests {
                     dev,
                     ino,
                     xattrs: Vec::new(),
+                    rdev: 0,
                 },
             )
     }

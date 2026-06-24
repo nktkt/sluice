@@ -263,6 +263,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     dev: 0,
                     ino: 0,
                     xattrs: read_xattrs(&source),
+                    rdev: 0,
                 });
             }
         }
@@ -502,6 +503,11 @@ pub async fn restore_subpath<B: StorageBackend>(
         EntryKind::Fifo => {
             make_fifo(&dest, node.mode)?;
             apply_special_metadata(&dest, &node);
+        }
+        EntryKind::CharDevice | EntryKind::BlockDevice => {
+            if make_device(&dest, node.mode, node.kind, node.rdev).is_ok() {
+                apply_special_metadata(&dest, &node);
+            }
         }
         _ => {}
     }
@@ -1281,6 +1287,7 @@ async fn backup_file<B: StorageBackend>(
         dev,
         ino,
         xattrs: read_xattrs(path),
+        rdev: 0,
     })
 }
 
@@ -1350,6 +1357,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     dev: 0,
                     ino: 0,
                     xattrs: read_xattrs(&path),
+                    rdev: 0,
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
@@ -1371,10 +1379,12 @@ fn backup_dir<'a, B: StorageBackend>(
                     dev: 0,
                     ino: 0,
                     xattrs: read_xattrs(&path),
+                    rdev: 0,
                 }
             } else if let Some(special) = special_kind(&kind) {
                 // FIFO / socket / device: record the node (no content) so the
-                // snapshot faithfully reflects the tree; restore recreates FIFOs.
+                // snapshot faithfully reflects the tree; restore recreates FIFOs
+                // and devices (sockets are runtime-only and stay record-only).
                 stats.files_new += 1;
                 Node {
                     name,
@@ -1391,6 +1401,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     dev: 0,
                     ino: 0,
                     xattrs: read_xattrs(&path),
+                    rdev: rdev_of(&meta),
                 }
             } else {
                 continue; // unknown entry type
@@ -1445,8 +1456,16 @@ fn restore_tree<'a, B: StorageBackend>(
                     make_fifo(&path, node.mode)?;
                     apply_special_metadata(&path, node);
                 }
-                // Files are handled below; sockets and devices are recorded but
-                // not recreated (ephemeral / require privileges).
+                EntryKind::CharDevice | EntryKind::BlockDevice => {
+                    // Device nodes need CAP_MKNOD; skip (rather than fail the
+                    // restore) when unprivileged, replaying metadata only if the
+                    // node was actually created.
+                    if make_device(&path, node.mode, node.kind, node.rdev).is_ok() {
+                        apply_special_metadata(&path, node);
+                    }
+                }
+                // Files are handled below; sockets are runtime-only and are
+                // recorded but not recreated.
                 _ => {}
             }
         }
@@ -1571,6 +1590,34 @@ fn make_fifo(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
+/// Recreate a character or block device node at `path`. `rdev` is the device
+/// number in the same encoding `stat` reported it (rustix's `Dev` matches the C
+/// library's), so it round-trips for any major/minor. Returns `Err` if `mknod`
+/// fails — notably `EPERM` when unprivileged — so the caller can skip rather
+/// than abort the whole restore.
+#[cfg(unix)]
+fn make_device(path: &Path, mode: u32, kind: EntryKind, rdev: u64) -> Result<()> {
+    use rustix::fs::{CWD, FileType, Mode, mknodat};
+    let file_type = match kind {
+        EntryKind::CharDevice => FileType::CharacterDevice,
+        EntryKind::BlockDevice => FileType::BlockDevice,
+        _ => return Ok(()),
+    };
+    mknodat(
+        CWD,
+        path,
+        file_type,
+        Mode::from_raw_mode((mode & 0o7777) as _),
+        rdev,
+    )
+    .map_err(|e| io_err(path, e.into()))
+}
+
+#[cfg(not(unix))]
+fn make_device(_path: &Path, _mode: u32, _kind: EntryKind, _rdev: u64) -> Result<()> {
+    Ok(())
+}
+
 /// Best-effort replay of a node's owner (Unix), mode (Unix), and mtime onto `path`.
 fn apply_metadata(path: &Path, node: &Node) {
     #[cfg(unix)]
@@ -1668,6 +1715,19 @@ fn hardlink_ids(meta: &std::fs::Metadata) -> (u64, u64) {
 #[cfg(not(unix))]
 fn hardlink_ids(_meta: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
+}
+
+/// The represented device number (`st_rdev`) of `meta`; non-zero only for
+/// device files, so it doubles as the value to store on any special node.
+#[cfg(unix)]
+fn rdev_of(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.rdev()
+}
+
+#[cfg(not(unix))]
+fn rdev_of(_meta: &std::fs::Metadata) -> u64 {
+    0
 }
 
 /// The effective owner of the running process, recorded on the snapshot object.
@@ -2010,6 +2070,7 @@ mod tests {
             dev: 0,
             ino: 0,
             xattrs: Vec::new(),
+            rdev: 0,
         };
         let tree = repo
             .save_tree(&Tree {
@@ -2476,6 +2537,46 @@ mod tests {
             "restored entry should be a FIFO"
         );
         assert_eq!(std::fs::read(out.path().join("normal")).unwrap(), b"data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_devices() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        // Creating and recreating a device node needs CAP_MKNOD.
+        if rustix::process::geteuid().as_raw() != 0 {
+            return;
+        }
+        let src = tempfile::tempdir().unwrap();
+        let dev = src.path().join("zero");
+        let rdev = rustix::fs::makedev(1, 5); // char 1:5 is /dev/zero
+        make_device(&dev, 0o644, EntryKind::CharDevice, rdev).unwrap();
+        let sm = std::fs::symlink_metadata(&dev).unwrap();
+        assert!(sm.file_type().is_char_device(), "test setup");
+        assert_eq!(sm.rdev(), rdev);
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+
+        // The node records the device kind and number.
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        let tree = repo.load_tree(&snap_obj.tree).await.unwrap();
+        let node = tree.nodes.iter().find(|n| n.name == b"zero").unwrap();
+        assert_eq!(node.kind, EntryKind::CharDevice);
+        assert_eq!(node.rdev, rdev);
+
+        // Restore recreates the device with the same major/minor.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let rm = std::fs::symlink_metadata(out.path().join("zero")).unwrap();
+        assert!(
+            rm.file_type().is_char_device(),
+            "restored entry should be a char device"
+        );
+        assert_eq!(rm.rdev(), rdev);
     }
 
     #[cfg(unix)]
@@ -3400,6 +3501,7 @@ mod tests {
             dev: 0,
             ino: 0,
             xattrs: Vec::new(),
+            rdev: 0,
         };
         let tree = repo
             .save_tree(&Tree {
