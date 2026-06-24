@@ -15,8 +15,8 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, EngineError, RetentionPolicy, backup_dry_run, backup_excluding, check, diff, dump,
-    forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
-    restore_subpath, retag, verify,
+    find, forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
+    rebuild_index, restore_subpath, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -140,6 +140,13 @@ enum Command {
         repo: String,
         /// Snapshot id (a unique hex prefix is accepted).
         snapshot: String,
+    },
+    /// Find entries matching a glob across all snapshots.
+    Find {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Glob matched against full paths (use ** to cross directories).
+        pattern: String,
     },
     /// Show the changes between two snapshots.
     Diff {
@@ -456,6 +463,22 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     _ => "-",
                 };
                 println!("{tag} {:>12} {}", entry.size, entry.path);
+            }
+        }
+        Command::Find { repo, pattern } => {
+            let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            for m in find(&repository, &pattern).await? {
+                let tag = match m.kind {
+                    EntryKind::Dir => "d",
+                    EntryKind::Symlink => "l",
+                    _ => "-",
+                };
+                println!(
+                    "{}  {tag} {:>12} {}",
+                    &m.snapshot.to_string()[..16],
+                    m.size,
+                    m.path
+                );
             }
         }
         Command::Diff { repo, from, to } => {

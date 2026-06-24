@@ -663,6 +663,46 @@ pub async fn list_files<B: StorageBackend>(
     Ok(out)
 }
 
+/// One hit from [`find`]: the snapshot a matching entry lives in, and the entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindMatch {
+    /// The snapshot containing the match.
+    pub snapshot: Id,
+    /// Path of the matching entry, relative to the backup root.
+    pub path: String,
+    /// The kind of entry.
+    pub kind: EntryKind,
+    /// Logical size in bytes (0 for directories).
+    pub size: u64,
+}
+
+/// Find every entry whose path matches the glob `pattern` across all snapshots.
+/// The pattern is matched against the full relative path, so `**` is needed to
+/// cross directories (e.g. `**/*.log`). Results are grouped by snapshot in the
+/// repository's snapshot order.
+pub async fn find<B: StorageBackend>(
+    repo: &Repository<B>,
+    pattern: &str,
+) -> Result<Vec<FindMatch>> {
+    let matcher = Glob::new(pattern)
+        .map_err(|e| EngineError::Pattern(e.to_string()))?
+        .compile_matcher();
+    let mut matches = Vec::new();
+    for snapshot in repo.list_snapshots().await? {
+        for entry in list_files(repo, &snapshot).await? {
+            if matcher.is_match(&entry.path) {
+                matches.push(FindMatch {
+                    snapshot,
+                    path: entry.path,
+                    kind: entry.kind,
+                    size: entry.size,
+                });
+            }
+        }
+    }
+    Ok(matches)
+}
+
 /// Recursively append the entries of tree `tree_id` (under `prefix`) to `out`.
 fn list_tree<'a, B: StorageBackend>(
     repo: &'a Repository<B>,
@@ -1950,6 +1990,37 @@ mod tests {
         assert_eq!(again.files_unmodified, 2);
         // The dry run added no second snapshot.
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_locates_paths_across_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"a").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup(&mut repo, src.path()).await.unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/needle.log"), b"x").unwrap();
+        let snap2 = backup(&mut repo, src.path()).await.unwrap();
+
+        // An exact nested path: only the second snapshot has it.
+        let hits = find(&repo, "sub/needle.log").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snapshot, snap2);
+        assert_eq!(hits[0].path, "sub/needle.log");
+
+        // A.txt is present in both snapshots.
+        let both = find(&repo, "a.txt").await.unwrap();
+        let snaps: HashSet<Id> = both.iter().map(|m| m.snapshot).collect();
+        assert_eq!(snaps, HashSet::from([snap1, snap2]));
+
+        // A glob that matches nothing anywhere.
+        assert!(find(&repo, "*.nope").await.unwrap().is_empty());
+        // A `**` glob crosses directories.
+        let logs = find(&repo, "**/*.log").await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].path, "sub/needle.log");
     }
 
     #[tokio::test]
