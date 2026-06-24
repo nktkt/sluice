@@ -2,36 +2,47 @@
 
 > Encrypted, deduplicating, incremental backup & disaster-recovery tool, written in Rust.
 
-**Status: early, but working.** `sluice` already creates encrypted repositories
-and performs deduplicated, compressed, **incremental** backups and restores of
-local directories, with integrity verification — backed by 83 tests across the
-workspace. The full architecture is specified in [`DESIGN.md`](./DESIGN.md).
-**The on-disk format is not yet frozen; do not use it for data you cannot afford
-to lose.**
+**Status: alpha.** `sluice` creates encrypted repositories and performs
+deduplicated, compressed, **incremental** backups and restores — of files,
+directories, and symlinks, with mode and mtime preserved — to a local path **or
+any S3-compatible object store**, with integrity verification, snapshot diffs,
+retention, and pruning. Backed by 98 tests across the workspace. The full
+architecture is in [`DESIGN.md`](./DESIGN.md). **The on-disk format is not yet
+frozen; do not use it for data you cannot afford to lose.**
 
 `sluice` backs up a large number of *your own* files to an **untrusted** storage
-backend — a local disk, a NAS, or (planned) any S3-compatible object store — as a
-repository of immutable, content-addressed, encrypted objects. The backend only
-ever sees ciphertext. It is in the same family as
+backend — a local disk, a NAS, or any S3-compatible object store (S3, GCS,
+Azure, MinIO, ...) — as a repository of immutable, content-addressed, encrypted
+objects. The backend only ever sees ciphertext. It is in the same family as
 [restic](https://restic.net), [BorgBackup](https://www.borgbackup.org),
 [Kopia](https://kopia.io), and [Duplicacy](https://duplicacy.com).
 
 ## Usage
 
-The passphrase is read from the `SLUICE_PASSWORD` environment variable.
+The passphrase comes from the `SLUICE_PASSWORD` environment variable, or an
+interactive no-echo prompt. A repository is a local path or an object-store URL.
 
 ```sh
 export SLUICE_PASSWORD='correct horse battery staple'
 
-sluice init      ./repo                   # create an encrypted repository
-sluice backup    ./repo ~/documents       # snapshot a directory (prints a snapshot id)
-sluice snapshots ./repo                    # list snapshot ids
-sluice verify    ./repo                    # read & authenticate every stored object
-sluice restore   ./repo <snapshot> ./out   # restore (a unique id prefix is accepted)
+# Local repository
+sluice init      ./repo
+sluice backup    ./repo ~/documents --exclude '*.log' --exclude node_modules
+sluice snapshots ./repo                    # <id>  <time>  <N files>  <paths>
+sluice ls        ./repo <snapshot>         # list a snapshot's entries
+sluice diff      ./repo <snap-a> <snap-b>  # +/-/M changes between snapshots
+sluice verify    ./repo                    # read & authenticate every object
+sluice restore   ./repo <snapshot> ./out   # a unique id prefix is accepted
+sluice forget    ./repo --keep-last 7      # retention (or: forget ./repo <snapshot>)
+sluice prune     ./repo                    # reclaim unreferenced storage
+
+# Offsite: any object-store URL (s3://, gs://, az://, file://, ...)
+sluice init   s3://my-bucket/backups
+sluice backup s3://my-bucket/backups ~/documents
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
-stored chunks without being re-read. The Argon2id work factor can be tuned with
+stored chunks without being re-read. The Argon2id work factor is tunable with
 `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 
 ## Goals
@@ -41,13 +52,13 @@ stored chunks without being re-read. The Argon2id work factor can be tuned with
 - **Incremental** — after the first run, only new or changed data is read and stored.
 - **Deduplication** — content-defined chunking (FastCDC) stores identical data once.
 - **Compression** — per-chunk `zstd` (skipped for incompressible data).
-- **Encryption at rest** — you hold the keys; XChaCha20-Poly1305 by default.
-- **Snapshots, restore & verify** — point-in-time snapshots, full restore, and
-  read-data integrity verification.
-- **Pluggable backends** — local filesystem today; S3-compatible object storage
-  for offsite disaster recovery is planned.
-- **Crash-consistent** — an interrupted backup never corrupts the repository
-  (append-only; the snapshot is written last as the single commit point).
+- **Encryption at rest** — you hold the keys; XChaCha20-Poly1305 and Argon2id.
+- **Snapshots, restore, verify, diff** — point-in-time snapshots, full restore,
+  read-data integrity verification, and snapshot diffs.
+- **Retention** — keep-last-N `forget` plus mark-and-sweep `prune`.
+- **Pluggable backends** — local filesystem and S3-compatible object storage.
+- **Crash-consistent** — append-only; the snapshot is written last as the single
+  commit point.
 
 ## Security model
 
@@ -78,9 +89,9 @@ concurrency model, CLI surface, and threat model — lives in
 | `sluice-crypto` | Key hierarchy, AEAD, KDFs (Argon2id), hashing, compression, RNG |
 | `sluice-chunk`  | FastCDC content-defined chunking + chunk IDs |
 | `sluice-index`  | Dedup index *(in-progress; today the index is rebuilt from pack footers)* |
-| `sluice-store`  | `StorageBackend` trait, local + in-memory backends, pack codec |
+| `sluice-store`  | `StorageBackend` trait; in-memory, local, and object-store backends; pack codec |
 | `sluice-scan`   | Filesystem walk *(in-progress; the engine currently walks directly)* |
-| `sluice-engine` | Backup / restore / verify orchestration |
+| `sluice-engine` | Backup / restore / verify / diff / forget / prune orchestration |
 | `sluice-repo`   | Repository handle: init/open, blobs, files, trees, snapshots |
 | `sluice-cli`    | The `sluice` command-line binary |
 
@@ -92,25 +103,27 @@ concurrency model, CLI surface, and threat model — lives in
   index is a follow-up; the index is currently rebuilt from pack footers on open)*
 - **M3** — encryption: Argon2id key hierarchy, XChaCha20-Poly1305, keyed BLAKE3 — ✅
   *(anti-rollback head and key-derived chunk gear still pending)*
-- **verify** (read-data integrity) and **incremental** backups — ✅
-- **M4** — object storage / offsite DR (S3, WORM, cold tier) — planned
-- **M5** — prune / GC + retention policy — planned (`verify` done)
-- **M6** — performance, cross-platform, FUSE mount, metadata replay — planned
+- **M4** — object storage / offsite DR (S3, GCS, Azure, MinIO) — ✅
+- **M5** — verify, retention (`forget --keep-last`), and `prune` — ✅
+  *(richer retention policies still to come)*
+- extras shipped: incremental backups, symlinks, mode/mtime, exclude globs,
+  `ls`, `diff`
+- **M6** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
 
 ## Building
 
 Requires a recent stable Rust toolchain and a C compiler (used to build the
-bundled `zstd`). TLS for future object-storage backends uses `rustls`, so no
-OpenSSL or other system libraries are required.
+bundled `zstd`). TLS for object-storage backends uses `rustls`, so no OpenSSL or
+other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 83 tests
+cargo test     # 98 tests
 ```
 
 ## Caveats
 
-This is **pre-alpha software under active development**. The on-disk format will
+This is **alpha software under active development**. The on-disk format will
 change without migration until v0.1. **Do not use it for data you cannot afford
 to lose.**
 
