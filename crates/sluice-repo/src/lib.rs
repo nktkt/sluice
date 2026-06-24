@@ -35,6 +35,9 @@ pub enum RepoError {
     /// A storage backend error.
     #[error("storage error: {0}")]
     Store(#[from] StoreError),
+    /// An I/O error reading a source stream (e.g. during streaming backup).
+    #[error("io error: {0}")]
+    Io(String),
     /// A key wrapping/unwrapping error (e.g. a wrong passphrase).
     #[error("key error: {0}")]
     Key(#[from] KeyError),
@@ -405,6 +408,73 @@ impl<B: StorageBackend> Repository<B> {
             );
         }
         Ok(ids)
+    }
+
+    /// Stream `reader` through the chunker, storing each content-defined chunk as
+    /// a `Data` blob, and return the ordered chunk ids plus the total byte count.
+    ///
+    /// Peak memory is bounded by the chunker's maximum chunk size (plus a read
+    /// window), not the file size, so arbitrarily large files back up without
+    /// being loaded whole. Because the chunker only inspects the first `max`
+    /// bytes when finding a boundary, buffering `max` bytes before each cut
+    /// yields exactly the same chunks — and therefore the same ids — as
+    /// [`save_file`] on the equivalent buffer.
+    pub async fn save_file_reader<R: std::io::Read>(
+        &mut self,
+        mut reader: R,
+    ) -> Result<(Vec<Id>, u64)> {
+        use std::io::ErrorKind;
+        const READ_WINDOW: usize = 1 << 20; // 1 MiB
+
+        let chunker = self.chunker();
+        let max = chunker.max();
+        let mut ids = Vec::new();
+        let mut total: u64 = 0;
+        let mut buf: Vec<u8> = Vec::with_capacity(max + READ_WINDOW);
+        let mut eof = false;
+
+        loop {
+            // Fill the buffer to at least `max` bytes (so a cut sees a full
+            // window) or until the reader is exhausted.
+            while !eof && buf.len() < max {
+                let start = buf.len();
+                buf.resize(start + READ_WINDOW, 0);
+                match reader.read(&mut buf[start..]) {
+                    Ok(0) => {
+                        buf.truncate(start);
+                        eof = true;
+                    }
+                    Ok(n) => buf.truncate(start + n),
+                    Err(e) if e.kind() == ErrorKind::Interrupted => buf.truncate(start),
+                    Err(e) => return Err(RepoError::Io(e.to_string())),
+                }
+            }
+
+            if buf.is_empty() {
+                break;
+            }
+
+            if eof {
+                // Final window: emit every remaining chunk, including the short
+                // trailing one.
+                let mut off = 0;
+                while off < buf.len() {
+                    let n = chunker.cut(&buf[off..]);
+                    ids.push(self.save_blob(BlobKind::Data, &buf[off..off + n]).await?);
+                    total += n as u64;
+                    off += n;
+                }
+                break;
+            }
+
+            // `buf.len() >= max`: `cut` returns a real boundary in `[min, max]`.
+            let n = chunker.cut(&buf);
+            ids.push(self.save_blob(BlobKind::Data, &buf[..n]).await?);
+            total += n as u64;
+            buf.drain(..n);
+        }
+
+        Ok((ids, total))
     }
 
     /// Reassemble a file from its ordered chunk ids.
@@ -897,6 +967,43 @@ mod tests {
         let content = repo.save_file(&data).await.unwrap();
         assert!(content.len() >= 2, "expected multiple chunks");
         assert_eq!(repo.load_file(&content).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn save_file_reader_matches_save_file() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // Spans several chunks with a short tail, exercising the streaming refill
+        // and the final flush.
+        let data = pseudo_random(5 * 1024 * 1024 + 12_345);
+        let whole = repo.save_file(&data).await.unwrap();
+        let (streamed, total) = repo
+            .save_file_reader(std::io::Cursor::new(&data))
+            .await
+            .unwrap();
+        // Identical boundaries => identical ids => streamed backups dedup against
+        // whole-buffer ones.
+        assert_eq!(streamed, whole, "streaming must chunk identically");
+        assert_eq!(total, data.len() as u64);
+        assert!(streamed.len() >= 2, "expected multiple chunks");
+        assert_eq!(repo.load_file(&streamed).await.unwrap(), data);
+
+        // Edge cases: a sub-min file and an empty stream.
+        let small = b"tiny".to_vec();
+        assert_eq!(
+            repo.save_file_reader(std::io::Cursor::new(&small))
+                .await
+                .unwrap()
+                .0,
+            repo.save_file(&small).await.unwrap()
+        );
+        let (empty_ids, empty_total) = repo
+            .save_file_reader(std::io::Cursor::new(Vec::new()))
+            .await
+            .unwrap();
+        assert!(empty_ids.is_empty());
+        assert_eq!(empty_total, 0);
     }
 
     #[tokio::test]

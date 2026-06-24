@@ -1300,9 +1300,10 @@ async fn backup_file<B: StorageBackend>(
         if dry_run {
             (Vec::new(), meta.len())
         } else {
-            let data = std::fs::read(path).map_err(|e| io_err(path, e))?;
-            let len = data.len() as u64;
-            (repo.save_file(&data).await?, len)
+            // Stream the file through the chunker so peak memory is bounded by the
+            // chunk size, not the file size — large files don't load whole.
+            let file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+            repo.save_file_reader(file).await?
         }
     };
     stats.bytes_processed += size;

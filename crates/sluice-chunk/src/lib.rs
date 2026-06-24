@@ -117,6 +117,14 @@ impl Chunker {
         }
     }
 
+    /// The maximum chunk size: a boundary is forced once a chunk reaches it.
+    /// Streaming callers buffer at least this many bytes before cutting, so the
+    /// boundaries match whole-buffer chunking exactly.
+    #[must_use]
+    pub fn max(&self) -> usize {
+        self.params.max
+    }
+
     /// Length of the first content-defined chunk of `data`.
     ///
     /// The returned length is in `[min, max]` unless `data` is shorter than
