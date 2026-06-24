@@ -11,7 +11,7 @@
 use std::fmt;
 
 use argon2::{Algorithm, Argon2, Params, Version};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{Key, derive_key, open, seal};
 
@@ -132,10 +132,15 @@ pub fn unwrap_master(
     salt: &[u8],
     params: KdfParams,
     wrapped: &[u8],
-) -> Result<Key, KeyError> {
+) -> Result<Zeroizing<Key>, KeyError> {
     let kek = derive_kek(passphrase, salt, params)?;
-    let master = open(&kek, WRAP_AAD, wrapped).map_err(|_| KeyError::WrongPassphrase)?;
-    master.try_into().map_err(|_| KeyError::Corrupt)
+    let mut plaintext = open(&kek, WRAP_AAD, wrapped).map_err(|_| KeyError::WrongPassphrase)?;
+    let parsed = <[u8; 32]>::try_from(plaintext.as_slice());
+    plaintext.zeroize();
+    let mut raw = parsed.map_err(|_| KeyError::Corrupt)?;
+    let master = Zeroizing::new(raw);
+    raw.zeroize();
+    Ok(master)
 }
 
 #[cfg(test)]
@@ -167,7 +172,7 @@ mod tests {
         let salt = [1u8; 16];
         let wrapped = wrap_master(b"correct horse", &salt, fast(), &master).unwrap();
         assert_eq!(
-            unwrap_master(b"correct horse", &salt, fast(), &wrapped).unwrap(),
+            *unwrap_master(b"correct horse", &salt, fast(), &wrapped).unwrap(),
             master
         );
     }
@@ -177,10 +182,10 @@ mod tests {
         let master: Key = [3u8; 32];
         let salt = [1u8; 16];
         let wrapped = wrap_master(b"correct horse", &salt, fast(), &master).unwrap();
-        assert_eq!(
+        assert!(matches!(
             unwrap_master(b"wrong horse", &salt, fast(), &wrapped),
             Err(KeyError::WrongPassphrase)
-        );
+        ));
     }
 
     #[test]
@@ -190,7 +195,7 @@ mod tests {
         let (salt1, salt2) = ([1u8; 16], [2u8; 16]);
         let w1 = wrap_master(b"old", &salt1, fast(), &master).unwrap();
         let w2 = wrap_master(b"new", &salt2, fast(), &master).unwrap();
-        assert_eq!(unwrap_master(b"old", &salt1, fast(), &w1).unwrap(), master);
-        assert_eq!(unwrap_master(b"new", &salt2, fast(), &w2).unwrap(), master);
+        assert_eq!(*unwrap_master(b"old", &salt1, fast(), &w1).unwrap(), master);
+        assert_eq!(*unwrap_master(b"new", &salt2, fast(), &w2).unwrap(), master);
     }
 }
