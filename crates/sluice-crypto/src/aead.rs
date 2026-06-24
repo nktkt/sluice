@@ -75,6 +75,7 @@ pub fn open(key: &Key, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>, AeadError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     const KEY: Key = [7u8; 32];
 
@@ -133,5 +134,29 @@ mod tests {
         let k = crate::derive_key("sluice.test data-key", b"master");
         let sealed = seal(&k, b"", b"payload");
         assert_eq!(open(&k, b"", &sealed).unwrap(), b"payload");
+    }
+
+    proptest! {
+        #[test]
+        fn seal_open_roundtrips_over_arbitrary_data(
+            plaintext in proptest::collection::vec(any::<u8>(), 0..2000),
+            aad in proptest::collection::vec(any::<u8>(), 0..64),
+        ) {
+            let key: Key = [0x11u8; 32];
+            let sealed = seal(&key, &aad, &plaintext);
+            prop_assert_eq!(open(&key, &aad, &sealed).unwrap(), plaintext);
+        }
+
+        #[test]
+        fn any_byte_flip_breaks_authentication(
+            plaintext in proptest::collection::vec(any::<u8>(), 1..500),
+            flip in 0usize..2000,
+        ) {
+            let key: Key = [0x22u8; 32];
+            let mut sealed = seal(&key, b"aad", &plaintext);
+            let idx = flip % sealed.len();
+            sealed[idx] ^= 0x80;
+            prop_assert!(open(&key, b"aad", &sealed).is_err());
+        }
     }
 }
