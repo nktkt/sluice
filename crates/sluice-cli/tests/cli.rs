@@ -222,6 +222,71 @@ fn snapshots_and_stats_emit_json() {
 }
 
 #[test]
+fn diff_emits_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+
+    std::fs::write(src.join("a"), b"1").unwrap();
+    std::fs::write(src.join("b"), b"2").unwrap();
+    let s1 = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    std::fs::write(src.join("a"), b"11111").unwrap(); // size change -> modified
+    std::fs::remove_file(src.join("b")).unwrap(); // removed
+    std::fs::write(src.join("c"), b"3").unwrap(); // added
+    let s2 = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let out = sluice()
+        .arg("diff")
+        .arg(&repo)
+        .arg(&s1[..12])
+        .arg(&s2[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap())
+            .expect("valid JSON");
+    let changes: std::collections::HashMap<&str, &str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["path"].as_str().unwrap(), e["change"].as_str().unwrap()))
+        .collect();
+    assert_eq!(changes.get("a"), Some(&"modified"));
+    assert_eq!(changes.get("b"), Some(&"removed"));
+    assert_eq!(changes.get("c"), Some(&"added"));
+}
+
+#[test]
 fn cat_emits_config_snapshot_and_tree_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -185,6 +185,9 @@ enum Command {
         from: String,
         /// The newer snapshot id (a unique hex prefix is accepted).
         to: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Write a single file from a snapshot to stdout.
     Dump {
@@ -675,17 +678,38 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Diff { repo, from, to } => {
+        Command::Diff {
+            repo,
+            from,
+            to,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let a = resolve_snapshot(&repository, &from).await?;
             let b = resolve_snapshot(&repository, &to).await?;
-            for change in diff(&repository, &a, &b).await? {
-                let sign = match change.change {
-                    DiffKind::Added => '+',
-                    DiffKind::Removed => '-',
-                    DiffKind::Modified => 'M',
-                };
-                println!("{sign} {}", change.path);
+            let changes = diff(&repository, &a, &b).await?;
+            if json {
+                let arr: Vec<serde_json::Value> = changes
+                    .iter()
+                    .map(|c| {
+                        let kind = match c.change {
+                            DiffKind::Added => "added",
+                            DiffKind::Removed => "removed",
+                            DiffKind::Modified => "modified",
+                        };
+                        serde_json::json!({ "change": kind, "path": c.path })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                for change in &changes {
+                    let sign = match change.change {
+                        DiffKind::Added => '+',
+                        DiffKind::Removed => '-',
+                        DiffKind::Modified => 'M',
+                    };
+                    println!("{sign} {}", change.path);
+                }
             }
         }
         Command::Dump {
