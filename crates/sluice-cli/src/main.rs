@@ -14,9 +14,10 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy, backup_sources,
-    check, copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
-    list_files, prune, prune_excluding, rebuild_index, restore_with, retag, verify,
+    DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy,
+    backup_sources_with_progress, check, copy_all, copy_snapshot, diff, dump, find, forget,
+    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    restore_with, retag, verify,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -57,6 +58,9 @@ enum Command {
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Print each new (+) and changed (M) file as it is backed up.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Restore a snapshot into a target directory.
     Restore {
@@ -386,6 +390,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude_from,
             tags,
             dry_run,
+            verbose,
         } => {
             // Append patterns read from each --exclude-from file.
             for file in &exclude_from {
@@ -399,8 +404,23 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 }
             }
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let outcome =
-                backup_sources(&mut repository, &sources, &excludes, &tags, dry_run).await?;
+            // With --verbose, print each new/changed file as it is processed.
+            let report = |path: &std::path::Path, status: FileStatus| match status {
+                FileStatus::New => eprintln!("+ {}", path.display()),
+                FileStatus::Changed => eprintln!("M {}", path.display()),
+                FileStatus::Unmodified => {}
+            };
+            let progress: Option<sluice_engine::ProgressFn> =
+                if verbose { Some(&report) } else { None };
+            let outcome = backup_sources_with_progress(
+                &mut repository,
+                &sources,
+                &excludes,
+                &tags,
+                dry_run,
+                progress,
+            )
+            .await?;
             let s = outcome.summary;
             match outcome.snapshot {
                 Some(id) => {

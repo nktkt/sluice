@@ -100,6 +100,23 @@ pub struct BackupOutcome {
     pub summary: SnapshotStats,
 }
 
+/// How a regular file compared to the parent snapshot, reported via a
+/// [`ProgressFn`] as it is backed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    /// Not present in the parent snapshot.
+    New,
+    /// Present but with changed size or mtime, so its content was re-read.
+    Changed,
+    /// Unchanged since the parent; its stored chunks were reused without reading.
+    Unmodified,
+}
+
+/// A callback invoked once per regular file as it is processed, with the file's
+/// source path — used for `--verbose`/progress output. See
+/// [`backup_sources_with_progress`].
+pub type ProgressFn<'a> = &'a dyn Fn(&Path, FileStatus);
+
 /// Back up one or more `sources` into a single snapshot, skipping entries whose
 /// name matches one of `exclude_globs`. A single source becomes the snapshot
 /// root directly (backward-compatible); multiple sources are placed under a
@@ -112,6 +129,19 @@ pub async fn backup_sources<B: StorageBackend>(
     exclude_globs: &[String],
     tags: &[String],
     dry_run: bool,
+) -> Result<BackupOutcome> {
+    backup_sources_with_progress(repo, sources, exclude_globs, tags, dry_run, None).await
+}
+
+/// Like [`backup_sources`], but `progress` (if any) is invoked once per regular
+/// file as it is processed, for `--verbose`/progress output.
+pub async fn backup_sources_with_progress<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    sources: &[PathBuf],
+    exclude_globs: &[String],
+    tags: &[String],
+    dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     if sources.is_empty() {
         return Err(EngineError::NotADirectory("(no source given)".to_string()));
@@ -128,7 +158,7 @@ pub async fn backup_sources<B: StorageBackend>(
     } else {
         Some(repo.acquire_lock(false).await?)
     };
-    let result = backup_sources_inner(repo, sources, exclude_globs, tags, dry_run).await;
+    let result = backup_sources_inner(repo, sources, exclude_globs, tags, dry_run, progress).await;
     if let Some(lock) = lock {
         let _ = repo.release_lock(&lock).await;
     }
@@ -142,6 +172,7 @@ async fn backup_sources_inner<B: StorageBackend>(
     exclude_globs: &[String],
     tags: &[String],
     dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     let excludes = build_globset(exclude_globs)?;
     let parent = latest_snapshot(repo).await?;
@@ -172,6 +203,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                 parent_node.as_ref(),
                 &mut summary,
                 dry_run,
+                progress,
             )
             .await?;
             let tree = Tree {
@@ -193,6 +225,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                 &excludes,
                 &mut summary,
                 dry_run,
+                progress,
             )
             .await?
         }
@@ -234,6 +267,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                         parent_node,
                         &mut summary,
                         dry_run,
+                        progress,
                     )
                     .await?,
                 );
@@ -248,6 +282,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     &excludes,
                     &mut summary,
                     dry_run,
+                    progress,
                 )
                 .await?;
                 summary.dirs += 1;
@@ -1474,12 +1509,23 @@ async fn backup_file<B: StorageBackend>(
     parent: Option<&Node>,
     stats: &mut SnapshotStats,
     dry_run: bool,
+    progress: Option<ProgressFn<'_>>,
 ) -> Result<Node> {
     let mtime = mtime_ns(meta);
     let reuse = parent.and_then(|prev| {
         (prev.kind == EntryKind::File && prev.size == meta.len() && prev.mtime_ns == mtime)
             .then(|| prev.content.clone())
     });
+    let status = if reuse.is_some() {
+        FileStatus::Unmodified
+    } else if parent.is_some() {
+        FileStatus::Changed
+    } else {
+        FileStatus::New
+    };
+    if let Some(report) = progress {
+        report(path, status);
+    }
     let (content, size) = if let Some(content) = reuse {
         stats.files_unmodified += 1;
         (content, meta.len())
@@ -1532,6 +1578,7 @@ fn backup_dir<'a, B: StorageBackend>(
     excludes: &'a GlobSet,
     stats: &'a mut SnapshotStats,
     dry_run: bool,
+    progress: Option<ProgressFn<'a>>,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
         // Load the parent directory's entries for incremental reuse.
@@ -1570,8 +1617,16 @@ fn backup_dir<'a, B: StorageBackend>(
                 let parent_sub = parent_nodes
                     .get(&name)
                     .and_then(|n| (n.kind == EntryKind::Dir).then_some(n.subtree).flatten());
-                let subtree =
-                    backup_dir(repo, path.clone(), parent_sub, excludes, stats, dry_run).await?;
+                let subtree = backup_dir(
+                    repo,
+                    path.clone(),
+                    parent_sub,
+                    excludes,
+                    stats,
+                    dry_run,
+                    progress,
+                )
+                .await?;
                 stats.dirs += 1;
                 Node {
                     name,
@@ -1593,7 +1648,17 @@ fn backup_dir<'a, B: StorageBackend>(
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
-                backup_file(repo, &path, name, &meta, parent_node, stats, dry_run).await?
+                backup_file(
+                    repo,
+                    &path,
+                    name,
+                    &meta,
+                    parent_node,
+                    stats,
+                    dry_run,
+                    progress,
+                )
+                .await?
             } else if kind.is_symlink() {
                 let target = std::fs::read_link(&path).map_err(|e| io_err(&path, e))?;
                 Node {
@@ -2544,6 +2609,53 @@ mod tests {
         assert_eq!(s.summary.files_unmodified, 1);
         assert_eq!(s.summary.files_new, 0);
         assert!(s.parent.is_some());
+    }
+
+    #[tokio::test]
+    async fn backup_reports_per_file_progress() {
+        use std::sync::Mutex;
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha").unwrap();
+        std::fs::write(src.path().join("b"), b"bravo").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let collect = |events: &Mutex<Vec<(String, FileStatus)>>, p: &Path, s: FileStatus| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            events.lock().unwrap().push((name, s));
+        };
+
+        // First backup: both files are new.
+        let first = Mutex::new(Vec::new());
+        let report = |p: &Path, s: FileStatus| collect(&first, p, s);
+        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, Some(&report))
+            .await
+            .unwrap();
+        let mut got = first.into_inner().unwrap();
+        got.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            got,
+            vec![("a".into(), FileStatus::New), ("b".into(), FileStatus::New),]
+        );
+
+        // Change one file: it reports Changed; the other reports Unmodified.
+        std::fs::write(src.path().join("a"), b"alpha is now longer").unwrap();
+        let second = Mutex::new(Vec::new());
+        let report2 = |p: &Path, s: FileStatus| collect(&second, p, s);
+        backup_sources_with_progress(&mut repo, &sources, &[], &[], false, Some(&report2))
+            .await
+            .unwrap();
+        let mut got = second.into_inner().unwrap();
+        got.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), FileStatus::Changed),
+                ("b".into(), FileStatus::Unmodified),
+            ]
+        );
     }
 
     #[tokio::test]

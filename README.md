@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 182 tests across
+machine-readable JSON output, and stable exit codes. Backed by 183 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -43,6 +43,7 @@ sluice backup ./repo ~/documents --exclude-from .sluiceignore   # exclude globs 
 sluice backup ./repo ~/.config/app.toml          # a single file is also a valid source
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
+sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
@@ -271,7 +272,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 182 tests
+cargo test     # 183 tests
 ```
 
 ## Caveats
