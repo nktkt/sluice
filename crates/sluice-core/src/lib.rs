@@ -5,12 +5,14 @@
 //! the engine and CLI separable (see `DESIGN.md` §4).
 #![forbid(unsafe_code)]
 
+mod config;
 mod error;
 mod format;
 mod id;
 
+pub use config::{CONFIG_VERSION, ChunkerConfig, CipherSuite, REPO_MAGIC, RepoConfig};
 pub use error::{Error, Result};
-pub use format::{Node, TREE_VERSION, Tree};
+pub use format::{Node, SNAPSHOT_VERSION, Snapshot, SnapshotStats, TREE_VERSION, Tree};
 pub use id::{Id, IdParseError};
 
 use serde::Serialize;

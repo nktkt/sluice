@@ -9,6 +9,9 @@ use crate::{EntryKind, Id};
 /// Current on-disk version of a [`Tree`] object.
 pub const TREE_VERSION: u8 = 1;
 
+/// Current on-disk version of a [`Snapshot`] object.
+pub const SNAPSHOT_VERSION: u8 = 1;
+
 /// A directory tree object: a name-sorted list of entries (see `DESIGN.md` §3).
 ///
 /// An unchanged directory serializes to identical bytes and therefore the same
@@ -52,6 +55,53 @@ pub struct Node {
     pub link_target: Option<Vec<u8>>,
 }
 
+/// A point-in-time snapshot: the single commit object of a backup run
+/// (see `DESIGN.md` §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snapshot {
+    /// Format version; see [`SNAPSHOT_VERSION`].
+    pub version: u8,
+    /// Creation time, nanoseconds since the Unix epoch (UTC).
+    pub time_ns: i64,
+    /// Root tree object ID.
+    pub tree: Id,
+    /// The backup source paths, as raw bytes.
+    pub paths: Vec<Vec<u8>>,
+    /// Host the snapshot was taken on.
+    pub hostname: String,
+    /// User that took the snapshot.
+    pub username: String,
+    /// Owner user ID.
+    pub uid: u32,
+    /// Owner group ID.
+    pub gid: u32,
+    /// Free-form tags.
+    pub tags: Vec<String>,
+    /// Parent snapshot ID, if this run was incremental.
+    pub parent: Option<Id>,
+    /// The sluice version that wrote this snapshot.
+    pub program_version: String,
+    /// Summary counters for the run.
+    pub summary: SnapshotStats,
+}
+
+/// Summary counters describing a backup run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SnapshotStats {
+    /// Files seen for the first time.
+    pub files_new: u64,
+    /// Files whose content changed since the parent snapshot.
+    pub files_changed: u64,
+    /// Files unchanged since the parent snapshot.
+    pub files_unmodified: u64,
+    /// Directories processed.
+    pub dirs: u64,
+    /// Total logical bytes processed.
+    pub bytes_processed: u64,
+    /// Bytes actually stored after deduplication and compression.
+    pub bytes_added: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,6 +141,27 @@ mod tests {
         }
     }
 
+    fn sample_snapshot() -> Snapshot {
+        Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns: 1_700_000_000_000_000_000,
+            tree: Id::from_bytes([1u8; 32]),
+            paths: vec![b"/home/user/docs".to_vec()],
+            hostname: "host".into(),
+            username: "user".into(),
+            uid: 1000,
+            gid: 1000,
+            tags: vec!["daily".into()],
+            parent: Some(Id::from_bytes([2u8; 32])),
+            program_version: "0.0.0".into(),
+            summary: SnapshotStats {
+                files_new: 3,
+                bytes_processed: 4096,
+                ..Default::default()
+            },
+        }
+    }
+
     #[test]
     fn tree_cbor_roundtrips() {
         let tree = sample_tree();
@@ -106,5 +177,13 @@ mod tests {
             to_cbor(&sample_tree()).unwrap(),
             to_cbor(&sample_tree()).unwrap()
         );
+    }
+
+    #[test]
+    fn snapshot_cbor_roundtrips() {
+        let snap = sample_snapshot();
+        let bytes = to_cbor(&snap).unwrap();
+        let back: Snapshot = from_cbor(&bytes).unwrap();
+        assert_eq!(snap, back);
     }
 }
