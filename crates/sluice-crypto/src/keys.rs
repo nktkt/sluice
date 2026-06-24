@@ -11,6 +11,7 @@
 use std::fmt;
 
 use argon2::{Algorithm, Argon2, Params, Version};
+use zeroize::Zeroizing;
 
 use crate::{Key, derive_key, open, seal};
 
@@ -88,17 +89,22 @@ pub enum KeyError {
     Corrupt,
 }
 
-/// Derive a 32-byte key-encryption key from a passphrase and salt.
-fn derive_kek(passphrase: &[u8], salt: &[u8], params: KdfParams) -> Result<Key, KeyError> {
+/// Derive a 32-byte key-encryption key from a passphrase and salt. The returned
+/// value zeroizes its memory when dropped.
+fn derive_kek(
+    passphrase: &[u8],
+    salt: &[u8],
+    params: KdfParams,
+) -> Result<Zeroizing<Key>, KeyError> {
     let argon = Argon2::new(
         Algorithm::Argon2id,
         Version::V0x13,
         Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(32))
             .map_err(|e| KeyError::Kdf(e.to_string()))?,
     );
-    let mut kek: Key = [0u8; 32];
+    let mut kek = Zeroizing::new([0u8; 32]);
     argon
-        .hash_password_into(passphrase, salt, &mut kek)
+        .hash_password_into(passphrase, salt, &mut *kek)
         .map_err(|e| KeyError::Kdf(e.to_string()))?;
     Ok(kek)
 }
