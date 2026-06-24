@@ -1019,6 +1019,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
                                 "content": n.content.iter().map(|i| i.to_string()).collect::<Vec<_>>(),
                                 "subtree": n.subtree.map(|i| i.to_string()),
                                 "link_target": n.link_target.as_ref().map(|b| String::from_utf8_lossy(b).into_owned()),
+                                "dev": n.dev,
+                                "ino": n.ino,
+                                "rdev": n.rdev,
+                                "sparse": n.sparse,
+                                "xattrs": n.xattrs.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).collect::<Vec<_>>(),
                             })
                         })
                         .collect();

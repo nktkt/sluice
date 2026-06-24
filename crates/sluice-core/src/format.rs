@@ -71,6 +71,12 @@ pub struct Node {
     /// `mknod`. Appended last so older snapshots without it still decode.
     #[serde(default)]
     pub rdev: u64,
+    /// Whether the source file had holes (fewer allocated blocks than its
+    /// logical size). When set, restore recreates the holes instead of writing
+    /// the zero regions, so a sparse file stays sparse. Appended last so older
+    /// snapshots without it still decode.
+    #[serde(default)]
+    pub sparse: bool,
 }
 
 /// A point-in-time snapshot: the single commit object of a backup run
@@ -151,6 +157,7 @@ mod tests {
                     ino: 0,
                     xattrs: vec![(b"user.tag".to_vec(), b"v".to_vec())],
                     rdev: 0,
+                    sparse: false,
                 },
                 Node {
                     name: b"subdir".to_vec(),
@@ -168,6 +175,7 @@ mod tests {
                     ino: 0,
                     xattrs: Vec::new(),
                     rdev: 0,
+                    sparse: false,
                 },
             ],
         }
@@ -295,6 +303,7 @@ mod tests {
         assert_eq!(file.ino, 0);
         assert!(file.xattrs.is_empty());
         assert_eq!(file.rdev, 0);
+        assert!(!file.sparse);
 
         let link = &tree.nodes[1];
         assert_eq!(link.kind, EntryKind::Symlink);
@@ -366,6 +375,7 @@ mod tests {
                     ino,
                     xattrs: Vec::new(),
                     rdev: 0,
+                    sparse: false,
                 },
             )
     }

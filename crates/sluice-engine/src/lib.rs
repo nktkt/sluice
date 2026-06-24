@@ -264,6 +264,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     ino: 0,
                     xattrs: read_xattrs(&source),
                     rdev: 0,
+                    sparse: false,
                 });
             }
         }
@@ -490,7 +491,7 @@ pub async fn restore_subpath<B: StorageBackend>(
         }
         EntryKind::File => {
             let data = repo.load_file(&node.content).await?;
-            std::fs::write(&dest, &data).map_err(|e| io_err(&dest, e))?;
+            write_file_content(&dest, &data, node.sparse)?;
             apply_metadata(&dest, &node);
         }
         EntryKind::Symlink => {
@@ -1288,6 +1289,7 @@ async fn backup_file<B: StorageBackend>(
         ino,
         xattrs: read_xattrs(path),
         rdev: 0,
+        sparse: is_sparse(meta),
     })
 }
 
@@ -1358,6 +1360,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     ino: 0,
                     xattrs: read_xattrs(&path),
                     rdev: 0,
+                    sparse: false,
                 }
             } else if kind.is_file() {
                 let parent_node = parent_nodes.get(&name);
@@ -1380,6 +1383,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     ino: 0,
                     xattrs: read_xattrs(&path),
                     rdev: 0,
+                    sparse: false,
                 }
             } else if let Some(special) = special_kind(&kind) {
                 // FIFO / socket / device: record the node (no content) so the
@@ -1402,6 +1406,7 @@ fn backup_dir<'a, B: StorageBackend>(
                     ino: 0,
                     xattrs: read_xattrs(&path),
                     rdev: rdev_of(&meta),
+                    sparse: false,
                 }
             } else {
                 continue; // unknown entry type
@@ -1481,7 +1486,7 @@ fn restore_tree<'a, B: StorageBackend>(
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
                         let data = repo.load_file(&node.content).await?;
-                        std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                        write_file_content(&path, &data, node.sparse)?;
                         apply_metadata(&path, node);
                         Ok::<(), EngineError>(())
                     }
@@ -1517,7 +1522,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 }
                 None => {
                     let data = repo.load_file(&node.content).await?;
-                    std::fs::write(&path, &data).map_err(|e| io_err(&path, e))?;
+                    write_file_content(&path, &data, node.sparse)?;
                     apply_metadata(&path, node);
                 }
             }
@@ -1531,6 +1536,33 @@ fn osstring_from_bytes(bytes: &[u8]) -> OsString {
     // SAFETY: `bytes` were produced by `OsStr::as_encoded_bytes` during backup,
     // which is exactly the precondition of `from_encoded_bytes_unchecked`.
     unsafe { OsString::from_encoded_bytes_unchecked(bytes.to_vec()) }
+}
+
+/// Write a restored file's contents, recreating holes when `sparse` is set: each
+/// all-zero block is skipped rather than written, so the filesystem leaves it
+/// unallocated. The restored bytes are identical either way (holes read back as
+/// zeros); only the on-disk allocation differs.
+fn write_file_content(path: &Path, data: &[u8], sparse: bool) -> Result<()> {
+    if !sparse {
+        return std::fs::write(path, data).map_err(|e| io_err(path, e));
+    }
+    use std::io::{Seek, SeekFrom, Write};
+    // A hole granularity at the common filesystem block size.
+    const BLOCK: usize = 4096;
+    let mut file = std::fs::File::create(path).map_err(|e| io_err(path, e))?;
+    let mut offset: u64 = 0;
+    for block in data.chunks(BLOCK) {
+        if block.iter().any(|&b| b != 0) {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| io_err(path, e))?;
+            file.write_all(block).map_err(|e| io_err(path, e))?;
+        }
+        offset += block.len() as u64;
+    }
+    // Extend to the full length so a trailing hole is reflected in the size.
+    file.set_len(data.len() as u64)
+        .map_err(|e| io_err(path, e))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1728,6 +1760,20 @@ fn rdev_of(meta: &std::fs::Metadata) -> u64 {
 #[cfg(not(unix))]
 fn rdev_of(_meta: &std::fs::Metadata) -> u64 {
     0
+}
+
+/// Whether `meta` describes a file with holes — fewer allocated 512-byte blocks
+/// than its logical size. The standard sparse heuristic; recorded so restore can
+/// recreate the holes.
+#[cfg(unix)]
+fn is_sparse(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512) < meta.size()
+}
+
+#[cfg(not(unix))]
+fn is_sparse(_meta: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// The effective owner of the running process, recorded on the snapshot object.
@@ -2071,6 +2117,7 @@ mod tests {
             ino: 0,
             xattrs: Vec::new(),
             rdev: 0,
+            sparse: false,
         };
         let tree = repo
             .save_tree(&Tree {
@@ -2577,6 +2624,53 @@ mod tests {
             "restored entry should be a char device"
         );
         assert_eq!(rm.rdev(), rdev);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn backup_restore_preserves_sparse_files() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::MetadataExt;
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("sparse.img");
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"head").unwrap();
+            f.seek(SeekFrom::Start(1 << 20)).unwrap(); // a 1 MiB hole
+            f.write_all(b"tail").unwrap();
+        }
+        let sm = std::fs::metadata(&path).unwrap();
+        // Skip if the filesystem didn't actually punch a hole.
+        if sm.blocks().saturating_mul(512) >= sm.size() {
+            return;
+        }
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let snap_obj = repo.load_snapshot(&snap).await.unwrap();
+        let tree = repo.load_tree(&snap_obj.tree).await.unwrap();
+        let node = tree.nodes.iter().find(|n| n.name == b"sparse.img").unwrap();
+        assert!(node.sparse, "node should be flagged sparse");
+
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        let restored = out.path().join("sparse.img");
+        // Byte-for-byte identical contents...
+        assert_eq!(
+            std::fs::read(&restored).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+        // ...and still sparse on disk (the 1 MiB hole was not allocated).
+        let rm = std::fs::metadata(&restored).unwrap();
+        assert!(
+            rm.blocks().saturating_mul(512) < rm.size(),
+            "restored file should remain sparse (blocks={}, size={})",
+            rm.blocks(),
+            rm.size()
+        );
     }
 
     #[cfg(unix)]
@@ -3502,6 +3596,7 @@ mod tests {
             ino: 0,
             xattrs: Vec::new(),
             rdev: 0,
+            sparse: false,
         };
         let tree = repo
             .save_tree(&Tree {
