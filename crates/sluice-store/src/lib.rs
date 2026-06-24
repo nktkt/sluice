@@ -11,7 +11,7 @@
 //! [`PackBuilder`]/[`PackReader`] pair implements the pack-file container.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -106,6 +106,31 @@ pub trait StorageBackend: Send + Sync {
 
     /// Remove an object (used only by prune).
     async fn remove(&self, ty: FileType, id: &Id) -> Result<()>;
+}
+
+/// Lets an `Arc<dyn StorageBackend>` (or any `Arc<B>`) be used as a backend, so
+/// the engine can hold a runtime-selected backend.
+#[async_trait]
+impl<B: StorageBackend + ?Sized> StorageBackend for Arc<B> {
+    async fn get(&self, ty: FileType, id: &Id) -> Result<Bytes> {
+        (**self).get(ty, id).await
+    }
+
+    async fn put(&self, ty: FileType, id: &Id, data: Bytes) -> Result<()> {
+        (**self).put(ty, id, data).await
+    }
+
+    async fn exists(&self, ty: FileType, id: &Id) -> Result<bool> {
+        (**self).exists(ty, id).await
+    }
+
+    async fn list(&self, ty: FileType) -> Result<Vec<Id>> {
+        (**self).list(ty).await
+    }
+
+    async fn remove(&self, ty: FileType, id: &Id) -> Result<()> {
+        (**self).remove(ty, id).await
+    }
 }
 
 /// An in-memory [`StorageBackend`] for tests and the in-memory test lane.
@@ -253,5 +278,15 @@ mod tests {
             .await
             .unwrap();
         assert!(be.exists(FileType::Config, &id(0)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn arc_dyn_backend_delegates() {
+        let be: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        be.put(FileType::Pack, &id(7), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(be.exists(FileType::Pack, &id(7)).await.unwrap());
+        assert_eq!(be.list(FileType::Pack).await.unwrap(), vec![id(7)]);
     }
 }

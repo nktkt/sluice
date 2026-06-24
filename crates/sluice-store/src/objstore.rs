@@ -3,6 +3,8 @@
 //!
 //! The concrete store (e.g. an `AmazonS3` built with object_store's `aws`
 //! feature) is supplied as a trait object, so this backend is store-agnostic.
+//! An optional prefix places all objects under a sub-path, matching the path
+//! component of an `s3://bucket/prefix` URL.
 
 use std::sync::Arc;
 
@@ -20,17 +22,34 @@ use crate::{FileType, Result, StorageBackend, StoreError, type_dir};
 #[derive(Clone)]
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
+    prefix: ObjectPath,
 }
 
 impl ObjectStoreBackend {
-    /// Wrap an object store.
+    /// Wrap an object store, placing objects at its root.
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            prefix: ObjectPath::default(),
+        }
     }
 
+    /// Wrap an object store, placing all objects under `prefix`.
+    #[must_use]
+    pub fn with_prefix(store: Arc<dyn ObjectStore>, prefix: ObjectPath) -> Self {
+        Self { store, prefix }
+    }
+
+    /// Full object path for one stored object. `ObjectPath::from` normalizes
+    /// away the empty leading segment when the prefix is empty.
     fn object_path(&self, ty: FileType, id: &Id) -> ObjectPath {
-        ObjectPath::from(format!("{}/{}", type_dir(ty), id.to_hex()))
+        ObjectPath::from(format!("{}/{}/{}", self.prefix, type_dir(ty), id.to_hex()))
+    }
+
+    /// Listing prefix for a file type.
+    fn type_prefix(&self, ty: FileType) -> ObjectPath {
+        ObjectPath::from(format!("{}/{}", self.prefix, type_dir(ty)))
     }
 }
 
@@ -75,7 +94,7 @@ impl StorageBackend for ObjectStoreBackend {
     }
 
     async fn list(&self, ty: FileType) -> Result<Vec<Id>> {
-        let prefix = ObjectPath::from(type_dir(ty));
+        let prefix = self.type_prefix(ty);
         let mut stream = self.store.list(Some(&prefix));
         let mut ids = Vec::new();
         while let Some(meta) = stream.next().await {
@@ -158,5 +177,20 @@ mod tests {
 
         be.remove(FileType::Pack, &id(1)).await.unwrap();
         assert!(!be.exists(FileType::Pack, &id(1)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prefixes_isolate_objects_in_a_shared_store() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let a = ObjectStoreBackend::with_prefix(store.clone(), ObjectPath::from("repo-a"));
+        let b = ObjectStoreBackend::with_prefix(store, ObjectPath::from("repo-b"));
+
+        a.put(FileType::Pack, &id(1), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(a.exists(FileType::Pack, &id(1)).await.unwrap());
+        // Same store, different prefix: invisible to `b`.
+        assert!(!b.exists(FileType::Pack, &id(1)).await.unwrap());
+        assert!(b.list(FileType::Pack).await.unwrap().is_empty());
     }
 }
