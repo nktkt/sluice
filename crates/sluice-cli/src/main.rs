@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    backup_excluding, forget, forget_keep_last, list_files, prune, restore, verify,
+    DiffKind, backup_excluding, diff, forget, forget_keep_last, list_files, prune, restore, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{LocalBackend, StorageBackend};
@@ -81,6 +81,15 @@ enum Command {
         repo: PathBuf,
         /// Snapshot id (a unique hex prefix is accepted).
         snapshot: String,
+    },
+    /// Show the changes between two snapshots.
+    Diff {
+        /// Path of the repository.
+        repo: PathBuf,
+        /// The older snapshot id (a unique hex prefix is accepted).
+        from: String,
+        /// The newer snapshot id (a unique hex prefix is accepted).
+        to: String,
     },
 }
 
@@ -183,6 +192,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     _ => "-",
                 };
                 println!("{tag} {:>12} {}", entry.size, entry.path);
+            }
+        }
+        Command::Diff { repo, from, to } => {
+            let repository = Repository::open(LocalBackend::open(&repo), pw).await?;
+            let a = resolve_snapshot(&repository, &from).await?;
+            let b = resolve_snapshot(&repository, &to).await?;
+            for change in diff(&repository, &a, &b).await? {
+                let sign = match change.change {
+                    DiffKind::Added => '+',
+                    DiffKind::Removed => '-',
+                    DiffKind::Modified => 'M',
+                };
+                println!("{sign} {}", change.path);
             }
         }
     }

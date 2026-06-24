@@ -332,6 +332,71 @@ fn list_tree<'a, B: StorageBackend>(
     })
 }
 
+/// How a path changed between two snapshots; see [`diff`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffKind {
+    /// Present only in the newer snapshot.
+    Added,
+    /// Present only in the older snapshot.
+    Removed,
+    /// Present in both, but with a different kind or size.
+    Modified,
+}
+
+/// A single change reported by [`diff`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffEntry {
+    /// Path relative to the backup root.
+    pub path: String,
+    /// The kind of change.
+    pub change: DiffKind,
+}
+
+/// Compare two snapshots by path, reporting added, removed, and modified entries
+/// (modification is detected by a change in kind or size). Unchanged entries are
+/// omitted; the result is sorted by path.
+pub async fn diff<B: StorageBackend>(
+    repo: &Repository<B>,
+    from: &Id,
+    to: &Id,
+) -> Result<Vec<DiffEntry>> {
+    let old: HashMap<String, (EntryKind, u64)> = list_files(repo, from)
+        .await?
+        .into_iter()
+        .map(|e| (e.path, (e.kind, e.size)))
+        .collect();
+    let new: HashMap<String, (EntryKind, u64)> = list_files(repo, to)
+        .await?
+        .into_iter()
+        .map(|e| (e.path, (e.kind, e.size)))
+        .collect();
+
+    let mut changes = Vec::new();
+    for (path, meta) in &new {
+        match old.get(path) {
+            None => changes.push(DiffEntry {
+                path: path.clone(),
+                change: DiffKind::Added,
+            }),
+            Some(prev) if prev != meta => changes.push(DiffEntry {
+                path: path.clone(),
+                change: DiffKind::Modified,
+            }),
+            _ => {}
+        }
+    }
+    for path in old.keys() {
+        if !new.contains_key(path) {
+            changes.push(DiffEntry {
+                path: path.clone(),
+                change: DiffKind::Removed,
+            });
+        }
+    }
+    changes.sort_by(|x, y| x.path.cmp(&y.path));
+    Ok(changes)
+}
+
 /// Recursively back up `dir`, returning the id of its `Tree` object. `parent`
 /// is the id of the same directory's tree in the previous snapshot, if any, and
 /// `stats` accumulates new/changed/unmodified counters.
@@ -865,5 +930,35 @@ mod tests {
         assert!(paths.contains(&"keep.txt".to_string()));
         assert!(!paths.iter().any(|p| p.contains("skip.log")));
         assert!(!paths.iter().any(|p| p.contains("cache")));
+    }
+
+    #[tokio::test]
+    async fn diff_reports_added_removed_modified() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("stable"), b"same").unwrap();
+        std::fs::write(src.path().join("gone"), b"to be removed").unwrap();
+        std::fs::write(src.path().join("changes"), b"v1").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let a = backup(&mut repo, src.path()).await.unwrap();
+
+        std::fs::remove_file(src.path().join("gone")).unwrap();
+        std::fs::write(src.path().join("changes"), b"v2 a different size").unwrap();
+        std::fs::write(src.path().join("brand_new"), b"hi").unwrap();
+        let b = backup(&mut repo, src.path()).await.unwrap();
+
+        let changes = diff(&repo, &a, &b).await.unwrap();
+        let of = |k: DiffKind| -> Vec<&str> {
+            changes
+                .iter()
+                .filter(|d| d.change == k)
+                .map(|d| d.path.as_str())
+                .collect()
+        };
+        assert_eq!(of(DiffKind::Added), vec!["brand_new"]);
+        assert_eq!(of(DiffKind::Removed), vec!["gone"]);
+        assert_eq!(of(DiffKind::Modified), vec!["changes"]);
+        assert!(!changes.iter().any(|d| d.path == "stable"));
     }
 }
