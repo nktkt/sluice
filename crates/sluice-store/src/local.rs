@@ -73,6 +73,23 @@ impl StorageBackend for LocalBackend {
         }
     }
 
+    async fn get_range(&self, ty: FileType, id: &Id, offset: u64, len: u64) -> Result<Bytes> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = match fs::File::open(self.path(ty, id)).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(StoreError::NotFound { ty, id: *id });
+            }
+            Err(e) => return Err(io(e)),
+        };
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(io)?;
+        let mut buf = vec![0u8; len as usize];
+        file.read_exact(&mut buf).await.map_err(io)?;
+        Ok(Bytes::from(buf))
+    }
+
     async fn put(&self, ty: FileType, id: &Id, data: Bytes) -> Result<()> {
         let final_path = self.path(ty, id);
         if fs::try_exists(&final_path).await.map_err(io)? {
@@ -158,6 +175,33 @@ mod tests {
             be.get(FileType::Pack, &id(1)).await.unwrap(),
             Bytes::from_static(b"pack-bytes")
         );
+    }
+
+    #[tokio::test]
+    async fn get_range_reads_a_subslice() {
+        let dir = tempfile::tempdir().unwrap();
+        let be = LocalBackend::create(dir.path()).await.unwrap();
+        be.put(FileType::Pack, &id(2), Bytes::from_static(b"0123456789"))
+            .await
+            .unwrap();
+        // A middle slice, the head, and the tail.
+        assert_eq!(
+            be.get_range(FileType::Pack, &id(2), 3, 4).await.unwrap(),
+            Bytes::from_static(b"3456")
+        );
+        assert_eq!(
+            be.get_range(FileType::Pack, &id(2), 0, 2).await.unwrap(),
+            Bytes::from_static(b"01")
+        );
+        assert_eq!(
+            be.get_range(FileType::Pack, &id(2), 8, 2).await.unwrap(),
+            Bytes::from_static(b"89")
+        );
+        // A missing object is reported as such, not as a generic read error.
+        assert!(matches!(
+            be.get_range(FileType::Pack, &id(9), 0, 1).await,
+            Err(StoreError::NotFound { .. })
+        ));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 175 tests across
+machine-readable JSON output, and stable exit codes. Backed by 176 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -155,6 +155,11 @@ sluice backup s3://my-bucket/backups ~/documents
 # gs://…, az://…, file://… are also supported
 ```
 
+Restore and verify fetch each blob with a **ranged read** (an object-store range
+`GET`, or a local-file seek), so only the bytes in use cross the wire rather than
+the whole pack — keeping their memory bounded and, on object storage, their
+transfer cost proportional to the data actually read.
+
 ## Concurrency and safety
 
 Operations coordinate through **advisory locks**: a backup takes a shared lock and
@@ -256,7 +261,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 175 tests
+cargo test     # 176 tests
 ```
 
 ## Caveats

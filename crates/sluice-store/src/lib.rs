@@ -92,6 +92,22 @@ pub trait StorageBackend: Send + Sync {
     /// Fetch an object's full contents.
     async fn get(&self, ty: FileType, id: &Id) -> Result<Bytes>;
 
+    /// Fetch the byte range `[offset, offset + len)` of an object.
+    ///
+    /// Lets a caller read a single blob out of a pack without transferring the
+    /// whole pack. Backends with native ranged reads (a local-file `seek`+read,
+    /// an object-store range `GET`) override this; the default fetches the whole
+    /// object and slices it.
+    async fn get_range(&self, ty: FileType, id: &Id, offset: u64, len: u64) -> Result<Bytes> {
+        let full = self.get(ty, id).await?;
+        let start = offset as usize;
+        let end = start
+            .checked_add(len as usize)
+            .filter(|&end| end <= full.len())
+            .ok_or_else(|| StoreError::Backend("requested range exceeds object".into()))?;
+        Ok(full.slice(start..end))
+    }
+
     /// Store a new object.
     ///
     /// Objects are content-addressed and immutable, so writing an id that
@@ -117,6 +133,12 @@ pub trait StorageBackend: Send + Sync {
 impl<B: StorageBackend + ?Sized> StorageBackend for Arc<B> {
     async fn get(&self, ty: FileType, id: &Id) -> Result<Bytes> {
         (**self).get(ty, id).await
+    }
+
+    async fn get_range(&self, ty: FileType, id: &Id, offset: u64, len: u64) -> Result<Bytes> {
+        // Forward so the inner backend's native ranged read is used, not the
+        // whole-object default.
+        (**self).get_range(ty, id, offset, len).await
     }
 
     async fn put(&self, ty: FileType, id: &Id, data: Bytes) -> Result<()> {

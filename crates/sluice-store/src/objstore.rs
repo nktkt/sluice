@@ -67,6 +67,22 @@ impl StorageBackend for ObjectStoreBackend {
         }
     }
 
+    async fn get_range(&self, ty: FileType, id: &Id, offset: u64, len: u64) -> Result<Bytes> {
+        // A single ranged GET — only the blob's bytes cross the wire, not the
+        // whole pack.
+        let start = offset as usize;
+        let end = start + len as usize;
+        match self
+            .store
+            .get_range(&self.object_path(ty, id), start..end)
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(object_store::Error::NotFound { .. }) => Err(StoreError::NotFound { ty, id: *id }),
+            Err(e) => Err(os_err(e)),
+        }
+    }
+
     async fn put(&self, ty: FileType, id: &Id, data: Bytes) -> Result<()> {
         let opts = PutOptions {
             mode: PutMode::Create,

@@ -382,10 +382,18 @@ impl<B: StorageBackend> Repository<B> {
             .get(id)
             .copied()
             .ok_or(RepoError::BlobNotFound(*id))?;
-        let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
-        let reader = PackReader::parse(&bytes)?;
-        let sealed = reader.blob(id).ok_or(RepoError::BlobNotFound(*id))?;
-        let frame = open(&self.keys.data_key, &self.blob_aad(entry.kind), sealed)
+        // Read only this blob's sealed bytes (its slice of the pack body, which
+        // begins at offset 0), not the whole pack.
+        let sealed = self
+            .backend
+            .get_range(
+                FileType::Pack,
+                &pack_id,
+                u64::from(entry.offset),
+                u64::from(entry.length),
+            )
+            .await?;
+        let frame = open(&self.keys.data_key, &self.blob_aad(entry.kind), &sealed)
             .map_err(|_| RepoError::Blob)?;
         decompress(&frame).map_err(|_| RepoError::Blob)
     }
