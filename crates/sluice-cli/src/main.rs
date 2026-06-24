@@ -89,6 +89,9 @@ enum Command {
         /// Only show snapshots with this tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Show only the N most recent snapshots.
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -462,7 +465,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        Command::Snapshots { repo, tag, json } => {
+        Command::Snapshots {
+            repo,
+            tag,
+            last,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let mut snaps = Vec::new();
             for id in repository.list_snapshots().await? {
@@ -473,6 +481,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 snaps.push((id, snap));
+            }
+            // List chronologically (oldest first); --last keeps the most recent N.
+            snaps.sort_by(|a, b| a.1.time_ns.cmp(&b.1.time_ns));
+            if let Some(n) = last {
+                let drop = snaps.len().saturating_sub(n);
+                snaps.drain(..drop);
             }
             if json {
                 let arr: Vec<serde_json::Value> = snaps

@@ -179,6 +179,64 @@ fn stats_reports_counts() {
 }
 
 #[test]
+fn snapshots_are_chronological_and_last_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+
+    let mut ids = Vec::new();
+    for v in ["v1", "v2", "v3"] {
+        std::fs::write(src.join("f"), v).unwrap();
+        let a = sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success();
+        ids.push(
+            String::from_utf8(a.get_output().stdout.clone())
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    // --json lists them oldest-first (creation order here).
+    let out = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    let got: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, vec![&ids[0][..], &ids[1][..], &ids[2][..]]);
+
+    // --last 1 keeps only the most recent.
+    let out = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--last")
+        .arg("1")
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["id"], ids[2]);
+}
+
+#[test]
 fn snapshots_and_stats_emit_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
