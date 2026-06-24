@@ -9,3 +9,5 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+sluice-core = { path = "../sluice-core" }
+blake3 = { workspace = true }
