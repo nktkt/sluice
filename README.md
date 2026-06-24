@@ -10,10 +10,11 @@ many source directories), full and partial restore, two tiers of integrity
 checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
-persisted index for fast repository open, machine-readable JSON output, and
-stable exit codes. Backed by 153 tests across the workspace. The full
-architecture is in [`DESIGN.md`](./DESIGN.md). **The on-disk format is not yet
-frozen; do not use it for data you cannot afford to lose.**
+persisted index for fast repository open, concurrent verify and restore,
+machine-readable JSON output, and stable exit codes. Backed by 158 tests across
+the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
+on-disk format is not yet frozen; do not use it for data you cannot afford to
+lose.**
 
 `sluice` backs up a large number of *your own* files to an **untrusted** storage
 backend — a local disk, a NAS, or any S3-compatible object store (S3, GCS,
@@ -37,6 +38,7 @@ export SLUICE_PASSWORD='correct horse battery staple'
 sluice init   ./repo
 sluice backup ./repo ~/documents --exclude '*.log' --exclude node_modules --tag daily
 sluice backup ./repo ~/documents --exclude-from .sluiceignore   # exclude globs from a file
+sluice backup ./repo ~/.config/app.toml          # a single file is also a valid source
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 ```
@@ -44,16 +46,16 @@ sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
 stored chunks without being re-read. `--exclude` (glob, by entry name) and `--tag`
 are repeatable, and `--exclude-from` reads exclude globs from a file (one per
-line; `#` comments and blank lines ignored). Multiple source directories go into
-a single snapshot under a synthetic root named by each source's final path
-component. The Argon2id work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and
-`SLUICE_KDF_PASSES`.
+line; `#` comments and blank lines ignored). A source may be a directory or a
+single file, and several sources (files and/or directories) go into one snapshot
+under a synthetic root named by each source's final path component. The Argon2id
+work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 
 ### Inspect and restore
 
 ```sh
 sluice snapshots ./repo [--tag daily]          # <id> <time> <N files> <paths>
-sluice ls        ./repo <snapshot>             # list a snapshot's entries
+sluice ls        ./repo <snapshot> [path]      # list a snapshot's entries (or just a subpath)
 sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
 sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes between snapshots
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
@@ -154,6 +156,10 @@ lock behind; clear it with `sluice unlock`. Writes are crash-consistent: objects
 are immutable and append-only, and the snapshot — written last — is the single
 commit point, so an interrupted backup never corrupts the repository.
 
+On the read side, `verify` and `restore` overlap their blob reads (and
+`load_file`/`dump` overlap a file's chunk reads), which keeps a high-latency
+object-store backend busy instead of waiting one round-trip at a time.
+
 ## Security model
 
 `sluice` treats the storage backend as **untrusted**. Data is compressed and then
@@ -175,7 +181,8 @@ blob is authenticated, a single flipped byte in a stored pack is caught by `veri
 - **Encryption at rest** — you hold the keys; XChaCha20-Poly1305 and Argon2id,
   with multiple passphrases and rotation.
 - **Snapshots, restore, verify, diff** — point-in-time snapshots of one or many
-  source directories, full or partial restore, fast structural `check` and
+  source files and/or directories, full or partial restore (with concurrent
+  reads), fast structural `check` and
   thorough read-data `verify`, snapshot diffs, cross-snapshot `find`, and `tag`
   editing.
 - **Retention** — restic-style keep-last/daily/weekly/monthly/yearly plus
@@ -241,7 +248,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 153 tests
+cargo test     # 158 tests
 ```
 
 ## Caveats
