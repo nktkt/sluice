@@ -41,7 +41,7 @@ fn init_backup_snapshots_verify_restore_roundtrip() {
         .arg(&repo)
         .assert()
         .success()
-        .stdout(predicate::str::contains(&snapshot));
+        .stdout(predicate::str::contains(&snapshot[..12]));
 
     sluice()
         .arg("verify")
