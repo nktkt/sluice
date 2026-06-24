@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, backup_excluding, diff, dump, forget, forget_keep_daily, forget_keep_last,
-    forget_tagged, list_files, prune, restore_subpath, verify,
+    DiffKind, RetentionPolicy, backup_excluding, diff, dump, forget, forget_tagged,
+    forget_with_policy, list_files, prune, restore_subpath, verify,
 };
 use sluice_repo::Repository;
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -78,12 +78,15 @@ enum Command {
         repo: String,
         /// Snapshot id to forget (a unique hex prefix is accepted).
         snapshot: Option<String>,
-        /// Instead, keep the N most recent snapshots and forget the rest.
+        /// Keep the N most recent snapshots (combinable with the other --keep rules).
         #[arg(long, value_name = "N")]
         keep_last: Option<usize>,
-        /// Instead, keep the most recent snapshot of each of the last N days.
+        /// Keep the most recent snapshot of each of the last N days.
         #[arg(long, value_name = "N")]
         keep_daily: Option<usize>,
+        /// Keep the most recent snapshot of each of the last N (Monday-aligned) weeks.
+        #[arg(long, value_name = "N")]
+        keep_weekly: Option<usize>,
         /// Instead, forget every snapshot with this tag.
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -223,30 +226,33 @@ async fn run() -> Result<(), Box<dyn Error>> {
             snapshot,
             keep_last,
             keep_daily,
+            keep_weekly,
             tag,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            match (snapshot, keep_last, keep_daily, tag) {
-                (Some(snapshot), None, None, None) => {
+            let policy = RetentionPolicy {
+                last: keep_last.unwrap_or(0),
+                daily: keep_daily.unwrap_or(0),
+                weekly: keep_weekly.unwrap_or(0),
+            };
+            match (snapshot, tag, policy.is_empty()) {
+                (Some(snapshot), None, true) => {
                     let id = resolve_snapshot(&repository, &snapshot).await?;
                     forget(&repository, &id).await?;
                     println!("forgot {id}");
                 }
-                (None, Some(keep), None, None) => {
-                    let forgotten = forget_keep_last(&repository, keep).await?;
-                    println!("forgot {} snapshot(s)", forgotten.len());
-                }
-                (None, None, Some(keep), None) => {
-                    let forgotten = forget_keep_daily(&repository, keep).await?;
-                    println!("forgot {} snapshot(s)", forgotten.len());
-                }
-                (None, None, None, Some(tag)) => {
+                (None, Some(tag), true) => {
                     let forgotten = forget_tagged(&repository, &tag).await?;
+                    println!("forgot {} snapshot(s)", forgotten.len());
+                }
+                (None, None, false) => {
+                    let forgotten = forget_with_policy(&repository, policy).await?;
                     println!("forgot {} snapshot(s)", forgotten.len());
                 }
                 _ => {
                     return Err(
-                        "specify exactly one of <snapshot>, --keep-last N, --keep-daily N, or --tag T"
+                        "specify exactly one of: <snapshot>, --tag T, or one or more \
+                         --keep-last/--keep-daily/--keep-weekly rules"
                             .into(),
                     );
                 }

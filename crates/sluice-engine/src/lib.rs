@@ -246,60 +246,119 @@ pub async fn forget<B: StorageBackend>(repo: &Repository<B>, snapshot: &Id) -> R
     Ok(())
 }
 
+/// A snapshot retention policy. A snapshot is kept if it satisfies *any* enabled
+/// rule (the union, as in restic); a rule with a count of 0 is disabled. See
+/// `DESIGN.md` §8.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// Keep the N most recent snapshots.
+    pub last: usize,
+    /// Keep the most recent snapshot of each of the last N UTC days.
+    pub daily: usize,
+    /// Keep the most recent snapshot of each of the last N (Monday-aligned) weeks.
+    pub weekly: usize,
+}
+
+impl RetentionPolicy {
+    /// Whether every rule is disabled (so the policy would keep nothing).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.last == 0 && self.daily == 0 && self.weekly == 0
+    }
+}
+
+/// Nanoseconds per UTC day; `Snapshot::time_ns` is ns since the Unix epoch.
+const NS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// The UTC day index (days since the epoch) containing `time_ns`.
+fn day_bucket(time_ns: i64) -> i64 {
+    time_ns.div_euclid(NS_PER_DAY)
+}
+
+/// The Monday-aligned week index containing `time_ns`. Epoch day 0 is a
+/// Thursday, so `+3` shifts week boundaries onto Mondays.
+fn week_bucket(time_ns: i64) -> i64 {
+    (day_bucket(time_ns) + 3).div_euclid(7)
+}
+
+/// Apply a retention `policy`, forgetting every snapshot kept by no rule, and
+/// return the ids forgotten. Reclaim their data afterwards with [`prune`].
+///
+/// Each bucketed rule keeps the most recent snapshot of each of its last N
+/// buckets: walking newest-first, the first snapshot seen for a bucket is that
+/// bucket's most recent, and buckets only decrease, so one pass per rule with a
+/// running list of kept buckets suffices. The kept sets are unioned.
+pub async fn forget_with_policy<B: StorageBackend>(
+    repo: &Repository<B>,
+    policy: RetentionPolicy,
+) -> Result<Vec<Id>> {
+    let mut snapshots = Vec::new();
+    for id in repo.list_snapshots().await? {
+        let time = repo.load_snapshot(&id).await?.time_ns;
+        snapshots.push((id, time));
+    }
+    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+
+    let mut keep: HashSet<Id> = HashSet::new();
+    // `--keep-last N`: the N most recent snapshots outright.
+    for (id, _) in snapshots.iter().take(policy.last) {
+        keep.insert(*id);
+    }
+    // `--keep-daily`/`--keep-weekly`: most recent per bucket, last N buckets.
+    let bucketed: [(usize, fn(i64) -> i64); 2] =
+        [(policy.daily, day_bucket), (policy.weekly, week_bucket)];
+    for (budget, bucket_of) in bucketed {
+        let mut kept_buckets: Vec<i64> = Vec::new();
+        for (id, time) in &snapshots {
+            let bucket = bucket_of(*time);
+            if kept_buckets.last() != Some(&bucket) && kept_buckets.len() < budget {
+                kept_buckets.push(bucket);
+                keep.insert(*id);
+            }
+        }
+    }
+
+    let mut forgotten = Vec::new();
+    for (id, _) in &snapshots {
+        if !keep.contains(id) {
+            forget(repo, id).await?;
+            forgotten.push(*id);
+        }
+    }
+    Ok(forgotten)
+}
+
 /// Keep the `keep` most recent snapshots and forget the rest, returning the ids
 /// that were forgotten. Reclaim their data afterwards with [`prune`].
 pub async fn forget_keep_last<B: StorageBackend>(
     repo: &Repository<B>,
     keep: usize,
 ) -> Result<Vec<Id>> {
-    let mut snapshots = Vec::new();
-    for id in repo.list_snapshots().await? {
-        let time = repo.load_snapshot(&id).await?.time_ns;
-        snapshots.push((id, time));
-    }
-    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
-    let mut forgotten = Vec::new();
-    for (id, _) in snapshots.into_iter().skip(keep) {
-        forget(repo, &id).await?;
-        forgotten.push(id);
-    }
-    Ok(forgotten)
+    forget_with_policy(
+        repo,
+        RetentionPolicy {
+            last: keep,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
-/// Apply a daily retention policy: for each of the `keep` most recent UTC days
-/// that hold any snapshot, keep only that day's most recent snapshot; forget all
-/// other snapshots (older snapshots within a kept day, and every snapshot on days
-/// beyond the budget). Returns the ids forgotten. Reclaim their data with
-/// [`prune`]. This mirrors restic's `--keep-daily` rule (see `DESIGN.md` §8).
+/// Apply a daily retention policy: keep the most recent snapshot of each of the
+/// `keep` most recent UTC days and forget the rest. Returns the ids forgotten.
+/// Reclaim their data afterwards with [`prune`].
 pub async fn forget_keep_daily<B: StorageBackend>(
     repo: &Repository<B>,
     keep: usize,
 ) -> Result<Vec<Id>> {
-    /// Nanoseconds per UTC day; `time_ns` is nanoseconds since the Unix epoch.
-    const NS_PER_DAY: i64 = 86_400_000_000_000;
-    let mut snapshots = Vec::new();
-    for id in repo.list_snapshots().await? {
-        let time = repo.load_snapshot(&id).await?.time_ns;
-        snapshots.push((id, time));
-    }
-    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
-
-    // Walking newest-first, the first snapshot seen for a day is that day's most
-    // recent. `kept_days` holds the days we have already kept a snapshot for; as
-    // days only decrease, the day we keep is always the last one pushed.
-    let mut kept_days: Vec<i64> = Vec::new();
-    let mut forgotten = Vec::new();
-    for (id, time) in snapshots {
-        let day = time.div_euclid(NS_PER_DAY);
-        let keep_this = kept_days.last() != Some(&day) && kept_days.len() < keep;
-        if keep_this {
-            kept_days.push(day);
-        } else {
-            forget(repo, &id).await?;
-            forgotten.push(id);
-        }
-    }
-    Ok(forgotten)
+    forget_with_policy(
+        repo,
+        RetentionPolicy {
+            daily: keep,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Forget every snapshot tagged `tag`, returning the ids forgotten. Reclaim
@@ -1025,6 +1084,52 @@ mod tests {
 
         // Keeping more days than exist forgets nothing further.
         assert!(forget_keep_daily(&repo, 9).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn forget_with_policy_unions_daily_and_weekly() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const DAY: i64 = 86_400_000_000_000;
+        // days 3, 9, 10 -> weeks (day+3)/7 = 0, 1, 1.
+        let d3 = repo.commit_snapshot(&at(3 * DAY + 10)).await.unwrap();
+        let d9 = repo.commit_snapshot(&at(9 * DAY + 10)).await.unwrap();
+        let d10 = repo.commit_snapshot(&at(10 * DAY + 10)).await.unwrap();
+
+        // daily 1 keeps only d10; weekly 2 additionally keeps d3 (week 0's newest).
+        // d9 is the newest of week 1 only after d10, so neither rule keeps it.
+        let policy = RetentionPolicy {
+            last: 0,
+            daily: 1,
+            weekly: 2,
+        };
+        let forgotten = forget_with_policy(&repo, policy).await.unwrap();
+        assert_eq!(forgotten, vec![d9]);
+
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([d10, d3]));
     }
 
     #[cfg(unix)]
