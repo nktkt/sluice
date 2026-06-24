@@ -1811,6 +1811,7 @@ name = "sluice-core"
 version = "0.0.0"
 dependencies = [
  "ciborium",
+ "proptest",
  "serde",
  "thiserror",
 ]

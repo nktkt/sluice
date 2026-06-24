@@ -106,6 +106,7 @@ pub struct SnapshotStats {
 mod tests {
     use super::*;
     use crate::{from_cbor, to_cbor};
+    use proptest::prelude::*;
 
     fn sample_tree() -> Tree {
         Tree {
@@ -185,5 +186,50 @@ mod tests {
         let bytes = to_cbor(&snap).unwrap();
         let back: Snapshot = from_cbor(&bytes).unwrap();
         assert_eq!(snap, back);
+    }
+
+    fn arb_id() -> impl Strategy<Value = Id> {
+        proptest::collection::vec(any::<u8>(), 32..=32)
+            .prop_map(|v| Id::from_bytes(v.try_into().unwrap()))
+    }
+
+    fn arb_node() -> impl Strategy<Value = Node> {
+        (
+            proptest::collection::vec(any::<u8>(), 0..16),
+            any::<u32>(),
+            any::<u32>(),
+            any::<u32>(),
+            any::<i64>(),
+            any::<i64>(),
+            any::<u64>(),
+            proptest::collection::vec(arb_id(), 0..4),
+        )
+            .prop_map(|(name, mode, uid, gid, mtime, ctime, size, content)| Node {
+                name,
+                kind: EntryKind::File,
+                mode,
+                uid,
+                gid,
+                mtime_ns: mtime,
+                ctime_ns: ctime,
+                size,
+                content,
+                subtree: None,
+                link_target: None,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn tree_cbor_roundtrips_and_is_deterministic(
+            nodes in proptest::collection::vec(arb_node(), 0..8)
+        ) {
+            let tree = Tree { version: TREE_VERSION, nodes };
+            let bytes = to_cbor(&tree).unwrap();
+            // Roundtrip.
+            prop_assert_eq!(from_cbor::<Tree>(&bytes).unwrap(), tree.clone());
+            // Deterministic: tree IDs are the hash of these bytes.
+            prop_assert_eq!(to_cbor(&tree).unwrap(), bytes);
+        }
     }
 }

@@ -12,3 +12,6 @@ authors.workspace = true
 serde = { workspace = true }
 ciborium = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
