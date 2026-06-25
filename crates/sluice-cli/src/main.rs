@@ -550,13 +550,24 @@ enum KeyCmd {
 }
 
 fn main() {
-    match run() {
-        Ok(code) => std::process::exit(code),
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(exit_code(error.as_ref()));
-        }
-    }
+    // Windows' default main-thread stack is 1 MiB, far below the 8 MiB on
+    // Linux/macOS. The command future built by `#[tokio::main]` is driven by
+    // `block_on` on whichever thread calls `run()`, and the backup/restore
+    // pipeline holds large I/O buffers across `.await` points, so that future
+    // overflows a 1 MiB stack on every invocation. Drive it on a worker thread
+    // with a generous stack so behaviour is uniform across platforms.
+    let worker = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| match run() {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("error: {error}");
+                exit_code(error.as_ref())
+            }
+        })
+        .expect("spawn worker thread");
+    let code = worker.join().expect("worker thread panicked");
+    std::process::exit(code);
 }
 
 /// Map an error to a stable, documented exit code (`DESIGN.md` §7): 10 repo not

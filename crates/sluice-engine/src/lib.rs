@@ -4676,7 +4676,9 @@ mod tests {
         }
         let src = tempfile::tempdir().unwrap();
         let dev = src.path().join("zero");
-        let rdev = rustix::fs::makedev(1, 5); // char 1:5 is /dev/zero
+        // `makedev` returns the platform `dev_t` (u64 on Linux, i32 on macOS);
+        // widen to the u64 `make_device`/`Node::rdev` use everywhere.
+        let rdev: u64 = rustix::fs::makedev(1, 5) as u64; // char 1:5 is /dev/zero
         make_device(&dev, 0o644, EntryKind::CharDevice, rdev).unwrap();
         let sm = std::fs::symlink_metadata(&dev).unwrap();
         assert!(sm.file_type().is_char_device(), "test setup");
