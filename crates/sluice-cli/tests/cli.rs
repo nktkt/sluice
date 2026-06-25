@@ -1021,6 +1021,49 @@ fn copy_emits_json() {
 }
 
 #[test]
+fn backup_compression_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    let data = vec![b'A'; 100_000];
+    std::fs::write(src.join("f.bin"), &data).unwrap();
+
+    // Repo default is level 3; this run overrides to 19.
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--compression", "19"])
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f.bin")).unwrap(), data);
+
+    // Out-of-range levels are rejected by the argument parser.
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--compression", "99"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in 1..=22"));
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

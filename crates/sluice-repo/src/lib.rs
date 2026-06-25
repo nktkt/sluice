@@ -123,6 +123,11 @@ pub struct Repository<B> {
     pending: PackBuilder,
     /// chunk id -> directory entry within `pending`.
     pending_index: HashMap<Id, BlobEntry>,
+    /// Per-run override for the zstd level used to compress newly stored file
+    /// data; `None` ⇒ use `config.compression`. Set by [`set_data_compression`].
+    ///
+    /// [`set_data_compression`]: Self::set_data_compression
+    compression_override: Option<i32>,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -187,6 +192,7 @@ impl<B: StorageBackend> Repository<B> {
             index: HashMap::new(),
             pending: PackBuilder::new(),
             pending_index: HashMap::new(),
+            compression_override: None,
         })
     }
 
@@ -241,6 +247,7 @@ impl<B: StorageBackend> Repository<B> {
             index,
             pending: PackBuilder::new(),
             pending_index: HashMap::new(),
+            compression_override: None,
         })
     }
 
@@ -533,7 +540,7 @@ impl<B: StorageBackend> Repository<B> {
         use rayon::prelude::*;
         let id_key = self.keys.id_key;
         let data_key = self.keys.data_key;
-        let compression = self.config.compression;
+        let compression = self.compression_override.unwrap_or(self.config.compression);
         let aad = self.blob_aad(BlobKind::Data);
         // Parallel CPU work: each chunk's id, plus its compressed-and-sealed bytes.
         let sealed: Vec<(Id, Vec<u8>)> = batch
@@ -670,6 +677,16 @@ impl<B: StorageBackend> Repository<B> {
     #[must_use]
     pub fn config(&self) -> &RepoConfig {
         &self.config
+    }
+
+    /// Override the zstd level used to compress newly stored **file data** for
+    /// subsequent backups on this handle; `None` restores the repository default
+    /// (`config().compression`). Because a chunk's id is the hash of its
+    /// *plaintext*, the level never affects deduplication or the data read back —
+    /// only the stored size of chunks written from here on. Metadata blobs (trees,
+    /// snapshots, config) always use the repository default.
+    pub fn set_data_compression(&mut self, level: Option<i32>) {
+        self.compression_override = level;
     }
 
     /// Id of the key object whose passphrase unlocked this handle. This is the

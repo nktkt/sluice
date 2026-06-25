@@ -5619,6 +5619,120 @@ mod tests {
         assert!(again.is_empty());
     }
 
+    /// Deterministic medium-entropy data (4 symbols from a small-period LCG) that
+    /// zstd compresses visibly better at a higher level — used to observe the
+    /// per-run compression override taking effect.
+    fn compressible_blob() -> Vec<u8> {
+        let mut data = vec![0u8; 1 << 20];
+        let mut x: u64 = 12345;
+        for b in data.iter_mut() {
+            x = 1103515245u64.wrapping_mul(x).wrapping_add(12345) % 2147483648;
+            *b = b"ACGT"[((x / 65536) % 4) as usize];
+        }
+        data
+    }
+
+    /// Total stored size of all packs in the repository.
+    async fn pack_bytes<B: StorageBackend>(repo: &Repository<B>) -> u64 {
+        let mut total = 0;
+        for p in repo.backend().list(FileType::Pack).await.unwrap() {
+            total += repo.backend().size(FileType::Pack, &p).await.unwrap();
+        }
+        total
+    }
+
+    /// A per-run compression override actually changes the stored size — the same
+    /// data stored at level 1 is larger than at level 19 — while restoring
+    /// byte-identically at either level.
+    #[tokio::test]
+    async fn per_run_compression_override_changes_stored_size() {
+        let data = compressible_blob();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("blob.bin"), &data).unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let store = |level: i32| {
+            let sources = sources.clone();
+            let data = data.clone();
+            async move {
+                let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+                    .await
+                    .unwrap();
+                repo.set_data_compression(Some(level));
+                let snap = backup_sources_with_options(
+                    &mut repo,
+                    &sources,
+                    &[],
+                    &Default::default(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap();
+                let stored = pack_bytes(&repo).await;
+                let dst = tempfile::tempdir().unwrap();
+                restore(&repo, &snap, dst.path()).await.unwrap();
+                assert_eq!(
+                    std::fs::read(dst.path().join("blob.bin")).unwrap(),
+                    data,
+                    "round-trips at level {level}"
+                );
+                stored
+            }
+        };
+
+        let low = store(1).await;
+        let high = store(19).await;
+        assert!(
+            low > high,
+            "level 1 stored {low} should exceed level 19 stored {high}"
+        );
+    }
+
+    /// The compression level never affects deduplication: the same content stored
+    /// under two names at two levels shares its blob, so the second backup adds no
+    /// new storage, and both restore correctly. This is the safety guarantee that
+    /// lets the level vary per run.
+    #[tokio::test]
+    async fn compression_level_does_not_affect_dedup() {
+        let data = compressible_blob();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.bin"), &data).unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        repo.set_data_compression(Some(1));
+        backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap();
+        let after_first = pack_bytes(&repo).await;
+
+        // Identical bytes under a new name, now at level 19: the chunks dedup
+        // against the level-1 blobs (ids are over plaintext), so nothing new is
+        // stored beyond a tiny tree/snapshot.
+        std::fs::write(src.path().join("b.bin"), &data).unwrap();
+        repo.set_data_compression(Some(19));
+        let snap = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        let growth = pack_bytes(&repo).await - after_first;
+        assert!(
+            growth < (data.len() as u64) / 10,
+            "duplicate content re-stored {growth} bytes; dedup should keep it tiny"
+        );
+
+        // Both copies restore to the original bytes.
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+        assert_eq!(std::fs::read(dst.path().join("a.bin")).unwrap(), data);
+        assert_eq!(std::fs::read(dst.path().join("b.bin")).unwrap(), data);
+    }
+
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
     /// round-trips byte-identical and re-backs-up reused, exercising the batch-
     /// boundary logic of the parallel write path.

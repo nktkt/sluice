@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 228 tests across
+machine-readable JSON output, and stable exit codes. Backed by 231 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -49,6 +49,7 @@ sluice backup ./repo ~/.config/app.toml          # a single file is also a valid
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
 sluice backup ./repo --files-from backup.list    # read source paths from a file (one per line)
 sluice backup ./repo ~/big --cache ~/.cache/sluice.redb   # reuse unchanged files via a stat cache
+sluice backup ./repo ~/archive --compression 19  # override the repo's zstd level for this run
 pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a piped stream
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
@@ -68,7 +69,11 @@ chunker with a bounded buffer, and restored the same way — chunks written as t
 arrive — so a file larger than memory backs up and restores without being loaded
 whole. Within a file the chunks are compressed and encrypted **in parallel**
 across CPU cores (the chunker and pack assembly stay serial), so backups scale
-with the machine — most pronounced at higher compression levels. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
+with the machine — most pronounced at higher compression levels. The repository's
+zstd level is fixed at `init`, but `--compression <LEVEL>` overrides it for a
+single run (e.g. a one-off archival backup at level 19); because a chunk's id is
+the hash of its *plaintext*, changing the level never affects deduplication —
+only newly stored chunks are written at the new level. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
 instead of being read back as zeros, so a mostly-empty disk image is barely
 touched. On an interactive terminal, backup shows a live spinner with the running
 file count and current path; it hides itself when stderr is not a TTY (piped or
@@ -372,7 +377,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 228 tests
+cargo test     # 231 tests
 ```
 
 ## Caveats

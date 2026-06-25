@@ -98,6 +98,11 @@ enum Command {
         /// previous snapshot's trees (notably faster for object-store repos).
         #[arg(long, value_name = "PATH")]
         cache: Option<PathBuf>,
+        /// Override the zstd level (1 fastest .. 22 smallest) for data stored by
+        /// this run only; defaults to the repository's level set at init. Dedup is
+        /// unaffected, so only newly stored chunks use the new level.
+        #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=22))]
+        compression: Option<i32>,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -532,6 +537,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude_if_present,
             exclude_caches,
             cache,
+            compression,
             dry_run,
             verbose,
             json,
@@ -569,6 +575,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             }
             let max_size = exclude_larger_than.as_deref().map(parse_size).transpose()?;
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            // Apply a per-run compression override (None keeps the repo default).
+            repository.set_data_compression(compression);
             // With --verbose, print each new/changed file as it is processed.
             let report = |path: &std::path::Path, status: FileStatus| match status {
                 FileStatus::New => eprintln!("+ {}", path.display()),
