@@ -17,10 +17,10 @@ use clap::{CommandFactory, Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport,
-    RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin, check, copy_all,
-    copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
-    prune_excluding, rebuild_index, restore_with, retag, verify_with,
+    BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
+    RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
+    check, copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
+    list_files, prune, prune_excluding, rebuild_index, restore_filtered, retag, verify_with,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -110,6 +110,14 @@ enum Command {
         /// Restore only this path within the snapshot (repeatable; omit for all).
         #[arg(long = "path", value_name = "PATH")]
         paths: Vec<String>,
+        /// Restore only entries whose path (relative to the restore root) matches
+        /// this glob (repeatable); `**` spans directories, e.g. '**/*.pdf'.
+        #[arg(long = "include", value_name = "GLOB")]
+        include: Vec<String>,
+        /// Skip entries whose path matches this glob (repeatable); a matching
+        /// directory is pruned with its subtree.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
         /// Report what would be restored (file count and bytes) without writing.
         #[arg(long)]
         dry_run: bool,
@@ -575,11 +583,14 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             snapshot,
             target,
             paths,
+            include,
+            exclude,
             dry_run,
             skip_existing,
             verify,
             verbose,
         } => {
+            let filter = RestoreFilter::new(&include, &exclude)?;
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
             if dry_run {
@@ -600,6 +611,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                             .any(|(p, prefix)| e.path == *p || e.path.starts_with(prefix))
                     });
                 }
+                // Honor the include/exclude globs in the preview, too.
+                entries.retain(|e| filter.allows_path(std::path::Path::new(&e.path)));
                 let files = entries.iter().filter(|e| e.kind == EntryKind::File);
                 let count = files.clone().count();
                 let bytes: u64 = files.map(|e| e.size).sum();
@@ -619,12 +632,28 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     if verbose { Some(&report_file) } else { None };
                 let mut report = RestoreReport::default();
                 if paths.is_empty() {
-                    report =
-                        restore_with(&repository, &id, None, &target, options, progress).await?;
+                    report = restore_filtered(
+                        &repository,
+                        &id,
+                        None,
+                        &target,
+                        options,
+                        &filter,
+                        progress,
+                    )
+                    .await?;
                 } else {
                     for p in &paths {
-                        let r = restore_with(&repository, &id, Some(p), &target, options, progress)
-                            .await?;
+                        let r = restore_filtered(
+                            &repository,
+                            &id,
+                            Some(p),
+                            &target,
+                            options,
+                            &filter,
+                            progress,
+                        )
+                        .await?;
                         report.warnings += r.warnings;
                         report.messages.extend(r.messages);
                     }

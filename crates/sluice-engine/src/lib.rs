@@ -692,6 +692,57 @@ pub struct RestoreOptions {
     pub verify: bool,
 }
 
+/// Path globs selecting which entries a restore writes. Both sets match an
+/// entry's path **relative to the restore root** (e.g. `docs/report.pdf`), with
+/// `**` spanning directory separators. The default (empty) filter restores
+/// everything.
+#[derive(Default)]
+pub struct RestoreFilter {
+    include: Option<GlobSet>,
+    exclude: Option<GlobSet>,
+}
+
+impl RestoreFilter {
+    /// Build a filter from `--include`/`--exclude` patterns (either may be empty).
+    /// With any include pattern, only matching leaf entries are restored; an
+    /// exclude pattern prunes a matching entry (and, for a directory, its whole
+    /// subtree).
+    pub fn new(include: &[String], exclude: &[String]) -> Result<Self> {
+        let set = |pats: &[String]| -> Result<Option<GlobSet>> {
+            if pats.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(build_globset(pats)?))
+            }
+        };
+        Ok(Self {
+            include: set(include)?,
+            exclude: set(exclude)?,
+        })
+    }
+
+    /// Whether a leaf at relative path `rel` would be restored. For previewing a
+    /// filtered restore (e.g. `restore --dry-run`); the recursive walk uses the
+    /// private helpers directly.
+    #[must_use]
+    pub fn allows_path(&self, rel: &Path) -> bool {
+        self.allows_leaf(rel)
+    }
+
+    /// Whether a leaf entry (file, symlink, special) at relative path `rel` is
+    /// restored: it matches an include pattern (or there are none) and no exclude.
+    fn allows_leaf(&self, rel: &Path) -> bool {
+        self.include.as_ref().map_or(true, |g| g.is_match(rel))
+            && !self.exclude.as_ref().is_some_and(|g| g.is_match(rel))
+    }
+
+    /// Whether a directory at relative path `rel` is descended into (an exclude
+    /// match prunes it; include patterns never prune dirs, only gate leaves).
+    fn allows_dir(&self, rel: &Path) -> bool {
+        !self.exclude.as_ref().is_some_and(|g| g.is_match(rel))
+    }
+}
+
 /// Concurrent collector for [`RestoreReport`] entries during a restore.
 type Reporter = std::sync::Mutex<RestoreReport>;
 
@@ -750,13 +801,38 @@ pub async fn restore_subpath<B: StorageBackend>(
 
 /// Restore a snapshot (optionally just `subpath`) into `target` under `options`,
 /// invoking `progress` (if any) with each restored file's path. [`restore`] and
-/// [`restore_subpath`] are thin wrappers with default options and no progress.
+/// [`restore_subpath`] are thin wrappers with default options and no progress;
+/// [`restore_filtered`] additionally takes glob filters.
 pub async fn restore_with<B: StorageBackend>(
     repo: &Repository<B>,
     snapshot: &Id,
     subpath: Option<&str>,
     target: &Path,
     options: RestoreOptions,
+    progress: Option<RestoreProgressFn<'_>>,
+) -> Result<RestoreReport> {
+    restore_filtered(
+        repo,
+        snapshot,
+        subpath,
+        target,
+        options,
+        &RestoreFilter::default(),
+        progress,
+    )
+    .await
+}
+
+/// Like [`restore_with`], but only entries permitted by `filter` (include/exclude
+/// globs matched against each entry's path relative to the restore root) are
+/// written.
+pub async fn restore_filtered<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    subpath: Option<&str>,
+    target: &Path,
+    options: RestoreOptions,
+    filter: &RestoreFilter,
     progress: Option<RestoreProgressFn<'_>>,
 ) -> Result<RestoreReport> {
     let snap = repo.load_snapshot(snapshot).await?;
@@ -773,13 +849,16 @@ pub async fn restore_with<B: StorageBackend>(
             EntryKind::Dir => {
                 std::fs::create_dir_all(&dest).map_err(|e| io_err(&dest, e))?;
                 if let Some(subtree) = node.subtree {
+                    // Filter relative to this subpath's base name.
                     restore_tree(
                         repo,
                         subtree,
                         dest.clone(),
+                        PathBuf::from(osstring_from_bytes(&node.name)),
                         &links,
                         &reporter,
                         options,
+                        filter,
                         progress,
                     )
                     .await?;
@@ -822,9 +901,11 @@ pub async fn restore_with<B: StorageBackend>(
             repo,
             snap.tree,
             target.to_path_buf(),
+            PathBuf::new(),
             &links,
             &reporter,
             options,
+            filter,
             progress,
         )
         .await?;
@@ -2093,14 +2174,18 @@ fn backup_dir<'a, B: StorageBackend>(
     })
 }
 
-/// Recursively restore the tree `tree_id` into the directory `dir`.
+/// Recursively restore the tree `tree_id` into the directory `dir`, where `rel`
+/// is `dir`'s path relative to the restore root (for `filter` matching).
+#[allow(clippy::too_many_arguments)]
 fn restore_tree<'a, B: StorageBackend>(
     repo: &'a Repository<B>,
     tree_id: Id,
     dir: PathBuf,
+    rel: PathBuf,
     links: &'a std::sync::Mutex<HashMap<(u64, u64), PathBuf>>,
     reporter: &'a Reporter,
     options: RestoreOptions,
+    filter: &'a RestoreFilter,
     progress: Option<RestoreProgressFn<'a>>,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
@@ -2110,7 +2195,19 @@ fn restore_tree<'a, B: StorageBackend>(
         // Directories (recurse) and symlinks first, sequentially, to build the
         // structure. A subdirectory's mtime is replayed after its own subtree.
         for node in &tree.nodes {
-            let path = dir.join(osstring_from_bytes(&node.name));
+            let name = osstring_from_bytes(&node.name);
+            let path = dir.join(&name);
+            let rel_child = rel.join(&name);
+            // Apply the include/exclude filter: an excluded directory is pruned,
+            // and any leaf entry not permitted is skipped (plain files are gated
+            // again in the passes below).
+            if node.kind == EntryKind::Dir {
+                if !filter.allows_dir(&rel_child) {
+                    continue;
+                }
+            } else if !filter.allows_leaf(&rel_child) {
+                continue;
+            }
             // For non-file entries, skip-existing means "leave it if already there".
             let present = options.skip_existing && exists(&path);
             match node.kind {
@@ -2121,9 +2218,11 @@ fn restore_tree<'a, B: StorageBackend>(
                             repo,
                             subtree,
                             path.clone(),
+                            rel_child.clone(),
                             links,
                             reporter,
                             options,
+                            filter,
                             progress,
                         )
                         .await?;
@@ -2165,7 +2264,11 @@ fn restore_tree<'a, B: StorageBackend>(
         futures::stream::iter(
             tree.nodes
                 .iter()
-                .filter(|n| n.kind == EntryKind::File && n.ino == 0)
+                .filter(|n| {
+                    n.kind == EntryKind::File
+                        && n.ino == 0
+                        && filter.allows_leaf(&rel.join(osstring_from_bytes(&n.name)))
+                })
                 .map(|node| {
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
@@ -2182,11 +2285,11 @@ fn restore_tree<'a, B: StorageBackend>(
         // source (dev, ino) materializes the content; later entries — possibly in
         // other directories — become hard links to it. Done sequentially against
         // the shared inode map; hardlinks are rare, so this isn't a hot path.
-        for node in tree
-            .nodes
-            .iter()
-            .filter(|n| n.kind == EntryKind::File && n.ino != 0)
-        {
+        for node in tree.nodes.iter().filter(|n| {
+            n.kind == EntryKind::File
+                && n.ino != 0
+                && filter.allows_leaf(&rel.join(osstring_from_bytes(&n.name)))
+        }) {
             let path = dir.join(osstring_from_bytes(&node.name));
             let target = {
                 let mut map = links.lock().expect("restore link map poisoned");
@@ -4590,6 +4693,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(std::fs::read(dst.path().join("f")).unwrap(), b"content");
+    }
+
+    #[tokio::test]
+    async fn restore_filter_includes_and_excludes_by_glob() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("docs")).unwrap();
+        std::fs::write(src.path().join("docs/a.pdf"), b"pdf").unwrap();
+        std::fs::write(src.path().join("docs/notes.txt"), b"text").unwrap();
+        std::fs::create_dir_all(src.path().join("img")).unwrap();
+        std::fs::write(src.path().join("img/photo.jpg"), b"jpeg").unwrap();
+        std::fs::write(src.path().join("readme.md"), b"md").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        // --include '**/*.pdf': only the pdf is written.
+        let inc = tempfile::tempdir().unwrap();
+        let filter = RestoreFilter::new(&["**/*.pdf".to_string()], &[]).unwrap();
+        restore_filtered(
+            &repo,
+            &snap,
+            None,
+            inc.path(),
+            RestoreOptions::default(),
+            &filter,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(inc.path().join("docs/a.pdf").exists());
+        assert!(!inc.path().join("docs/notes.txt").exists());
+        assert!(!inc.path().join("img/photo.jpg").exists());
+        assert!(!inc.path().join("readme.md").exists());
+
+        // --exclude '**/*.txt' and the whole 'img' directory.
+        let exc = tempfile::tempdir().unwrap();
+        let filter = RestoreFilter::new(&[], &["**/*.txt".to_string(), "img".to_string()]).unwrap();
+        restore_filtered(
+            &repo,
+            &snap,
+            None,
+            exc.path(),
+            RestoreOptions::default(),
+            &filter,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(exc.path().join("docs/a.pdf").exists());
+        assert!(exc.path().join("readme.md").exists());
+        assert!(!exc.path().join("docs/notes.txt").exists(), "txt excluded");
+        assert!(!exc.path().join("img").exists(), "excluded dir pruned");
     }
 
     fn rnd(s: &mut u64) -> u64 {

@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 208 tests across
+machine-readable JSON output, and stable exit codes. Backed by 209 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -92,12 +92,18 @@ sluice stats     ./repo                         # logical vs stored bytes, dedup
 sluice cat       ./repo snapshot <id>           # decrypted object as JSON (config|snapshot|tree)
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
+sluice restore   ./repo <snapshot> ./out --include '**/*.pdf'        # only matching files (glob)
+sluice restore   ./repo <snapshot> ./out --exclude '**/*.tmp' --exclude cache   # skip matching paths
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
 sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
 ```
 
+`--path` restores a subtree by prefix, while `--include`/`--exclude` select by
+glob against each entry's path relative to the restore root (`**` spans
+directories): with any `--include`, only matching files are written; `--exclude`
+prunes a matching entry, and a matching directory along with its whole subtree.
 `--skip-existing` makes a restore idempotent and resumable: an entry already
 present and matching (for files, same size and mtime) is left untouched, so
 re-running after an interruption only fills the gaps. `--verify` re-reads each
@@ -337,7 +343,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 208 tests
+cargo test     # 209 tests
 ```
 
 ## Caveats
