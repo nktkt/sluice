@@ -382,6 +382,117 @@ fn snapshots_filter_by_host_and_path() {
 }
 
 #[test]
+fn full_lifecycle_backup_copy_forget_prune_restore() {
+    let json = |a: assert_cmd::assert::Assert| -> serde_json::Value {
+        serde_json::from_slice(&a.get_output().stdout).unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let repo2 = dir.path().join("repo2");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("docs/a.txt"), b"version one").unwrap();
+    std::fs::write(src.join("keep.bin"), vec![5u8; 4096]).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&repo2).assert().success();
+
+    // First snapshot, then change/add files and take a second.
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    std::fs::write(src.join("docs/a.txt"), b"version two is longer").unwrap();
+    std::fs::write(src.join("new.txt"), b"added later").unwrap();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    let snaps = json(
+        sluice()
+            .args(["snapshots"])
+            .arg(&repo)
+            .arg("--json")
+            .assert()
+            .success(),
+    );
+    let arr = snaps.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "two snapshots (chronological)");
+    let snap1 = arr[0]["id"].as_str().unwrap().to_string();
+    let snap2 = arr[1]["id"].as_str().unwrap().to_string();
+
+    // Replicate everything to a second repository (re-encrypted under its keys).
+    sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&repo2)
+        .assert()
+        .success();
+
+    // Forget the old snapshot in the source and reclaim its space.
+    sluice()
+        .arg("forget")
+        .arg(&repo)
+        .arg(&snap1[..12])
+        .assert()
+        .success();
+    sluice().arg("prune").arg(&repo).assert().success();
+    sluice().arg("verify").arg(&repo).assert().success();
+
+    // The surviving snapshot still restores byte-identical from the pruned repo.
+    let out = dir.path().join("out");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap2[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(out.join("docs/a.txt")).unwrap(),
+        b"version two is longer"
+    );
+    assert_eq!(std::fs::read(out.join("new.txt")).unwrap(), b"added later");
+    assert_eq!(
+        std::fs::read(out.join("keep.bin")).unwrap(),
+        vec![5u8; 4096]
+    );
+
+    // The copy kept BOTH snapshots; its oldest still restores the original v1
+    // state — recovering a version that was pruned from the source.
+    let snaps2 = json(
+        sluice()
+            .args(["snapshots"])
+            .arg(&repo2)
+            .arg("--json")
+            .assert()
+            .success(),
+    );
+    let arr2 = snaps2.as_array().unwrap();
+    assert_eq!(arr2.len(), 2, "the copy retains both snapshots");
+    let old_in_copy = arr2[0]["id"].as_str().unwrap();
+    let out1 = dir.path().join("out1");
+    sluice()
+        .arg("restore")
+        .arg(&repo2)
+        .arg(&old_in_copy[..12])
+        .arg(&out1)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(out1.join("docs/a.txt")).unwrap(),
+        b"version one"
+    );
+    assert!(!out1.join("new.txt").exists());
+    sluice().arg("verify").arg(&repo2).assert().success();
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
