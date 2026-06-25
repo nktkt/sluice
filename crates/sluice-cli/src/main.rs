@@ -1,9 +1,10 @@
 //! `sluice` — command-line interface for the encrypted, deduplicating backup
 //! and disaster-recovery tool (see `DESIGN.md` §7).
 //!
-//! The passphrase comes from the `SLUICE_PASSWORD` environment variable, or an
-//! interactive no-echo prompt when a terminal is attached. A repository is a
-//! local path or an object-store URL such as `s3://bucket/prefix`.
+//! The passphrase comes from the file named by `SLUICE_PASSWORD_FILE`, else the
+//! `SLUICE_PASSWORD` environment variable, else an interactive no-echo prompt when
+//! a terminal is attached. A repository is a local path or an object-store URL
+//! such as `s3://bucket/prefix`.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -985,9 +986,14 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             json,
         } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
-            // The destination may use a different passphrase.
-            let dest_pass =
-                std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone());
+            // The destination may use a different passphrase: from
+            // SLUICE_DEST_PASSWORD_FILE, then SLUICE_DEST_PASSWORD, else the
+            // source's. Mirrors the SLUICE_PASSWORD/_FILE precedence.
+            let dest_pass = if let Ok(path) = std::env::var("SLUICE_DEST_PASSWORD_FILE") {
+                passphrase_from_file(&path)?
+            } else {
+                std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone())
+            };
             let mut dest =
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
             // Optionally recompress data into the destination at a chosen level.
@@ -2067,15 +2073,31 @@ fn kdf_params() -> KdfParams {
     params
 }
 
-/// Read the passphrase from `SLUICE_PASSWORD`, or prompt with no echo when a
-/// terminal is attached. With `confirm` set (for `init`), it is entered twice.
+/// The passphrase is the first line of the file, with the trailing newline
+/// removed — so the secret need not live in the environment (visible via
+/// `/proc/<pid>/environ`) or be typed interactively in a script.
+fn passphrase_from_file(path: &str) -> Result<String, Box<dyn Error>> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("reading password file {path}: {e}"))?;
+    Ok(contents.lines().next().unwrap_or("").to_string())
+}
+
+/// Read the passphrase: from the file named by `SLUICE_PASSWORD_FILE` if set,
+/// else from `SLUICE_PASSWORD`, else prompt with no echo when a terminal is
+/// attached. With `confirm` set (for `init` at a prompt), it is entered twice.
 fn read_passphrase(confirm: bool) -> Result<String, Box<dyn Error>> {
     use std::io::IsTerminal;
+    if let Ok(path) = std::env::var("SLUICE_PASSWORD_FILE") {
+        return passphrase_from_file(&path);
+    }
     if let Ok(passphrase) = std::env::var("SLUICE_PASSWORD") {
         return Ok(passphrase);
     }
     if !std::io::stdin().is_terminal() {
-        return Err("no passphrase: set SLUICE_PASSWORD or run in a terminal".into());
+        return Err(
+            "no passphrase: set SLUICE_PASSWORD or SLUICE_PASSWORD_FILE, or run in a terminal"
+                .into(),
+        );
     }
     let passphrase = rpassword::prompt_password("Passphrase: ")?;
     if confirm && passphrase != rpassword::prompt_password("Confirm passphrase: ")? {

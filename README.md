@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 252 tests across
+machine-readable JSON output, and stable exit codes. Backed by 253 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -27,11 +27,18 @@ objects. The backend only ever sees ciphertext. It is in the same family as
 
 ## Usage
 
-The passphrase comes from the `SLUICE_PASSWORD` environment variable, or an
-interactive no-echo prompt. A repository is a local path or an object-store URL.
+The passphrase comes from the file named by `SLUICE_PASSWORD_FILE` (its first
+line, trailing newline stripped — keeping the secret out of the environment),
+else the `SLUICE_PASSWORD` environment variable, else an interactive no-echo
+prompt. A repository is a local path or an object-store URL. (`copy`'s
+destination uses `SLUICE_DEST_PASSWORD_FILE`/`SLUICE_DEST_PASSWORD`, falling back
+to the source passphrase.)
 
 ```sh
 export SLUICE_PASSWORD='correct horse battery staple'
+# ...or, keeping it out of the environment:
+printf 'correct horse battery staple' > ~/.sluice-pw && chmod 600 ~/.sluice-pw
+export SLUICE_PASSWORD_FILE=~/.sluice-pw
 ```
 
 ### Create and back up
@@ -412,7 +419,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 252 tests
+cargo test     # 253 tests
 ```
 
 ## Caveats

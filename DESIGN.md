@@ -609,7 +609,9 @@ pack サイズ・object count・アクセスタイミング（high-threat ユー
 > `forget`（keep-last/hourly/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・
 > `--keep-within-hourly/daily/weekly/monthly/yearly`・`--group-by`・`--prune`）/
 > `prune`（`--max-unused`）、`copy`（リポジトリ間、宛先鍵で再封緘、`--compression` で再圧縮）。
-> **横断**: 全 result/変更系コマンドが `--json`、安定 exit code（3/10/11/12/13）、
+> **横断**: 全 result/変更系コマンドが `--json`、パスフレーズ供給は `SLUICE_PASSWORD_FILE`
+> （ファイル先頭行）＞ `SLUICE_PASSWORD` ＞ 対話プロンプト（`copy` 宛先は `SLUICE_DEST_PASSWORD_FILE`/
+> `SLUICE_DEST_PASSWORD`）、安定 exit code（3/10/11/12/13）、
 > backup/restore/verify/copy/prune のインタラクティブ進捗スピナー、読み取り専用 FUSE mount
 > （`sluice mount`、任意 `fuse` feature）、shell completions・man。
 > **未実装の主項目**: 完全並列パイプライン（チャンク毎 CPU 並列は実装済み；**ファイル間の並行処理と

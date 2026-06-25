@@ -554,6 +554,54 @@ fn missing_password_is_an_error() {
 }
 
 #[test]
+fn password_file_is_read_and_newline_stripped() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hi").unwrap();
+    // The passphrase lives in a file, with a trailing newline that must be ignored.
+    let pwfile = dir.path().join("pw");
+    std::fs::write(&pwfile, "secret-from-file\n").unwrap();
+
+    // A command authenticated only by SLUICE_PASSWORD_FILE (no SLUICE_PASSWORD).
+    let by_file = || {
+        let mut cmd = Command::cargo_bin("sluice").unwrap();
+        cmd.env_remove("SLUICE_PASSWORD")
+            .env("SLUICE_KDF_MEMORY_KIB", "16")
+            .env("SLUICE_KDF_PASSES", "1")
+            .env("SLUICE_PASSWORD_FILE", &pwfile);
+        cmd
+    };
+    by_file().arg("init").arg(&repo).assert().success();
+    by_file()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // The repository opens with the *newline-stripped* passphrase passed directly,
+    // proving the file was read and trimmed correctly.
+    let mut direct = Command::cargo_bin("sluice").unwrap();
+    direct
+        .env_remove("SLUICE_PASSWORD_FILE")
+        .env("SLUICE_KDF_MEMORY_KIB", "16")
+        .env("SLUICE_KDF_PASSES", "1")
+        .env("SLUICE_PASSWORD", "secret-from-file");
+    direct.arg("snapshots").arg(&repo).assert().success();
+
+    // A wrong passphrase is still rejected (exit 11).
+    let mut wrong = Command::cargo_bin("sluice").unwrap();
+    wrong
+        .env_remove("SLUICE_PASSWORD_FILE")
+        .env("SLUICE_KDF_MEMORY_KIB", "16")
+        .env("SLUICE_KDF_PASSES", "1")
+        .env("SLUICE_PASSWORD", "not-it");
+    wrong.arg("snapshots").arg(&repo).assert().code(11);
+}
+
+#[test]
 fn info_shows_repository_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
