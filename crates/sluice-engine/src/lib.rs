@@ -5521,6 +5521,74 @@ mod tests {
         assert_eq!(collect_files(out.path()), want);
     }
 
+    /// An offsite copy is often interrupted by a network failure. A copy that
+    /// "crashes" committing its snapshot in the destination must leave the
+    /// destination's existing snapshots intact and consistent, and a later re-copy
+    /// must succeed (idempotent recovery) — the same snapshot-written-last property
+    /// the backup path guarantees, exercised through copy.
+    #[tokio::test]
+    async fn copy_crash_before_commit_keeps_destination_consistent() {
+        use std::sync::Arc;
+        let src_mem = Arc::new(MemoryBackend::new());
+        let dst_mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+
+        // Two source snapshots capturing different states.
+        std::fs::write(src.path().join("f"), b"state A").unwrap();
+        let mut srcrepo = Repository::init(src_mem.clone(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap_a = backup(&mut srcrepo, src.path()).await.unwrap();
+        let want_a = collect_files(src.path());
+        std::fs::write(src.path().join("f"), b"state B is longer").unwrap();
+        let snap_b = backup(&mut srcrepo, src.path()).await.unwrap();
+        let want_b = collect_files(src.path());
+
+        // Snapshot A copies into the destination cleanly.
+        let copy_a = {
+            let mut dst = Repository::init(dst_mem.clone(), b"dpw", fast())
+                .await
+                .unwrap();
+            copy_snapshot(&srcrepo, &mut dst, &snap_a).await.unwrap()
+        };
+
+        // Snapshot B's copy writes its data but "crashes" committing the snapshot.
+        {
+            let fault = FaultBackend {
+                inner: dst_mem.clone(),
+                fail_on: FileType::Snapshot,
+            };
+            let mut dst = Repository::open(fault, b"dpw").await.unwrap();
+            assert!(
+                copy_snapshot(&srcrepo, &mut dst, &snap_b).await.is_err(),
+                "the interrupted copy must fail"
+            );
+        }
+
+        // The destination still holds only copy A; it verifies and restores, the
+        // orphaned B data notwithstanding.
+        {
+            let dst = Repository::open(dst_mem.clone(), b"dpw").await.unwrap();
+            assert_eq!(dst.list_snapshots().await.unwrap(), vec![copy_a]);
+            assert!(verify(&dst).await.is_ok());
+            let out = tempfile::tempdir().unwrap();
+            restore(&dst, &copy_a, out.path()).await.unwrap();
+            assert_eq!(collect_files(out.path()), want_a);
+        }
+
+        // Re-copying B succeeds (reusing the orphaned blobs), and both restore.
+        {
+            let mut dst = Repository::open(dst_mem.clone(), b"dpw").await.unwrap();
+            let copy_b = copy_snapshot(&srcrepo, &mut dst, &snap_b).await.unwrap();
+            let out_b = tempfile::tempdir().unwrap();
+            restore(&dst, &copy_b, out_b.path()).await.unwrap();
+            assert_eq!(collect_files(out_b.path()), want_b);
+            let out_a = tempfile::tempdir().unwrap();
+            restore(&dst, &copy_a, out_a.path()).await.unwrap();
+            assert_eq!(collect_files(out_a.path()), want_a);
+        }
+    }
+
     /// A backend that flips a byte in reads of a chosen FileType (optionally only
     /// one specific id), to simulate silent on-disk corruption (bit rot).
     struct CorruptBackend {
