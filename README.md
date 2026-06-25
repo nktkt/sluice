@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 290 tests across
+machine-readable JSON output, and stable exit codes. Backed by 291 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -330,6 +330,7 @@ sluice copy ./repo s3://my-bucket/backups --tag prod    # only snapshots tagged 
 sluice copy ./repo s3://my-bucket/backups --host db1    # only snapshots from host db1
 sluice copy ./repo s3://my-bucket/backups --last 7      # only the 7 most recent
 sluice copy ./repo s3://my-bucket/backups --tag prod --dry-run   # preview the selection, copy nothing
+sluice copy ./repo s3://my-bucket/backups --verify      # re-read & authenticate the copy after writing
 sluice copy ./repo s3://my-bucket/backups --json        # report new destination ids as JSON
 sluice copy ./repo /mnt/cold/archive --compression 19   # recompress into the destination at level 19
 ```
@@ -342,7 +343,11 @@ all that are given) and cannot be used together with an explicit snapshot id.
 `--dry-run` lists the snapshots the selection would copy without writing to (or
 even opening) the destination — a cheap check before a bandwidth-heavy offsite
 run. It reports source ids; the re-encrypted destination ids only exist once the
-data is actually copied.
+data is actually copied. `--verify` re-reads and authenticates every copied
+snapshot in the destination once the copy finishes, so a scripted offsite job
+fails (exit 13) rather than silently trusting a truncated or corrupt upload —
+most worthwhile for an object-store destination, where it confirms the write is
+readable back.
 
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
 source's). Re-running copies only what is missing. Like backup, restore and
@@ -530,7 +535,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 290 tests
+cargo test     # 291 tests
 ```
 
 ## Caveats

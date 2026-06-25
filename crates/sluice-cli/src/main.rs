@@ -223,6 +223,12 @@ enum Command {
         /// contacting) the destination. Honors --snapshot/--tag/--host/--path.
         #[arg(long)]
         dry_run: bool,
+        /// After copying, re-read every copied snapshot in the destination and
+        /// authenticate it, confirming the offsite copy landed intact (exits 13
+        /// if not). Doubles the destination read I/O; most useful for object
+        /// stores.
+        #[arg(long)]
+        verify: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1105,6 +1111,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             last,
             compression,
             dry_run,
+            verify,
             json,
         } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
@@ -1206,28 +1213,43 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 if spinner.is_some() { Some(&tick) } else { None };
             // Each new id is the snapshot's re-encrypted id in the destination,
             // which differs from the source id (copy re-seals under dest keys).
-            let new_ids: Vec<String> =
-                copy_snapshots_with_progress(&source, &mut dest, &to_copy, progress)
-                    .await?
-                    .iter()
-                    .map(|i| i.to_string())
-                    .collect();
+            let copied =
+                copy_snapshots_with_progress(&source, &mut dest, &to_copy, progress).await?;
             if let Some(pb) = &spinner {
                 pb.finish_and_clear();
             }
+            // --verify re-reads every copied snapshot in the destination and
+            // authenticates it, so a script knows the offsite copy is intact
+            // before relying on it. A failure propagates as exit code 13.
+            if verify {
+                for id in &copied {
+                    verify_with_progress(
+                        &dest,
+                        VerifyOptions {
+                            only: Some(*id),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await?;
+                }
+            }
+            let new_ids: Vec<String> = copied.iter().map(|i| i.to_string()).collect();
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "copied": new_ids.len(),
                         "snapshots": new_ids,
+                        "verified": verify,
                     }))?
                 );
             } else if single {
                 // A single-snapshot copy prints the new destination id.
                 println!("{}", new_ids[0]);
             } else {
-                println!("copied {} snapshot(s)", new_ids.len());
+                let suffix = if verify { " (verified)" } else { "" };
+                println!("copied {} snapshot(s){suffix}", new_ids.len());
             }
         }
         Command::Snapshots {

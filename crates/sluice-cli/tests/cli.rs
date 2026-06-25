@@ -3292,3 +3292,45 @@ fn verify_ignore_errors_scans_and_reports_all_damage() {
     assert_eq!(damaged[0]["path"], "a");
     assert_eq!(damaged[0]["bad_blobs"], 1);
 }
+
+#[test]
+fn copy_verify_confirms_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hello").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // copy --verify copies and authenticates the destination in one step.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--verify", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    assert_eq!(v["copied"], 1);
+    assert_eq!(v["verified"], true);
+
+    // The verified destination restores faithfully.
+    let snap = v["snapshots"][0].as_str().unwrap().to_string();
+    let out = dir.path().join("out");
+    sluice()
+        .arg("restore")
+        .arg(&dest)
+        .arg(&snap)
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f")).unwrap(), b"hello");
+}
