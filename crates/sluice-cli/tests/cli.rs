@@ -263,6 +263,35 @@ fn key_list_marks_the_active_key() {
 }
 
 #[test]
+fn completions_generate_without_a_passphrase() {
+    // No SLUICE_PASSWORD set: completion generation must not prompt or require it.
+    let out = Command::cargo_bin("sluice")
+        .unwrap()
+        .args(["completions", "bash"])
+        .assert()
+        .success();
+    let script = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        script.contains("sluice"),
+        "the bash completion script names the binary"
+    );
+
+    // Another supported shell also works.
+    Command::cargo_bin("sluice")
+        .unwrap()
+        .args(["completions", "zsh"])
+        .assert()
+        .success();
+
+    // An unknown shell is rejected by the argument parser.
+    Command::cargo_bin("sluice")
+        .unwrap()
+        .args(["completions", "nonsense-shell"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -13,7 +13,7 @@ use std::sync::Arc;
 #[cfg(feature = "fuse")]
 mod mount;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
@@ -328,6 +328,11 @@ enum Command {
         /// An existing empty directory to mount the snapshot at.
         mountpoint: PathBuf,
     },
+    /// Print a shell completion script to stdout (bash, zsh, fish, ...).
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
 }
 
 /// How `forget` partitions snapshots before applying retention.
@@ -433,6 +438,16 @@ fn exit_code(error: &(dyn Error + 'static)) -> i32 {
 #[tokio::main]
 async fn run() -> Result<i32, Box<dyn Error>> {
     let cli = Cli::parse();
+    // Generating completions needs neither a repository nor a passphrase.
+    if let Command::Completions { shell } = &cli.command {
+        clap_complete::generate(
+            *shell,
+            &mut Cli::command(),
+            "sluice",
+            &mut std::io::stdout(),
+        );
+        return Ok(0);
+    }
     let confirm = matches!(cli.command, Command::Init { .. });
     let passphrase = read_passphrase(confirm)?;
     let pw = passphrase.as_bytes();
@@ -1332,6 +1347,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 );
             }
         }
+        // Handled before the passphrase prompt above.
+        Command::Completions { .. } => unreachable!(),
     }
     Ok(exit)
 }

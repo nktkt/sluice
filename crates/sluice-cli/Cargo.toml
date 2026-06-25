@@ -19,6 +19,7 @@ sluice-engine = { path = "../sluice-engine" }
 sluice-repo = { path = "../sluice-repo" }
 sluice-store = { path = "../sluice-store" }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 tokio = { workspace = true }
 rpassword = { workspace = true }
 object_store = { workspace = true }
