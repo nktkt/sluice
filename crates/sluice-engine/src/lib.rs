@@ -614,6 +614,31 @@ pub async fn copy_snapshot_with_progress<S: StorageBackend, D: StorageBackend>(
     result
 }
 
+/// Copy the given `snapshots` from `src` into `dst` (see [`copy_snapshot`]),
+/// returning the new ids in `dst`. Like [`copy_all`] but limited to an explicit
+/// subset — used to mirror a filtered selection (e.g. by tag or host) offsite.
+pub async fn copy_snapshots<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    snapshots: &[Id],
+) -> Result<Vec<Id>> {
+    copy_snapshots_with_progress(src, dst, snapshots, None).await
+}
+
+/// Like [`copy_snapshots`], invoking `progress` (if any) once per copied blob.
+pub async fn copy_snapshots_with_progress<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    snapshots: &[Id],
+    progress: Option<CopyProgressFn<'_>>,
+) -> Result<Vec<Id>> {
+    let mut ids = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        ids.push(copy_snapshot_with_progress(src, dst, snapshot, progress).await?);
+    }
+    Ok(ids)
+}
+
 /// Copy every snapshot from `src` into `dst` (see [`copy_snapshot`]), returning
 /// the new ids in `dst`. Re-running is safe: a snapshot already copied commits
 /// to the same id and is a no-op, and shared blobs are deduplicated in `dst`.
@@ -630,11 +655,8 @@ pub async fn copy_all_with_progress<S: StorageBackend, D: StorageBackend>(
     dst: &mut Repository<D>,
     progress: Option<CopyProgressFn<'_>>,
 ) -> Result<Vec<Id>> {
-    let mut ids = Vec::new();
-    for snapshot in src.list_snapshots().await? {
-        ids.push(copy_snapshot_with_progress(src, dst, &snapshot, progress).await?);
-    }
-    Ok(ids)
+    let all = src.list_snapshots().await?;
+    copy_snapshots_with_progress(src, dst, &all, progress).await
 }
 
 /// The body of [`copy_snapshot`], run while holding `dst`'s shared lock.
@@ -6952,6 +6974,42 @@ mod tests {
                 "copy metadata mismatch for seed {seed}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn copy_snapshots_copies_only_the_listed_subset() {
+        // Three independent snapshots in the source.
+        let mut src = Repository::init(MemoryBackend::new(), b"src", fast())
+            .await
+            .unwrap();
+        let items: [(&str, &[u8]); 3] =
+            [("one", b"first"), ("two", b"second"), ("three", b"third")];
+        let mut ids = Vec::new();
+        for (name, body) in items {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(name), body).unwrap();
+            ids.push(backup(&mut src, dir.path()).await.unwrap());
+        }
+
+        // Copy only the first and third into a destination with independent keys.
+        let mut dst = Repository::init(MemoryBackend::new(), b"dst", fast())
+            .await
+            .unwrap();
+        let subset = [ids[0], ids[2]];
+        let new_ids = copy_snapshots(&src, &mut dst, &subset).await.unwrap();
+
+        // The destination holds exactly those two snapshots — the second was
+        // never referenced and is absent.
+        assert_eq!(new_ids.len(), 2);
+        let landed: std::collections::HashSet<_> =
+            dst.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(landed.len(), 2, "only the listed subset is copied");
+        assert!(new_ids.iter().all(|id| landed.contains(id)));
+
+        // And a copied snapshot still restores its file byte-for-byte.
+        let out = tempfile::tempdir().unwrap();
+        restore(&dst, &new_ids[0], out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("one")).unwrap(), b"first");
     }
 
     #[tokio::test]

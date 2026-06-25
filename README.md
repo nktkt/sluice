@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 274 tests across
+machine-readable JSON output, and stable exit codes. Backed by 276 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -291,9 +291,16 @@ deduplication.
 ```sh
 sluice copy ./repo s3://my-bucket/backups <snapshot>   # one snapshot
 sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempotent)
+sluice copy ./repo s3://my-bucket/backups --tag prod    # only snapshots tagged 'prod'
+sluice copy ./repo s3://my-bucket/backups --host db1    # only snapshots from host db1
 sluice copy ./repo s3://my-bucket/backups --json        # report new destination ids as JSON
 sluice copy ./repo /mnt/cold/archive --compression 19   # recompress into the destination at level 19
 ```
+
+Omit `<snapshot>` to copy every snapshot, or narrow the set with `--tag`, `--host`
+and/or `--path` (the same selectors `snapshots` lists by) — e.g. mirror only your
+production-tagged snapshots offsite. The filters combine (a snapshot must match
+all that are given) and cannot be used together with an explicit snapshot id.
 
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
 source's). Re-running copies only what is missing. Like backup, restore and
@@ -481,7 +488,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 274 tests
+cargo test     # 276 tests
 ```
 
 ## Caveats

@@ -22,8 +22,8 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
-    check_only, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
-    forget_tagged, forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
+    check_only, copy_snapshots_with_progress, diff, dump, find, forget, forget_tagged,
+    forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
     prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
     verify_with_progress,
 };
@@ -194,8 +194,18 @@ enum Command {
         src: String,
         /// Destination repository path or object-store URL.
         dst: String,
-        /// Snapshot id to copy (a unique hex prefix); omit to copy every snapshot.
+        /// Snapshot id to copy (a unique hex prefix). Omit to copy every snapshot,
+        /// or narrow the selection with --tag/--host/--path.
         snapshot: Option<String>,
+        /// Copy only snapshots with this tag (cannot be combined with a snapshot id).
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Copy only snapshots taken on this host.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Copy only snapshots that backed up this source path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
         /// Recompress data into the destination at this zstd level (1..22) instead
         /// of the destination repository's default — e.g. copy to a cold archive
         /// at level 19. Dedup within the destination is unaffected.
@@ -1050,6 +1060,9 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             src,
             dst,
             snapshot,
+            tag,
+            host,
+            path,
             compression,
             json,
         } => {
@@ -1065,11 +1078,26 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
             // Optionally recompress data into the destination at a chosen level.
             dest.set_data_compression(compression);
-            let target_id = match &snapshot {
-                Some(s) => Some(resolve_snapshot(&source, s).await?),
-                None => None,
+            // Select the source snapshots to copy: a single id, a tag/host/path
+            // filtered subset, or — with no selector — every snapshot.
+            if snapshot.is_some() && (tag.is_some() || host.is_some() || path.is_some()) {
+                return Err("a snapshot id cannot be combined with --tag/--host/--path".into());
+            }
+            let single = snapshot.is_some();
+            let to_copy = match &snapshot {
+                Some(s) => vec![resolve_snapshot(&source, s).await?],
+                None => {
+                    let mut ids = Vec::new();
+                    for id in source.list_snapshots().await? {
+                        let snap = source.load_snapshot(&id).await?;
+                        if snapshot_matches(&snap, tag.as_deref(), host.as_deref(), path.as_deref())
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    ids
+                }
             };
-            let single = target_id.is_some();
             // A live spinner on a terminal (offsite copies can move a lot of
             // data); hidden when piped or emitting JSON.
             let spinner = (!json && std::io::stderr().is_terminal()).then(|| {
@@ -1089,18 +1117,12 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 if spinner.is_some() { Some(&tick) } else { None };
             // Each new id is the snapshot's re-encrypted id in the destination,
             // which differs from the source id (copy re-seals under dest keys).
-            let new_ids: Vec<String> = match target_id {
-                Some(id) => vec![
-                    copy_snapshot_with_progress(&source, &mut dest, &id, progress)
-                        .await?
-                        .to_string(),
-                ],
-                None => copy_all_with_progress(&source, &mut dest, progress)
+            let new_ids: Vec<String> =
+                copy_snapshots_with_progress(&source, &mut dest, &to_copy, progress)
                     .await?
                     .iter()
                     .map(|i| i.to_string())
-                    .collect(),
-            };
+                    .collect();
             if let Some(pb) = &spinner {
                 pb.finish_and_clear();
             }
@@ -1133,24 +1155,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             let mut snaps = Vec::new();
             for id in repository.list_snapshots().await? {
                 let snap = repository.load_snapshot(&id).await?;
-                if let Some(tag) = &tag {
-                    if !snap.tags.iter().any(|t| t == tag) {
-                        continue;
-                    }
-                }
-                if let Some(host) = &host {
-                    if &snap.hostname != host {
-                        continue;
-                    }
-                }
-                if let Some(path) = &path {
-                    if !snap
-                        .paths
-                        .iter()
-                        .any(|p| String::from_utf8_lossy(p) == *path)
-                    {
-                        continue;
-                    }
+                if !snapshot_matches(&snap, tag.as_deref(), host.as_deref(), path.as_deref()) {
+                    continue;
                 }
                 snaps.push((id, snap));
             }
@@ -2169,6 +2175,36 @@ async fn backend(repo: &str, create: bool) -> Result<Arc<dyn StorageBackend>, Bo
     } else {
         Ok(Arc::new(LocalBackend::open(repo)))
     }
+}
+
+/// True if `snap` passes the optional tag/host/path filters; a `None` filter
+/// matches everything. Shared by the `snapshots` and `copy` selectors.
+fn snapshot_matches(
+    snap: &sluice_core::Snapshot,
+    tag: Option<&str>,
+    host: Option<&str>,
+    path: Option<&str>,
+) -> bool {
+    if let Some(tag) = tag {
+        if !snap.tags.iter().any(|t| t == tag) {
+            return false;
+        }
+    }
+    if let Some(host) = host {
+        if snap.hostname != host {
+            return false;
+        }
+    }
+    if let Some(path) = path {
+        if !snap
+            .paths
+            .iter()
+            .any(|p| String::from_utf8_lossy(p) == path)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve a full id or a unique hex prefix to a snapshot id.

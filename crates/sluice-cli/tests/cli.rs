@@ -1298,6 +1298,69 @@ fn copy_emits_json() {
 }
 
 #[test]
+fn copy_tag_filter_copies_only_matching_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("fa.txt"), b"alpha").unwrap();
+    std::fs::write(b.join("fb.txt"), b"bravo").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    // Two snapshots distinguished only by their tags.
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .args(["--tag", "keep"])
+        .assert()
+        .success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&b)
+        .args(["--tag", "scratch"])
+        .assert()
+        .success();
+
+    // Mirror only the `keep`-tagged snapshot offsite.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--tag", "keep", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["copied"], 1, "only the tagged snapshot is copied");
+
+    // The destination holds exactly that one snapshot, still tagged `keep`.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&dest)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("JSON");
+    let snaps = snaps.as_array().unwrap();
+    assert_eq!(snaps.len(), 1, "the scratch snapshot was not mirrored");
+    assert_eq!(snaps[0]["tags"][0], "keep");
+
+    // A snapshot id and a filter together are rejected as ambiguous.
+    sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["0000000000", "--tag", "keep"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn copy_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
