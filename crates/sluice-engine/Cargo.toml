@@ -26,3 +26,5 @@ rustix = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }

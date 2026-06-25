@@ -4797,6 +4797,87 @@ mod tests {
         }
     }
 
+    /// A backend that wraps a shared `MemoryBackend` and fails every `put` of a
+    /// chosen `FileType`, to simulate a crash that interrupts a backup before it
+    /// commits its snapshot.
+    struct FaultBackend {
+        inner: std::sync::Arc<MemoryBackend>,
+        fail_on: FileType,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for FaultBackend {
+        async fn get(&self, ty: FileType, id: &Id) -> sluice_store::Result<bytes::Bytes> {
+            self.inner.get(ty, id).await
+        }
+        async fn put(&self, ty: FileType, id: &Id, data: bytes::Bytes) -> sluice_store::Result<()> {
+            if ty == self.fail_on {
+                return Err(sluice_store::StoreError::Backend("injected crash".into()));
+            }
+            self.inner.put(ty, id, data).await
+        }
+        async fn exists(&self, ty: FileType, id: &Id) -> sluice_store::Result<bool> {
+            self.inner.exists(ty, id).await
+        }
+        async fn list(&self, ty: FileType) -> sluice_store::Result<Vec<Id>> {
+            self.inner.list(ty).await
+        }
+        async fn remove(&self, ty: FileType, id: &Id) -> sluice_store::Result<()> {
+            self.inner.remove(ty, id).await
+        }
+        async fn size(&self, ty: FileType, id: &Id) -> sluice_store::Result<u64> {
+            self.inner.size(ty, id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn crash_before_commit_keeps_existing_snapshots_intact() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+
+        // A first backup completes normally.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep"), b"durable data").unwrap();
+        let snap1 = {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap()
+        };
+
+        // A second backup writes its data but "crashes" committing the snapshot
+        // (the snapshot is always written last, after the data it references).
+        std::fs::write(src.path().join("more"), b"data that will be orphaned").unwrap();
+        let interrupted = {
+            let fault = FaultBackend {
+                inner: mem.clone(),
+                fail_on: FileType::Snapshot,
+            };
+            let mut repo = Repository::open(fault, b"pw").await.unwrap();
+            backup(&mut repo, src.path()).await
+        };
+        assert!(interrupted.is_err(), "the interrupted backup must fail");
+
+        // Reopen normally: the first snapshot is the only one, it still restores
+        // byte-identical, and verify passes despite the orphaned data.
+        let mut repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap1]);
+        assert!(verify(&repo).await.is_ok());
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap1, out.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("keep")).unwrap(),
+            b"durable data"
+        );
+        assert!(
+            !out.path().join("more").exists(),
+            "the uncommitted backup's new file is absent"
+        );
+
+        // The orphaned data is reclaimable, and pruning leaves the survivor intact.
+        prune(&mut repo, false, 0).await.unwrap();
+        assert!(verify(&repo).await.is_ok());
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap1]);
+    }
+
     #[tokio::test]
     async fn restore_subpath_restores_only_a_subtree() {
         let src = tempfile::tempdir().unwrap();

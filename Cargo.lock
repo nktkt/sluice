@@ -1957,6 +1957,8 @@ dependencies = [
 name = "sluice-engine"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "filetime",
  "futures",
  "globset",
