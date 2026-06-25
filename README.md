@@ -171,6 +171,18 @@ sluice unlock        ./repo   # clear advisory locks left by an interrupted run
 sluice rebuild-index ./repo   # rescan packs to repair a damaged/stale index
 ```
 
+### Browse a snapshot (FUSE mount)
+
+Built with the optional `fuse` feature (`cargo build --features fuse`, which
+links libfuse), `sluice mount` exposes a snapshot as a **read-only** filesystem,
+so you can `ls`, `cat`, and copy individual files without a full restore. File
+contents are fetched and decrypted lazily as you read them.
+
+```sh
+sluice mount ./repo <snapshot> /mnt/snap   # then browse /mnt/snap; unmount with:
+fusermount -u /mnt/snap                     # (or Ctrl-C in the mount terminal)
+```
+
 ### Replicate to another repository
 
 `copy` re-encrypts a snapshot under the destination's keys, so the two
@@ -295,15 +307,17 @@ concurrency model, CLI surface, and threat model — lives in
 - **M8** — streaming & spot-checks: memory-bounded streaming backup/restore with
   ranged reads, sparse-file skipping, `backup --stdin`, `--exclude-if-present` /
   `--exclude-caches`, `init --compression`, `verify --sample`, on-disk stat cache
-  (`backup --cache`) — ✅
-- **M9** — *planned*: parallel backup pipeline, FUSE mount, Windows support,
-  optional Reed-Solomon self-heal (`verify --repair`)
+  (`backup --cache`), read-only FUSE mount (`mount`, `fuse` feature) — ✅
+- **M9** — *planned*: parallel backup pipeline, Windows support, optional
+  Reed-Solomon self-heal (`verify --repair`)
 
 ## Building
 
 Requires a recent stable Rust toolchain and a C compiler (used to build the
 bundled `zstd`). TLS for object-storage backends uses `rustls`, so no OpenSSL or
-other system libraries are required.
+other system libraries are required. The optional `fuse` feature (`sluice mount`)
+is the one exception — building it needs `libfuse` (e.g. `libfuse3-dev`); it is
+off by default.
 
 ```sh
 cargo build

@@ -10,6 +10,9 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "fuse")]
+mod mount;
+
 use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
@@ -315,6 +318,15 @@ enum Command {
     Cat {
         #[command(subcommand)]
         object: CatObject,
+    },
+    /// Mount a snapshot as a read-only filesystem (needs the `fuse` build feature).
+    Mount {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Snapshot id (a unique hex prefix is accepted).
+        snapshot: String,
+        /// An existing empty directory to mount the snapshot at.
+        mountpoint: PathBuf,
     },
 }
 
@@ -1287,6 +1299,38 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 }
             };
             println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        Command::Mount {
+            repo,
+            snapshot,
+            mountpoint,
+        } => {
+            #[cfg(feature = "fuse")]
+            {
+                let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                let snap_id = resolve_snapshot(&repository, &snapshot).await?;
+                eprintln!(
+                    "mounting snapshot at {} — unmount with `fusermount -u {}` or Ctrl-C",
+                    mountpoint.display(),
+                    mountpoint.display()
+                );
+                // The FUSE session blocks and builds its own runtime, so run it on
+                // a thread with no ambient Tokio runtime; wait for unmount off the
+                // async worker via spawn_blocking.
+                let session =
+                    std::thread::spawn(move || mount::run_mount(repository, snap_id, &mountpoint));
+                tokio::task::spawn_blocking(move || session.join())
+                    .await
+                    .map_err(|e| format!("mount supervisor failed: {e}"))?
+                    .map_err(|_| "mount thread panicked")??;
+            }
+            #[cfg(not(feature = "fuse"))]
+            {
+                let _ = (&repo, &snapshot, &mountpoint);
+                return Err(
+                    "this build has no FUSE support; rebuild with `--features fuse`".into(),
+                );
+            }
         }
     }
     Ok(exit)

@@ -24,6 +24,13 @@ rpassword = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
 serde_json = { workspace = true }
+libc = { workspace = true, optional = true }
+fuser = { workspace = true, optional = true }
+
+[features]
+# Mount a snapshot as a read-only filesystem (`sluice mount`). Off by default so
+# the standard build needs no system libraries; enabling it links libfuse.
+fuse = ["dep:fuser", "dep:libc"]
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
