@@ -307,9 +307,13 @@ impl<B: StorageBackend> Repository<B> {
         live: &HashSet<Id>,
         dry_run: bool,
         max_unused: u8,
+        progress: Option<&(dyn Fn() + Sync)>,
     ) -> Result<PruneReport> {
         let mut report = PruneReport::default();
         for pack_id in self.backend.list(FileType::Pack).await? {
+            if let Some(p) = progress {
+                p();
+            }
             let bytes = self.backend.get(FileType::Pack, &pack_id).await?;
             let reader = PackReader::parse(&bytes)?;
             let entries: Vec<BlobEntry> = reader.entries().to_vec();
@@ -1237,7 +1241,10 @@ mod tests {
         repo.flush().await.unwrap();
 
         // Only `keep` is live, so the shared pack is repacked into a fresh one.
-        let report = repo.sweep(&HashSet::from([keep]), false, 0).await.unwrap();
+        let report = repo
+            .sweep(&HashSet::from([keep]), false, 0, None)
+            .await
+            .unwrap();
         assert_eq!(report.repacked, 1);
 
         // The old pack's index segment is gone and the new pack's is present.

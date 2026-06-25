@@ -22,8 +22,8 @@ use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
     check, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
-    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
-    restore_filtered, retag, verify_with_progress,
+    forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
+    prune_excluding_with_progress, rebuild_index, restore_filtered, retag, verify_with_progress,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -1102,7 +1102,34 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             json,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let report = prune(&mut repository, dry_run, max_unused).await?;
+            // A live spinner on a terminal (repacking can rewrite a lot of data);
+            // hidden when piped, with --json, or on a dry run.
+            let spinner = (!json && !dry_run && std::io::stderr().is_terminal()).then(|| {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner:.green} {pos} packs swept").unwrap(),
+                );
+                pb.enable_steady_tick(std::time::Duration::from_millis(120));
+                pb
+            });
+            let tick = || {
+                if let Some(pb) = &spinner {
+                    pb.inc(1);
+                }
+            };
+            let progress: Option<sluice_engine::PruneProgressFn> =
+                if spinner.is_some() { Some(&tick) } else { None };
+            let report = prune_excluding_with_progress(
+                &mut repository,
+                dry_run,
+                &std::collections::HashSet::new(),
+                max_unused,
+                progress,
+            )
+            .await?;
+            if let Some(pb) = &spinner {
+                pb.finish_and_clear();
+            }
             if json {
                 println!(
                     "{}",

@@ -160,7 +160,9 @@ sluice prune ./repo --dry-run        # report reclaimable bytes without touching
 ```
 
 `forget` only removes snapshots; `prune` reclaims the now-unreferenced storage,
-deleting fully-dead packs and repacking partially-dead ones to recover space.
+deleting fully-dead packs and repacking partially-dead ones to recover space. It,
+too, shows a live spinner on a terminal (hidden when piped or with `--json`), so
+all of backup, restore, verify, copy and prune report progress interactively.
 
 ### Keys (passphrases)
 

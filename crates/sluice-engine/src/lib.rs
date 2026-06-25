@@ -1559,6 +1559,10 @@ pub async fn prune<B: StorageBackend>(
     prune_excluding(repo, dry_run, &HashSet::new(), max_unused).await
 }
 
+/// A callback invoked once per pack as it is examined during a prune sweep, for
+/// progress display.
+pub type PruneProgressFn<'a> = &'a (dyn Fn() + Sync);
+
 /// Like [`prune`], but treat the snapshots in `excluded` as already gone — their
 /// blobs are not marked live. This lets a dry run preview the reclamation of a
 /// pending `forget` (the snapshots it would remove) without removing them first.
@@ -1568,13 +1572,24 @@ pub async fn prune_excluding<B: StorageBackend>(
     excluded: &HashSet<Id>,
     max_unused: u8,
 ) -> Result<PruneReport> {
+    prune_excluding_with_progress(repo, dry_run, excluded, max_unused, None).await
+}
+
+/// Like [`prune_excluding`], invoking `progress` (if any) once per pack swept.
+pub async fn prune_excluding_with_progress<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    dry_run: bool,
+    excluded: &HashSet<Id>,
+    max_unused: u8,
+    progress: Option<PruneProgressFn<'_>>,
+) -> Result<PruneReport> {
     // A dry run only reads, so it needs no lock; a real prune takes the exclusive
     // lock that guards deletion against concurrent operations (`DESIGN.md` §8).
     if dry_run {
-        return prune_marked(repo, true, excluded, max_unused).await;
+        return prune_marked(repo, true, excluded, max_unused, progress).await;
     }
     let lock = repo.acquire_lock(true).await?;
-    let result = prune_marked(repo, false, excluded, max_unused).await;
+    let result = prune_marked(repo, false, excluded, max_unused, progress).await;
     let _ = repo.release_lock(&lock).await;
     result
 }
@@ -1586,6 +1601,7 @@ async fn prune_marked<B: StorageBackend>(
     dry_run: bool,
     excluded: &HashSet<Id>,
     max_unused: u8,
+    progress: Option<PruneProgressFn<'_>>,
 ) -> Result<PruneReport> {
     let mut live: HashSet<Id> = HashSet::new();
     for snapshot in repo.list_snapshots().await? {
@@ -1595,7 +1611,7 @@ async fn prune_marked<B: StorageBackend>(
         let snap = repo.load_snapshot(&snapshot).await?;
         mark_tree(repo, snap.tree, &mut live).await?;
     }
-    Ok(repo.sweep(&live, dry_run, max_unused).await?)
+    Ok(repo.sweep(&live, dry_run, max_unused, progress).await?)
 }
 
 /// Repair the repository's index segments by rescanning packs (see
