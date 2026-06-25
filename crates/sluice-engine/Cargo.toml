@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 sluice-core = { path = "../sluice-core" }
+sluice-crypto = { path = "../sluice-crypto" }
 sluice-repo = { path = "../sluice-repo" }
 sluice-store = { path = "../sluice-store" }
 thiserror = { workspace = true }
@@ -21,6 +22,5 @@ globset = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-sluice-crypto = { path = "../sluice-crypto" }
 tokio = { workspace = true }
 tempfile = { workspace = true }

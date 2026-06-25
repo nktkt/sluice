@@ -837,8 +837,31 @@ pub struct VerifyReport {
     pub snapshots: usize,
     /// Number of tree objects read and authenticated.
     pub trees: usize,
-    /// Number of content (file chunk) blobs read and authenticated.
+    /// Number of unique content (file chunk) blobs read and authenticated. When
+    /// sampling (see [`VerifyOptions`]) this is the size of the chosen subset.
     pub blobs: usize,
+    /// Total number of unique content blobs referenced by the snapshots. Equals
+    /// `blobs` for a full verify; for a sampled verify it is the denominator.
+    pub total_blobs: usize,
+}
+
+/// Options controlling [`verify_with`].
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOptions {
+    /// Percentage of the unique content blobs to read and authenticate, in
+    /// `1..=100`. Trees are always walked and authenticated in full; only the
+    /// expensive content-blob reads are sampled. A value of `100` reads
+    /// everything; a smaller value trades completeness for speed, so a large
+    /// repository can be spot-checked often and fully verified occasionally.
+    pub sample_percent: u8,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            sample_percent: 100,
+        }
+    }
 }
 
 /// Concurrent content-blob reads during [`verify`].
@@ -850,12 +873,29 @@ const RESTORE_CONCURRENCY: usize = 16;
 /// Verify every snapshot in `repo` by reading and authenticating all reachable
 /// trees and content blobs (a full read-data check; see `DESIGN.md` §5.7).
 ///
-/// The trees are walked and authenticated first (counting them and collecting
-/// the referenced content blobs); the content blobs are then read and
-/// AEAD-authenticated concurrently, which is far faster on a high-latency
-/// (object-store) backend. Returns the counts on success, or an error
-/// identifying a missing or corrupt object.
+/// Equivalent to [`verify_with`] with the default options. Returns the counts
+/// on success, or an error identifying a missing or corrupt object.
 pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyReport> {
+    verify_with(repo, VerifyOptions::default()).await
+}
+
+/// Verify `repo`, optionally reading only a random sample of the content blobs.
+///
+/// The trees are always walked and authenticated in full (this is cheap and
+/// proves the snapshot structure), collecting the set of referenced content
+/// blobs. When `options.sample_percent` is below 100, a uniformly random subset
+/// of that set — at least one blob — is selected; the chosen blobs are then read
+/// and AEAD-authenticated concurrently, which is far faster on a high-latency
+/// (object-store) backend. Sampling lets a large repository be spot-checked
+/// cheaply and often, catching bit-rot probabilistically, while a periodic full
+/// verify still reads everything.
+///
+/// Returns the counts on success, or an error identifying a missing or corrupt
+/// object.
+pub async fn verify_with<B: StorageBackend>(
+    repo: &Repository<B>,
+    options: VerifyOptions,
+) -> Result<VerifyReport> {
     use futures::stream::{StreamExt, TryStreamExt};
 
     let mut report = VerifyReport::default();
@@ -865,13 +905,53 @@ pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyRep
         report.snapshots += 1;
         collect_verify(repo, snap.tree, &mut report, &mut content).await?;
     }
-    // Read and authenticate every referenced content blob concurrently; load_blob
+    report.total_blobs = content.len();
+
+    // Choose which blobs to read: all of them for a full verify, or a uniformly
+    // random subset (at least one) when sampling.
+    let percent = options.sample_percent.clamp(1, 100);
+    let to_read: Vec<Id> = if percent >= 100 {
+        content.into_iter().collect()
+    } else {
+        sample_ids(content.into_iter().collect(), percent)
+    };
+    report.blobs = to_read.len();
+
+    // Read and authenticate each selected content blob concurrently; load_blob
     // checks the AEAD tag, so any corrupt or missing blob surfaces as an error.
-    futures::stream::iter(content.iter().map(|id| repo.load_blob(id)))
+    futures::stream::iter(to_read.iter().map(|id| repo.load_blob(id)))
         .buffer_unordered(VERIFY_CONCURRENCY)
         .try_for_each(|_| async { Ok(()) })
         .await?;
     Ok(report)
+}
+
+/// Select `ceil(len * percent / 100)` ids (at least one when non-empty) from
+/// `ids` uniformly at random, via a partial Fisher-Yates shuffle seeded from the
+/// OS CSPRNG.
+fn sample_ids(mut ids: Vec<Id>, percent: u8) -> Vec<Id> {
+    let n = ids.len();
+    if n == 0 {
+        return ids;
+    }
+    let target = (n * percent as usize).div_ceil(100).clamp(1, n);
+    for i in 0..target {
+        let r = i + random_below(n - i);
+        ids.swap(i, r);
+    }
+    ids.truncate(target);
+    ids
+}
+
+/// A uniform random `usize` in `0..bound` drawn from the OS CSPRNG (`bound >= 1`).
+fn random_below(bound: usize) -> usize {
+    debug_assert!(bound >= 1);
+    if bound <= 1 {
+        return 0;
+    }
+    let mut buf = [0u8; 8];
+    sluice_crypto::fill_random(&mut buf);
+    (u64::from_le_bytes(buf) % bound as u64) as usize
 }
 
 /// Recursively authenticate the tree `tree_id` (counting trees) and collect the
@@ -894,7 +974,6 @@ fn collect_verify<'a, B: StorageBackend>(
                 }
                 EntryKind::File => {
                     for id in &node.content {
-                        report.blobs += 1;
                         content.insert(*id);
                     }
                 }
@@ -2683,6 +2762,68 @@ mod tests {
         assert_eq!(report.snapshots, 1);
         assert!(report.trees >= 2, "root + subdir trees");
         assert!(report.blobs >= 2, "two file chunks");
+        assert_eq!(
+            report.blobs, report.total_blobs,
+            "a full verify reads every unique blob"
+        );
+    }
+
+    #[test]
+    fn sample_ids_picks_the_right_count() {
+        let ids: Vec<Id> = (0..100u8).map(|i| Id::from_bytes([i; 32])).collect();
+        // ceil(100 * pct / 100), at least one, never more than the whole set.
+        assert_eq!(sample_ids(ids.clone(), 10).len(), 10);
+        assert_eq!(sample_ids(ids.clone(), 25).len(), 25);
+        assert_eq!(sample_ids(ids.clone(), 1).len(), 1);
+        assert_eq!(sample_ids(ids.clone(), 100).len(), 100);
+        // A tiny set still yields at least one, and the picks are real members.
+        let three: Vec<Id> = ids[..3].to_vec();
+        let picked = sample_ids(three.clone(), 10);
+        assert_eq!(picked.len(), 1, "ceil(3 * 10/100) == 1");
+        assert!(picked.iter().all(|p| three.contains(p)));
+        assert!(sample_ids(Vec::new(), 50).is_empty());
+    }
+
+    #[tokio::test]
+    async fn sampled_verify_reads_only_a_subset() {
+        let src = tempfile::tempdir().unwrap();
+        // 40 files with distinct content => 40 distinct content blobs.
+        for i in 0..40u32 {
+            std::fs::write(
+                src.path().join(format!("f{i}")),
+                format!("unique-contents-{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+
+        let full = verify(&repo).await.unwrap();
+        assert_eq!(full.blobs, 40);
+        assert_eq!(full.blobs, full.total_blobs);
+
+        // A 25% sample reads ten of the forty, still reporting the true total,
+        // and the reads themselves authenticate (so it returns Ok).
+        let sampled = verify_with(&repo, VerifyOptions { sample_percent: 25 })
+            .await
+            .unwrap();
+        assert_eq!(sampled.total_blobs, 40, "denominator is the full set");
+        assert_eq!(sampled.blobs, 10, "ceil(40 * 25/100) == 10 read");
+        assert_eq!(sampled.snapshots, full.snapshots);
+        assert_eq!(sampled.trees, full.trees, "trees are always fully walked");
+
+        // 100% behaves exactly like the default full verify.
+        let whole = verify_with(
+            &repo,
+            VerifyOptions {
+                sample_percent: 100,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole.blobs, 40);
     }
 
     #[tokio::test]

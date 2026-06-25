@@ -15,9 +15,9 @@ use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
     DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy,
-    backup_sources_with_progress, backup_stdin, check, copy_all, copy_snapshot, diff, dump, find,
-    forget, forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
-    restore_with, retag, verify,
+    VerifyOptions, backup_sources_with_progress, backup_stdin, check, copy_all, copy_snapshot,
+    diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
+    prune_excluding, rebuild_index, restore_with, retag, verify_with,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -147,6 +147,10 @@ enum Command {
     Verify {
         /// Repository path or object-store URL.
         repo: String,
+        /// Read only this percentage (1-100) of content blobs, chosen at random,
+        /// for a fast probabilistic spot-check. Trees are always fully verified.
+        #[arg(long, value_name = "PERCENT")]
+        sample: Option<u8>,
     },
     /// Check structural integrity without reading file data (fast).
     Check {
@@ -687,13 +691,25 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("{new_id}");
             }
         }
-        Command::Verify { repo } => {
+        Command::Verify { repo, sample } => {
+            let options = match sample {
+                Some(p) if (1..=100).contains(&p) => VerifyOptions { sample_percent: p },
+                Some(p) => return Err(format!("--sample must be 1-100, got {p}").into()),
+                None => VerifyOptions::default(),
+            };
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let report = verify(&repository).await?;
-            println!(
-                "ok: {} snapshots, {} trees, {} blobs verified",
-                report.snapshots, report.trees, report.blobs
-            );
+            let report = verify_with(&repository, options).await?;
+            if report.blobs == report.total_blobs {
+                println!(
+                    "ok: {} snapshots, {} trees, {} blobs verified",
+                    report.snapshots, report.trees, report.blobs
+                );
+            } else {
+                println!(
+                    "ok: {} snapshots, {} trees, sampled {} of {} blobs verified",
+                    report.snapshots, report.trees, report.blobs, report.total_blobs
+                );
+            }
         }
         Command::Check { repo } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
