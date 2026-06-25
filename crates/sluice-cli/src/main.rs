@@ -211,6 +211,10 @@ enum Command {
         /// at level 19. Dedup within the destination is unaffected.
         #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=22))]
         compression: Option<i32>,
+        /// List the snapshots that would be copied, without writing to (or even
+        /// contacting) the destination. Honors --snapshot/--tag/--host/--path.
+        #[arg(long)]
+        dry_run: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1064,9 +1068,67 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             host,
             path,
             compression,
+            dry_run,
             json,
         } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
+            // Select the source snapshots to copy: a single id, a tag/host/path
+            // filtered subset, or — with no selector — every snapshot.
+            if snapshot.is_some() && (tag.is_some() || host.is_some() || path.is_some()) {
+                return Err("a snapshot id cannot be combined with --tag/--host/--path".into());
+            }
+            let single = snapshot.is_some();
+            let matched: Vec<(Id, sluice_core::Snapshot)> = match &snapshot {
+                Some(s) => {
+                    let id = resolve_snapshot(&source, s).await?;
+                    let snap = source.load_snapshot(&id).await?;
+                    vec![(id, snap)]
+                }
+                None => {
+                    let mut hits = Vec::new();
+                    for id in source.list_snapshots().await? {
+                        let snap = source.load_snapshot(&id).await?;
+                        if snapshot_matches(&snap, tag.as_deref(), host.as_deref(), path.as_deref())
+                        {
+                            hits.push((id, snap));
+                        }
+                    }
+                    hits
+                }
+            };
+
+            // --dry-run previews the source-side selection without contacting or
+            // writing the destination. It can't show the new destination ids:
+            // copy re-keys each snapshot, so those only exist once the data has
+            // actually been re-sealed under the destination's keys.
+            if dry_run {
+                if json {
+                    let ids: Vec<String> = matched.iter().map(|(id, _)| id.to_string()).collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "would_copy": ids.len(),
+                            "snapshots": ids,
+                        }))?
+                    );
+                } else {
+                    println!("would copy {} snapshot(s)", matched.len());
+                    for (id, snap) in &matched {
+                        let tags = if snap.tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  [{}]", snap.tags.join(","))
+                        };
+                        println!(
+                            "  {}  {}{tags}",
+                            &id.to_string()[..16],
+                            format_utc(snap.time_ns)
+                        );
+                    }
+                }
+                return Ok(0);
+            }
+
             // The destination may use a different passphrase, from the
             // SLUICE_DEST_PASSWORD{_COMMAND,_FILE,} sources; otherwise the
             // source's. Mirrors the SLUICE_PASSWORD precedence.
@@ -1078,26 +1140,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
             // Optionally recompress data into the destination at a chosen level.
             dest.set_data_compression(compression);
-            // Select the source snapshots to copy: a single id, a tag/host/path
-            // filtered subset, or — with no selector — every snapshot.
-            if snapshot.is_some() && (tag.is_some() || host.is_some() || path.is_some()) {
-                return Err("a snapshot id cannot be combined with --tag/--host/--path".into());
-            }
-            let single = snapshot.is_some();
-            let to_copy = match &snapshot {
-                Some(s) => vec![resolve_snapshot(&source, s).await?],
-                None => {
-                    let mut ids = Vec::new();
-                    for id in source.list_snapshots().await? {
-                        let snap = source.load_snapshot(&id).await?;
-                        if snapshot_matches(&snap, tag.as_deref(), host.as_deref(), path.as_deref())
-                        {
-                            ids.push(id);
-                        }
-                    }
-                    ids
-                }
-            };
+            let to_copy: Vec<Id> = matched.into_iter().map(|(id, _)| id).collect();
             // A live spinner on a terminal (offsite copies can move a lot of
             // data); hidden when piped or emitting JSON.
             let spinner = (!json && std::io::stderr().is_terminal()).then(|| {

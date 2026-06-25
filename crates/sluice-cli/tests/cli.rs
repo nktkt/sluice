@@ -1361,6 +1361,63 @@ fn copy_tag_filter_copies_only_matching_snapshots() {
 }
 
 #[test]
+fn copy_dry_run_previews_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    let a = dir.path().join("a");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::write(a.join("f"), b"x").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .args(["--tag", "keep"])
+        .assert()
+        .success();
+
+    // Dry-run reports the selection and copies nothing.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--dry-run", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["would_copy"], 1);
+    assert_eq!(v["snapshots"].as_array().unwrap().len(), 1);
+
+    // The destination is untouched — nothing was written.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&dest)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("JSON");
+    assert_eq!(
+        snaps.as_array().unwrap().len(),
+        0,
+        "dry-run must not write to the destination"
+    );
+
+    // A filter that matches nothing previews zero.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--tag", "nope", "--dry-run", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["would_copy"], 0);
+}
+
+#[test]
 fn copy_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
