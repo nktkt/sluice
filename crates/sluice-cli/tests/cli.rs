@@ -3097,3 +3097,74 @@ fn find_can_be_restricted_to_selected_snapshots() {
     assert_eq!(count(&["--last", "1"]), 1);
     assert_eq!(count(&["--tag", "nope"]), 0);
 }
+
+#[test]
+fn restore_ignore_errors_salvages_a_damaged_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a"), b"AAAA").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    // The single pack sealed so far holds file a's content; remember it.
+    let pack1 = std::fs::read_dir(repo.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Add b; a is reused from pack1, while b and the new trees land in a new pack.
+    std::fs::write(src.join("b"), b"BBBB").unwrap();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    let snap = snaps.as_array().unwrap().last().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Lose pack1: file a's content is gone; b and the trees survive.
+    std::fs::remove_file(&pack1).unwrap();
+
+    // A default restore aborts with the corruption exit code (13).
+    let out1 = dir.path().join("out1");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap)
+        .arg(&out1)
+        .assert()
+        .code(13);
+
+    // Best-effort restore recovers b, drops a, and exits 3 (finished with warnings).
+    let out2 = dir.path().join("out2");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap)
+        .arg(&out2)
+        .arg("--ignore-errors")
+        .assert()
+        .code(3);
+    assert_eq!(std::fs::read(out2.join("b")).unwrap(), b"BBBB");
+    assert!(
+        !out2.join("a").exists(),
+        "the unrecoverable file is left absent, not half-written"
+    );
+}

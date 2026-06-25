@@ -807,6 +807,12 @@ pub struct RestoreOptions {
     /// After writing each file, re-read it and confirm its contents match the
     /// snapshot, failing with [`EngineError::VerifyFailed`] if not.
     pub verify: bool,
+    /// Continue past a per-entry failure — a missing or corrupt content blob, or
+    /// an unreadable subtree — instead of aborting the whole restore: the broken
+    /// entry is removed (never left half-written) and recorded as a warning, so
+    /// the intact remainder is still recovered. For salvaging a partially damaged
+    /// repository; a clean restore is unaffected.
+    pub ignore_errors: bool,
 }
 
 /// Path globs selecting which entries a restore writes. Both sets match an
@@ -2797,7 +2803,7 @@ fn restore_tree<'a, B: StorageBackend>(
                 EntryKind::Dir => {
                     std::fs::create_dir_all(&path).map_err(|e| io_err(&path, e))?;
                     if let Some(subtree) = node.subtree {
-                        restore_tree(
+                        let res = restore_tree(
                             repo,
                             subtree,
                             path.clone(),
@@ -2808,7 +2814,19 @@ fn restore_tree<'a, B: StorageBackend>(
                             filter,
                             progress,
                         )
-                        .await?;
+                        .await;
+                        // Best-effort: a subtree whose tree object is unreadable is
+                        // skipped (the dir is kept) rather than failing the restore.
+                        if let Err(e) = res {
+                            if options.ignore_errors {
+                                record_warning(
+                                    reporter,
+                                    format!("skipped subtree {}: {e}", path.display()),
+                                );
+                            } else {
+                                return Err(e);
+                            }
+                        }
                     }
                     apply_metadata(&path, node, reporter);
                 }
@@ -2855,7 +2873,21 @@ fn restore_tree<'a, B: StorageBackend>(
                 .map(|node| {
                     let path = dir.join(osstring_from_bytes(&node.name));
                     async move {
-                        restore_file(repo, &path, node, reporter, options, progress).await?;
+                        if let Err(e) =
+                            restore_file(repo, &path, node, reporter, options, progress).await
+                        {
+                            // Best-effort: drop the (possibly half-written) file and
+                            // record it, rather than aborting every other file.
+                            if options.ignore_errors {
+                                let _ = std::fs::remove_file(&path);
+                                record_warning(
+                                    reporter,
+                                    format!("skipped {}: {e}", path.display()),
+                                );
+                            } else {
+                                return Err(e);
+                            }
+                        }
                         Ok::<(), EngineError>(())
                     }
                 }),
@@ -2892,7 +2924,16 @@ fn restore_tree<'a, B: StorageBackend>(
                     }
                 }
                 None => {
-                    restore_file(repo, &path, node, reporter, options, progress).await?;
+                    if let Err(e) =
+                        restore_file(repo, &path, node, reporter, options, progress).await
+                    {
+                        if options.ignore_errors {
+                            let _ = std::fs::remove_file(&path);
+                            record_warning(reporter, format!("skipped {}: {e}", path.display()));
+                        } else {
+                            return Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -5051,8 +5092,7 @@ mod tests {
         let report2 = |_: &Path| *again.lock().unwrap() += 1;
         let opts = RestoreOptions {
             skip_existing: true,
-            skip_newer: false,
-            verify: false,
+            ..Default::default()
         };
         restore_with(&repo, &snap, None, out.path(), opts, Some(&report2))
             .await
@@ -5088,8 +5128,7 @@ mod tests {
         // skip-existing keeps the matching file untouched...
         let opts = RestoreOptions {
             skip_existing: true,
-            skip_newer: false,
-            verify: false,
+            ..Default::default()
         };
         restore_with(&repo, &snap, None, out.path(), opts, None)
             .await
@@ -6094,6 +6133,72 @@ mod tests {
             restore(&repo, &snap, out.path()).await.is_err(),
             "restoring corrupt data must error, never write silently-wrong bytes"
         );
+    }
+
+    /// Best-effort restore (`ignore_errors`) recovers the files whose data is
+    /// still intact and skips the broken ones with a warning, instead of aborting
+    /// — the difference between losing one file and losing the whole backup.
+    #[tokio::test]
+    async fn best_effort_restore_salvages_intact_files() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), vec![1u8; 6000]).unwrap();
+        // The first backup seals one pack holding file `a`'s content.
+        let p1 = {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap();
+            repo.backend().list(FileType::Pack).await.unwrap()[0]
+        };
+        // The second backup adds `b` (a new pack) and reuses `a` unchanged from p1,
+        // so p1 holds only `a`'s data while `b` and the trees live elsewhere.
+        let snap = {
+            std::fs::write(src.path().join("b"), vec![2u8; 6000]).unwrap();
+            let mut repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap()
+        };
+
+        // Corrupt only p1: `a` is unreadable; `b` and the trees are fine.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Pack,
+                target: Some(p1),
+            },
+            b"pw",
+        )
+        .await
+        .unwrap();
+
+        // The default restore aborts on the corruption.
+        let out = tempfile::tempdir().unwrap();
+        assert!(restore(&repo, &snap, out.path()).await.is_err());
+
+        // Best-effort restore recovers `b`, drops `a`, and reports the skip.
+        let out = tempfile::tempdir().unwrap();
+        let report = restore_with(
+            &repo,
+            &snap,
+            None,
+            out.path(),
+            RestoreOptions {
+                ignore_errors: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("b")).unwrap(),
+            vec![2u8; 6000],
+            "the intact file is recovered"
+        );
+        assert!(
+            !out.path().join("a").exists(),
+            "the broken file is left absent, not half-written"
+        );
+        assert!(report.warnings >= 1, "the skipped file is reported");
     }
 
     #[tokio::test]

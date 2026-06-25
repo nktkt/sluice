@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 284 tests across
+machine-readable JSON output, and stable exit codes. Backed by 286 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -151,6 +151,7 @@ sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: k
 sluice restore   ./repo <snapshot> ./out --skip-newer                # keep target files newer than the snapshot
 sluice restore   ./repo <snapshot> ./out --delete                    # mirror: also remove extras in ./out
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
+sluice restore   ./repo <snapshot> ./out --ignore-errors             # salvage: skip unreadable entries, restore the rest
 sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
 sluice restore   ./repo <snapshot> ./out --json                      # restore report (warnings, deleted) as JSON
 ```
@@ -178,6 +179,13 @@ with `--dry-run` to preview the deletions first. `--verify` re-reads each
 file after writing and fails if its contents do not match the snapshot. Like
 backup, restore shows a live spinner on a terminal (hidden when piped), while
 `-v` prints each restored file.
+
+`--ignore-errors` turns a restore into a **best-effort salvage** of a partially
+damaged repository: an entry whose content blob or subtree is missing or corrupt
+is dropped (never left half-written) and recorded as a warning, instead of
+aborting the whole restore — so a single lost pack costs you that pack's files,
+not the entire backup. It finishes with exit code 3 (warnings) rather than 13
+(corruption); pair it with `verify` first to see what is intact.
 
 For a lighter touch than a full restore, `dump` writes a single file's contents
 to stdout, or a *directory* as a tar archive of its whole subtree — so a subset
@@ -511,7 +519,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 284 tests
+cargo test     # 286 tests
 ```
 
 ## Caveats

@@ -181,6 +181,11 @@ enum Command {
         /// After writing each file, re-read it and verify it matches the snapshot.
         #[arg(long)]
         verify: bool,
+        /// Salvage a damaged repository: skip an entry whose content blob or
+        /// subtree is missing or corrupt — reported as a warning (exit code 3) —
+        /// rather than aborting, so the intact files are still restored.
+        #[arg(long)]
+        ignore_errors: bool,
         /// Print each file as it is restored.
         #[arg(short, long)]
         verbose: bool,
@@ -873,6 +878,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             skip_newer,
             delete,
             verify,
+            ignore_errors,
             verbose,
             json,
         } => {
@@ -974,6 +980,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     skip_existing,
                     skip_newer,
                     verify,
+                    ignore_errors,
                 };
                 // With --verbose, print each file as it is restored (to stderr,
                 // like `backup -v`, leaving stdout for the completion line).
