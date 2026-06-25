@@ -588,6 +588,34 @@ fn init_refuses_to_overwrite_an_existing_repo() {
 }
 
 #[test]
+fn nonexistent_full_snapshot_id_is_a_clear_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"x").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // A syntactically valid but absent 64-hex id gets the same clear "no snapshot
+    // matches" as a bad prefix, not a cryptic downstream error.
+    let absent = "0".repeat(64);
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&absent)
+        .arg(dir.path().join("out"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no snapshot matches"));
+}
+
+#[test]
 fn ambiguous_snapshot_prefix_lists_candidates() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

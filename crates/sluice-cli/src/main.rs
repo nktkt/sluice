@@ -2146,12 +2146,17 @@ async fn resolve_snapshot<B: StorageBackend>(
     repo: &Repository<B>,
     needle: &str,
 ) -> Result<Id, Box<dyn Error>> {
+    let snapshots = repo.list_snapshots().await?;
+    // A full id must still name a real snapshot — otherwise it gets the same clear
+    // "no snapshot matches" as a bad prefix, not a cryptic downstream error.
     if let Ok(id) = needle.parse::<Id>() {
-        return Ok(id);
+        return if snapshots.contains(&id) {
+            Ok(id)
+        } else {
+            Err(format!("no snapshot matches '{needle}'").into())
+        };
     }
-    let matches: Vec<Id> = repo
-        .list_snapshots()
-        .await?
+    let matches: Vec<Id> = snapshots
         .into_iter()
         .filter(|id| id.to_string().starts_with(needle))
         .collect();
