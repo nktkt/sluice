@@ -542,6 +542,52 @@ fn prune_exits_12_when_a_lock_is_held() {
 }
 
 #[test]
+fn init_refuses_to_overwrite_an_existing_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"precious").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let snap = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Re-initializing the same location is refused with a clear message, never
+    // clobbering the existing config and keys.
+    sluice()
+        .arg("init")
+        .arg(&repo)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exists"))
+        .stderr(predicate::str::contains("refusing to overwrite"));
+
+    // The original snapshot is untouched and still restores.
+    let out = dir.path().join("out");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f")).unwrap(), b"precious");
+}
+
+#[test]
 fn missing_password_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("sluice").unwrap();

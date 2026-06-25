@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 268 tests across
+machine-readable JSON output, and stable exit codes. Backed by 269 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -47,7 +47,7 @@ export SLUICE_PASSWORD_COMMAND='pass show backups/sluice'
 ### Create and back up
 
 ```sh
-sluice init   ./repo
+sluice init   ./repo                             # refuses if a repository already exists there
 sluice init   ./repo --compression 19            # zstd level (1 fastest .. 22 smallest; default 3)
 sluice backup ./repo ~/documents --exclude '*.log' --exclude node_modules --tag daily
 sluice backup ./repo ~/documents --exclude-from .sluiceignore   # exclude globs from a file
@@ -432,7 +432,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 268 tests
+cargo test     # 269 tests
 ```
 
 ## Caveats

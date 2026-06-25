@@ -28,7 +28,7 @@ use sluice_engine::{
     verify_with_progress,
 };
 use sluice_repo::{RepoError, Repository};
-use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
+use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend, StoreError};
 
 /// Encrypted, deduplicating backup & disaster-recovery tool.
 #[derive(Parser)]
@@ -608,13 +608,22 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             compression,
             json,
         } => {
-            let repository = Repository::init_with_compression(
-                backend(&repo, true).await?,
-                pw,
-                kdf_params(),
-                compression,
-            )
-            .await?;
+            let be = backend(&repo, true).await?;
+            let repository =
+                match Repository::init_with_compression(be, pw, kdf_params(), compression).await {
+                    Ok(r) => r,
+                    // The config object is written first with create semantics, so an
+                    // existing repository is never clobbered; report that clearly
+                    // instead of leaking the internal "object already exists" error.
+                    Err(RepoError::Store(StoreError::AlreadyExists { .. })) => {
+                        return Err(format!(
+                            "a repository already exists at {repo}; refusing to overwrite it \
+                         (its data and keys are untouched)"
+                        )
+                        .into());
+                    }
+                    Err(e) => return Err(e.into()),
+                };
             if json {
                 println!(
                     "{}",
