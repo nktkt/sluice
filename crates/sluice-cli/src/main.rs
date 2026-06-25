@@ -206,6 +206,9 @@ enum Command {
         /// Copy only snapshots that backed up this source path.
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
+        /// Copy only the N most recent snapshots (applied after the other filters).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
         /// Recompress data into the destination at this zstd level (1..22) instead
         /// of the destination repository's default — e.g. copy to a cold archive
         /// at level 19. Dedup within the destination is unaffected.
@@ -1067,6 +1070,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             tag,
             host,
             path,
+            last,
             compression,
             dry_run,
             json,
@@ -1074,11 +1078,15 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
             // Select the source snapshots to copy: a single id, a tag/host/path
             // filtered subset, or — with no selector — every snapshot.
-            if snapshot.is_some() && (tag.is_some() || host.is_some() || path.is_some()) {
-                return Err("a snapshot id cannot be combined with --tag/--host/--path".into());
+            if snapshot.is_some()
+                && (tag.is_some() || host.is_some() || path.is_some() || last.is_some())
+            {
+                return Err(
+                    "a snapshot id cannot be combined with --tag/--host/--path/--last".into(),
+                );
             }
             let single = snapshot.is_some();
-            let matched: Vec<(Id, sluice_core::Snapshot)> = match &snapshot {
+            let mut matched: Vec<(Id, sluice_core::Snapshot)> = match &snapshot {
                 Some(s) => {
                     let id = resolve_snapshot(&source, s).await?;
                     let snap = source.load_snapshot(&id).await?;
@@ -1096,6 +1104,12 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     hits
                 }
             };
+            // Order oldest-first; --last keeps the most recent N (after filtering).
+            matched.sort_by_key(|s| s.1.time_ns);
+            if let Some(n) = last {
+                let drop = matched.len().saturating_sub(n);
+                matched.drain(..drop);
+            }
 
             // --dry-run previews the source-side selection without contacting or
             // writing the destination. It can't show the new destination ids:

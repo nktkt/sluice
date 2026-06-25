@@ -1418,6 +1418,78 @@ fn copy_dry_run_previews_without_writing() {
 }
 
 #[test]
+fn copy_last_n_selects_the_most_recent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    // Three snapshots of three distinct sources, taken in order.
+    for name in ["one", "two", "three"] {
+        let s = dir.path().join(name);
+        std::fs::create_dir_all(&s).unwrap();
+        std::fs::write(s.join(format!("{name}.txt")), name.as_bytes()).unwrap();
+        sluice()
+            .args(["backup"])
+            .arg(&repo)
+            .arg(&s)
+            .assert()
+            .success();
+    }
+
+    // `snapshots --json` lists oldest-first; capture the ids in that order.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let all: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("JSON");
+    let ids: Vec<String> = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 3);
+
+    // `--last 2` previews exactly the two most recent source ids, in order.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--last", "2", "--dry-run", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["would_copy"], 2);
+    let sel: Vec<String> = v["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(sel, vec![ids[1].clone(), ids[2].clone()], "the two newest");
+
+    // A real `--last 1` copy lands exactly one snapshot in the destination.
+    sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .args(["--last", "1"])
+        .assert()
+        .success();
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&dest)
+        .arg("--json")
+        .assert()
+        .success();
+    let landed: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("JSON");
+    assert_eq!(landed.as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn copy_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
