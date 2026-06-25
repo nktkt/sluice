@@ -1077,6 +1077,70 @@ fn copy_compression_override() {
 }
 
 #[test]
+fn init_tag_unlock_rebuild_index_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"hi").unwrap();
+
+    // init --json reports the new repo id and location.
+    let o = sluice()
+        .arg("init")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["repo_id"].as_str().unwrap().len(), 64);
+    assert_eq!(v["location"], repo.to_string_lossy().as_ref());
+
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // tag --json reports the retagged snapshot id and the resulting tag set.
+    let o = sluice()
+        .arg("tag")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .args(["--add", "keep", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["changed"], true);
+    assert_eq!(v["snapshot"].as_str().unwrap().len(), 64);
+    assert_eq!(v["tags"], serde_json::json!(["keep"]));
+
+    // rebuild-index --json reports the pack count.
+    let o = sluice()
+        .arg("rebuild-index")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert!(v["packs"].as_u64().unwrap() >= 1);
+
+    // unlock --json reports how many locks were removed (none here).
+    let o = sluice()
+        .arg("unlock")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["removed"], 0);
+}
+
+#[test]
 fn backup_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -46,6 +46,9 @@ enum Command {
         /// zstd compression level for stored blobs (1 fastest .. 22 smallest).
         #[arg(long, value_name = "LEVEL", default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22))]
         compression: i32,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Back up one or more directories into a single snapshot.
     Backup {
@@ -202,6 +205,9 @@ enum Command {
         /// Tag to remove (repeatable).
         #[arg(long = "remove", value_name = "TAG")]
         remove: Vec<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Verify the integrity of all snapshots.
     Verify {
@@ -355,11 +361,17 @@ enum Command {
     Unlock {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Rebuild index segments by rescanning packs (repairs a damaged index).
     RebuildIndex {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the passphrases (keys) that unlock the repository.
     Key {
@@ -518,7 +530,11 @@ async fn run() -> Result<i32, Box<dyn Error>> {
     // 0 = success; set to 3 when a restore completes with best-effort warnings.
     let mut exit = 0;
     match cli.command {
-        Command::Init { repo, compression } => {
+        Command::Init {
+            repo,
+            compression,
+            json,
+        } => {
             let repository = Repository::init_with_compression(
                 backend(&repo, true).await?,
                 pw,
@@ -526,7 +542,17 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 compression,
             )
             .await?;
-            println!("initialized repository {} at {repo}", repository.id());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "repo_id": repository.id().to_string(),
+                        "location": repo,
+                    }))?
+                );
+            } else {
+                println!("initialized repository {} at {repo}", repository.id());
+            }
         }
         Command::Backup {
             repo,
@@ -1041,14 +1067,27 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             snapshot,
             add,
             remove,
+            json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
             let new_id = retag(&repository, &id, &add, &remove).await?;
-            if new_id == id {
-                println!("no change");
-            } else {
+            let changed = new_id != id;
+            if json {
+                // Report the resulting snapshot's id and its tags after the edit.
+                let tags = repository.load_snapshot(&new_id).await?.tags;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "snapshot": new_id.to_string(),
+                        "changed": changed,
+                        "tags": tags,
+                    }))?
+                );
+            } else if changed {
                 println!("{new_id}");
+            } else {
+                println!("no change");
             }
         }
         Command::Verify { repo, sample, json } => {
@@ -1582,18 +1621,34 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("saved:         {saved}% (dedup + compression)");
             }
         }
-        Command::Unlock { repo } => {
+        Command::Unlock { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let locks = repository.list_locks().await?;
             for (id, _) in &locks {
                 repository.release_lock(id).await?;
             }
-            println!("removed {} lock(s)", locks.len());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "removed": locks.len(),
+                    }))?
+                );
+            } else {
+                println!("removed {} lock(s)", locks.len());
+            }
         }
-        Command::RebuildIndex { repo } => {
+        Command::RebuildIndex { repo, json } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let n = rebuild_index(&mut repository).await?;
-            println!("rebuilt index for {n} pack(s)");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "packs": n }))?
+                );
+            } else {
+                println!("rebuilt index for {n} pack(s)");
+            }
         }
         Command::Key { action } => match action {
             KeyCmd::List { repo, json } => {
