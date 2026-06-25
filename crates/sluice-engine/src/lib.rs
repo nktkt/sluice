@@ -5267,6 +5267,43 @@ mod tests {
         }
     }
 
+    /// Linux filenames are arbitrary byte sequences (anything but `/` and NUL),
+    /// not necessarily valid UTF-8. The tool stores names as raw `OsStr` bytes, so
+    /// such names — and a non-UTF-8 directory — must round-trip byte-for-byte.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_filenames_round_trip() {
+        use std::os::unix::ffi::OsStrExt;
+        let src = tempfile::tempdir().unwrap();
+        let bad_file = std::ffi::OsStr::from_bytes(b"weird-\xff\xfe-name");
+        std::fs::write(src.path().join(bad_file), b"contents of the weird file").unwrap();
+        let bad_dir = std::ffi::OsStr::from_bytes(b"dir-\x80\x81");
+        std::fs::create_dir(src.path().join(bad_dir)).unwrap();
+        let inner = std::ffi::OsStr::from_bytes(b"inner-\xfd");
+        std::fs::write(src.path().join(bad_dir).join(inner), b"deep").unwrap();
+        std::fs::write(src.path().join("plain.txt"), b"ascii").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+
+        // The whole tree — names and contents — survives byte-for-byte.
+        assert_eq!(collect_files(src.path()), collect_files(dst.path()));
+        // And the exact non-UTF-8 names are addressable in the restore.
+        assert_eq!(
+            std::fs::read(dst.path().join(bad_file)).unwrap(),
+            b"contents of the weird file"
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join(bad_dir).join(inner)).unwrap(),
+            b"deep"
+        );
+    }
+
     /// Full-stack round trip over the object-store backend (the offsite/S3 code
     /// path): init, back up, reopen via a fresh handle on the same store (which
     /// rebuilds the index from the store), then verify and restore. Uses an
