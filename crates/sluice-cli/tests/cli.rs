@@ -106,6 +106,63 @@ fn backup_emits_json() {
 }
 
 #[test]
+fn verify_and_check_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha unique").unwrap();
+    std::fs::write(src.join("b.txt"), b"bravo unique").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // Full verify: ok, two distinct blobs, nothing sampled.
+    let out = sluice()
+        .arg("verify")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["snapshots"], 1);
+    assert_eq!(v["blobs"], 2);
+    assert_eq!(v["total_blobs"], 2);
+    assert_eq!(v["sampled"], false);
+
+    // A 50% sample reads one of the two blobs and reports it as sampled.
+    let out = sluice()
+        .args(["verify", "--sample", "50", "--json"])
+        .arg(&repo)
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(v["blobs"], 1, "ceil(2 * 50/100) == 1");
+    assert_eq!(v["total_blobs"], 2);
+    assert_eq!(v["sampled"], true);
+
+    // Check: ok with no missing blobs.
+    let out = sluice()
+        .arg("check")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["snapshots"], 1);
+    assert!(v["missing"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

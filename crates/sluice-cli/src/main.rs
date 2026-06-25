@@ -151,11 +151,17 @@ enum Command {
         /// for a fast probabilistic spot-check. Trees are always fully verified.
         #[arg(long, value_name = "PERCENT")]
         sample: Option<u8>,
+        /// Emit the result (counts) as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Check structural integrity without reading file data (fast).
     Check {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit the result (counts and any missing blobs) as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Forget snapshots; reclaim their data later with `prune`.
     Forget {
@@ -691,7 +697,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("{new_id}");
             }
         }
-        Command::Verify { repo, sample } => {
+        Command::Verify { repo, sample, json } => {
             let options = match sample {
                 Some(p) if (1..=100).contains(&p) => VerifyOptions { sample_percent: p },
                 Some(p) => return Err(format!("--sample must be 1-100, got {p}").into()),
@@ -699,7 +705,19 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             };
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let report = verify_with(&repository, options).await?;
-            if report.blobs == report.total_blobs {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": true,
+                        "snapshots": report.snapshots,
+                        "trees": report.trees,
+                        "blobs": report.blobs,
+                        "total_blobs": report.total_blobs,
+                        "sampled": report.blobs != report.total_blobs,
+                    }))?
+                );
+            } else if report.blobs == report.total_blobs {
                 println!(
                     "ok: {} snapshots, {} trees, {} blobs verified",
                     report.snapshots, report.trees, report.blobs
@@ -711,10 +729,25 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 );
             }
         }
-        Command::Check { repo } => {
+        Command::Check { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let report = check(&repository).await?;
-            if report.missing.is_empty() {
+            if json {
+                let missing: Vec<String> = report.missing.iter().map(|id| id.to_string()).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": report.missing.is_empty(),
+                        "snapshots": report.snapshots,
+                        "trees": report.trees,
+                        "blobs": report.blobs,
+                        "missing": missing,
+                    }))?
+                );
+                if !report.missing.is_empty() {
+                    return Err("structural integrity check failed".into());
+                }
+            } else if report.missing.is_empty() {
                 println!(
                     "ok: {} snapshots, {} trees, {} blobs referenced",
                     report.snapshots, report.trees, report.blobs
