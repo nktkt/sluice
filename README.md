@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 211 tests across
+machine-readable JSON output, and stable exit codes. Backed by 212 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -146,6 +146,7 @@ authentication tag — so a scheduled check can alert on a non-zero status.
 sluice forget ./repo --keep-last 7 --keep-daily 14 --keep-weekly 8 \
                      --keep-monthly 12 --keep-yearly 5
 sluice forget ./repo --keep-last 7 --keep-tag important   # protect tagged snapshots
+sluice forget ./repo --keep-last 7 --keep-id <snapshot>   # pin a specific snapshot
 sluice forget ./repo --keep-daily 30 --keep-within 7d      # also keep everything from the last week
 sluice forget ./repo --keep-last 7 --group-by host         # apply the rules per host
 sluice forget ./repo --tag daily          # or forget by tag
@@ -279,7 +280,7 @@ blob is authenticated, a single flipped byte in a stored pack is caught by `veri
   thorough read-data `verify`, snapshot diffs, cross-snapshot `find`, and `tag`
   editing.
 - **Retention** — restic-style keep-last/daily/weekly/monthly/yearly plus
-  keep-tag and keep-within `forget`, optionally grouped by host or paths (with
+  keep-tag, keep-id and keep-within `forget`, optionally grouped by host or paths (with
   `--dry-run` and `--prune`), plus mark-and-sweep `prune` with repacking and a
   `--max-unused` tolerance.
 - **Replication** — `copy` a snapshot (or all) to another repository,
@@ -349,7 +350,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 211 tests
+cargo test     # 212 tests
 ```
 
 ## Caveats

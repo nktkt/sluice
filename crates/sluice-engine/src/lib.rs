@@ -1269,6 +1269,8 @@ pub struct RetentionPolicy {
     pub keep_tags: Vec<String>,
     /// Always keep snapshots taken within this many nanoseconds of now (0 = off).
     pub keep_within_ns: i64,
+    /// Always keep these specific snapshots (by full id), regardless of counts.
+    pub keep_ids: Vec<Id>,
 }
 
 impl RetentionPolicy {
@@ -1282,6 +1284,7 @@ impl RetentionPolicy {
             && self.yearly == 0
             && self.keep_tags.is_empty()
             && self.keep_within_ns == 0
+            && self.keep_ids.is_empty()
     }
 }
 
@@ -1347,6 +1350,14 @@ fn select_kept(
     if !policy.keep_tags.is_empty() {
         for (id, _, tags) in snapshots {
             if tags.iter().any(|t| policy.keep_tags.contains(t)) {
+                keep.insert(*id);
+            }
+        }
+    }
+    // `--keep-id`: pin specific snapshots by id, regardless of counts.
+    if !policy.keep_ids.is_empty() {
+        for (id, _, _) in snapshots {
+            if policy.keep_ids.contains(id) {
                 keep.insert(*id);
             }
         }
@@ -3828,6 +3839,51 @@ mod tests {
 
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([d10, d3]));
+    }
+
+    #[tokio::test]
+    async fn forget_keep_id_pins_a_snapshot() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const DAY: i64 = 86_400_000_000_000;
+        let old = repo.commit_snapshot(&at(DAY)).await.unwrap();
+        let mid = repo.commit_snapshot(&at(2 * DAY)).await.unwrap();
+        let new = repo.commit_snapshot(&at(3 * DAY)).await.unwrap();
+
+        // keep-last 1 keeps `new`; --keep-id pins `old`; only `mid` is forgotten.
+        let policy = RetentionPolicy {
+            last: 1,
+            keep_ids: vec![old],
+            ..Default::default()
+        };
+        let forgotten = forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
+        assert_eq!(forgotten, vec![mid]);
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([new, old]));
     }
 
     #[tokio::test]

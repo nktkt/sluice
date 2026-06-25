@@ -220,6 +220,10 @@ enum Command {
         /// Always keep snapshots with this tag, regardless of count rules (repeatable).
         #[arg(long = "keep-tag", value_name = "TAG")]
         keep_tag: Vec<String>,
+        /// Always keep this snapshot (a unique hex prefix), regardless of count
+        /// rules (repeatable).
+        #[arg(long = "keep-id", value_name = "SNAPSHOT")]
+        keep_id: Vec<String>,
         /// Keep all snapshots taken within this window, e.g. 7d, 24h, 2w.
         #[arg(long = "keep-within", value_name = "DURATION")]
         keep_within: Option<String>,
@@ -961,6 +965,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             keep_monthly,
             keep_yearly,
             keep_tag,
+            keep_id,
             keep_within,
             group_by,
             tag,
@@ -973,6 +978,11 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 Some(s) => parse_within(s)?,
                 None => 0,
             };
+            // Resolve each --keep-id prefix to a full snapshot id.
+            let mut keep_ids = Vec::with_capacity(keep_id.len());
+            for prefix in &keep_id {
+                keep_ids.push(resolve_snapshot(&repository, prefix).await?);
+            }
             let policy = RetentionPolicy {
                 last: keep_last.unwrap_or(0),
                 daily: keep_daily.unwrap_or(0),
@@ -981,6 +991,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 yearly: keep_yearly.unwrap_or(0),
                 keep_tags: keep_tag,
                 keep_within_ns,
+                keep_ids,
             };
             let group = match group_by {
                 None => GroupBy::None,
