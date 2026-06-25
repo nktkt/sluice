@@ -128,6 +128,10 @@ pub struct Repository<B> {
     ///
     /// [`set_data_compression`]: Self::set_data_compression
     compression_override: Option<i32>,
+    /// Per-run override for the timestamp recorded on a committed snapshot, in
+    /// nanoseconds since the Unix epoch; `None` ⇒ the current time. Set by
+    /// [`set_snapshot_time`](Self::set_snapshot_time).
+    snapshot_time_override: Option<i64>,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -193,6 +197,7 @@ impl<B: StorageBackend> Repository<B> {
             pending: PackBuilder::new(),
             pending_index: HashMap::new(),
             compression_override: None,
+            snapshot_time_override: None,
         })
     }
 
@@ -248,6 +253,7 @@ impl<B: StorageBackend> Repository<B> {
             pending: PackBuilder::new(),
             pending_index: HashMap::new(),
             compression_override: None,
+            snapshot_time_override: None,
         })
     }
 
@@ -692,6 +698,23 @@ impl<B: StorageBackend> Repository<B> {
     /// blobs (trees, snapshots, config) always use the repository default.
     pub fn set_data_compression(&mut self, level: Option<i32>) {
         self.compression_override = level;
+    }
+
+    /// Override the timestamp recorded on the next committed snapshot (nanoseconds
+    /// since the Unix epoch), or `None` to use the current time. Lets a snapshot
+    /// be dated to its logical time — e.g. when importing history from another
+    /// tool, so retention rules bucket it correctly.
+    pub fn set_snapshot_time(&mut self, time_ns: Option<i64>) {
+        self.snapshot_time_override = time_ns;
+    }
+
+    /// The overriding snapshot timestamp set by [`set_snapshot_time`], if any. The
+    /// engine consults this when stamping a snapshot, falling back to wall-clock.
+    ///
+    /// [`set_snapshot_time`]: Self::set_snapshot_time
+    #[must_use]
+    pub fn snapshot_time(&self) -> Option<i64> {
+        self.snapshot_time_override
     }
 
     /// Id of the key object whose passphrase unlocked this handle. This is the

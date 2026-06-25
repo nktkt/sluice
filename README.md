@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 236 tests across
+machine-readable JSON output, and stable exit codes. Backed by 238 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -51,6 +51,7 @@ sluice backup ./repo --files-from backup.list    # read source paths from a file
 sluice backup ./repo ~/big --cache ~/.cache/sluice.redb   # reuse unchanged files via a stat cache
 sluice backup ./repo ~/archive --compression 19  # override the repo's zstd level for this run
 sluice backup ./repo ~/documents --force         # re-read every file (catch mtime-preserving edits)
+sluice backup ./repo ~/old --time 1577836800     # date the snapshot (Unix epoch s, e.g. via `date +%s`)
 pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a piped stream
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
@@ -68,7 +69,10 @@ being present in the repository, so a stale or foreign cache falls back to a
 normal read. `--force` skips reuse entirely and re-reads every file, catching a
 content change that preserved the file's size and mtime (an edit the heuristic
 would otherwise miss); identical content still deduplicates, so it costs I/O but
-not storage. Changed files are **streamed** through the
+not storage. `--time <EPOCH_SECONDS>` records an explicit Unix timestamp on the
+snapshot instead of the current time — useful for importing history from another
+tool with original dates preserved, or reproducible snapshots; retention rules
+(`forget --keep-*`) bucket by this recorded time. Changed files are **streamed** through the
 chunker with a bounded buffer, and restored the same way — chunks written as they
 arrive — so a file larger than memory backs up and restores without being loaded
 whole. Within a file the chunks are compressed and encrypted **in parallel**
@@ -386,7 +390,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 236 tests
+cargo test     # 238 tests
 ```
 
 ## Caveats

@@ -434,7 +434,7 @@ async fn backup_sources_inner<B: StorageBackend>(
     let (snapshot_uid, snapshot_gid) = process_owner();
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
-        time_ns: now_ns(),
+        time_ns: repo.snapshot_time().unwrap_or_else(now_ns),
         tree: root_tree,
         paths: sources
             .iter()
@@ -534,7 +534,7 @@ async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
     };
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
-        time_ns: now,
+        time_ns: repo.snapshot_time().unwrap_or(now),
         tree: root_tree,
         paths: vec![name.to_vec()],
         hostname: env_or("HOSTNAME", "localhost"),
@@ -5863,6 +5863,41 @@ mod tests {
             b"bravo222",
             "--force captured the new content"
         );
+    }
+
+    /// A snapshot-time override stamps the committed snapshot with the given time
+    /// instead of wall-clock; clearing it returns to the current time.
+    #[tokio::test]
+    async fn snapshot_time_override_is_recorded() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"x").unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+
+        // A fixed historical time (2020-01-01 UTC, in nanoseconds).
+        let when = 1_577_836_800_000_000_000i64;
+        repo.set_snapshot_time(Some(when));
+        let snap = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert_eq!(repo.load_snapshot(&snap).await.unwrap().time_ns, when);
+
+        // Clearing the override falls back to wall-clock (far in the future of the
+        // fixed time above).
+        std::fs::write(src.path().join("g"), b"y").unwrap();
+        repo.set_snapshot_time(None);
+        let snap2 =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap();
+        assert!(repo.load_snapshot(&snap2).await.unwrap().time_ns > when);
     }
 
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)

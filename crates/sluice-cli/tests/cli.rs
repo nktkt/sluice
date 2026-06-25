@@ -1183,6 +1183,42 @@ fn backup_force_rereads_unchanged_files() {
 }
 
 #[test]
+fn backup_time_override_dates_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"hi").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    // 1577836800 = 2020-01-01 00:00:00 UTC.
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--time", "1577836800"])
+        .assert()
+        .success();
+
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v[0]["time_ns"], 1_577_836_800_000_000_000i64);
+
+    // The human listing renders that date.
+    sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2020-01-01 00:00:00 UTC"));
+}
+
+#[test]
 fn backup_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

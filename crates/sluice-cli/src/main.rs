@@ -111,6 +111,11 @@ enum Command {
         /// content still deduplicates, so this costs I/O but not storage.
         #[arg(long)]
         force: bool,
+        /// Record this Unix timestamp (seconds since the epoch, UTC) on the
+        /// snapshot instead of the current time — e.g. to preserve original dates
+        /// when importing history. Retention rules bucket by this time.
+        #[arg(long, value_name = "EPOCH_SECONDS")]
+        time: Option<i64>,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -575,6 +580,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             cache,
             compression,
             force,
+            time,
             dry_run,
             verbose,
             json,
@@ -614,6 +620,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
             // Apply a per-run compression override (None keeps the repo default).
             repository.set_data_compression(compression);
+            // Optionally stamp the snapshot with an explicit time (epoch seconds).
+            repository.set_snapshot_time(time.map(|s| s * 1_000_000_000));
             // With --verbose, print each new/changed file as it is processed.
             let report = |path: &std::path::Path, status: FileStatus| match status {
                 FileStatus::New => eprintln!("+ {}", path.display()),
