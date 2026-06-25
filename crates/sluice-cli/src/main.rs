@@ -2158,7 +2158,24 @@ async fn resolve_snapshot<B: StorageBackend>(
     match matches.as_slice() {
         [id] => Ok(*id),
         [] => Err(format!("no snapshot matches '{needle}'").into()),
-        _ => Err(format!("ambiguous snapshot prefix '{needle}'").into()),
+        _ => {
+            // List the candidates so the user can pick a longer, unique prefix.
+            let mut list: Vec<String> = matches
+                .iter()
+                .map(|id| id.to_string()[..16].into())
+                .collect();
+            list.sort();
+            let shown = if list.len() > 8 {
+                format!("{}, ... and {} more", list[..8].join(", "), list.len() - 8)
+            } else {
+                list.join(", ")
+            };
+            Err(format!(
+                "ambiguous snapshot prefix '{needle}': matches {} snapshots ({shown})",
+                matches.len()
+            )
+            .into())
+        }
     }
 }
 

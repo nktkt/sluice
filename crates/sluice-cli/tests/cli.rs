@@ -588,6 +588,49 @@ fn init_refuses_to_overwrite_an_existing_repo() {
 }
 
 #[test]
+fn ambiguous_snapshot_prefix_lists_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let mut ids = Vec::new();
+    for v in ["one", "two"] {
+        std::fs::write(src.join("f"), v).unwrap();
+        let a = sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success();
+        ids.push(
+            String::from_utf8(a.get_output().stdout.clone())
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    // The empty prefix matches every snapshot; the error names the count and the
+    // candidate ids so the user can pick a longer, unique prefix.
+    let assert = sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg("")
+        .arg(dir.path().join("out"))
+        .assert()
+        .failure();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(stderr.contains("ambiguous snapshot prefix"));
+    assert!(stderr.contains("matches 2 snapshots"));
+    assert!(
+        ids.iter().any(|id| stderr.contains(&id[..16])),
+        "the error should list candidate ids: {stderr}"
+    );
+}
+
+#[test]
 fn missing_password_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("sluice").unwrap();
