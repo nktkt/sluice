@@ -321,6 +321,51 @@ Restore and verify fetch each blob with a **ranged read** (an object-store range
 the whole pack — keeping their memory bounded and, on object storage, their
 transfer cost proportional to the data actually read.
 
+## Recipes
+
+End-to-end workflows tying the commands together. They assume the passphrase is
+supplied by one of the `SLUICE_PASSWORD*` mechanisms above.
+
+**Daily backup with retention, from cron.** `--skip-if-unchanged` avoids piling up
+identical snapshots on idle days, and `forget --prune` rolls the retention policy
+and reclaims space in one step:
+
+```sh
+repo=/srv/backups/repo                      # a shell variable; sluice takes the repo as an argument
+export SLUICE_PASSWORD_FILE=/etc/sluice.pw
+sluice backup "$repo" /home /etc --tag daily --exclude-caches --skip-if-unchanged
+sluice forget "$repo" --keep-daily 7 --keep-weekly 4 --keep-monthly 12 --prune
+```
+
+**Replicate offsite.** Initialize the destination once (with its own passphrase),
+then mirror into it; `copy` re-encrypts under the destination's keys and only
+transfers blobs it doesn't already have. Recompress into a cold archive if you
+like, and spot-check it afterwards:
+
+```sh
+SLUICE_PASSWORD_FILE=/etc/offsite.pw sluice init s3://my-bucket/offsite
+SLUICE_PASSWORD_FILE=/etc/sluice.pw SLUICE_DEST_PASSWORD_FILE=/etc/offsite.pw \
+  sluice copy "$repo" s3://my-bucket/offsite --compression 19
+SLUICE_PASSWORD_FILE=/etc/offsite.pw sluice verify s3://my-bucket/offsite --sample 5
+```
+
+**Disaster recovery.** Find the snapshot you want, preview it, then restore it,
+re-reading each file to confirm it matches:
+
+```sh
+sluice snapshots "$repo" --last 5 --compact
+sluice restore "$repo" <snapshot> /mnt/recovery --dry-run -v   # preview
+sluice restore "$repo" <snapshot> /mnt/recovery --verify       # write & check
+```
+
+**Rotate a passphrase** (add the new one, prove it works, drop the old):
+
+```sh
+SLUICE_NEW_PASSWORD='the new passphrase' sluice key add "$repo"
+old=$(SLUICE_PASSWORD='the new passphrase' sluice key list "$repo" --json | jq -r '.[] | select(.active==false) | .id')
+SLUICE_PASSWORD='the new passphrase' sluice key remove "$repo" "$old"
+```
+
 ## Concurrency and safety
 
 Operations coordinate through **advisory locks**: a backup takes a shared lock and
