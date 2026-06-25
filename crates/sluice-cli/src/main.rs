@@ -21,9 +21,9 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
-    check, copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
-    list_files, prune, prune_excluding, rebuild_index, restore_filtered, retag,
-    verify_with_progress,
+    check, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
+    forget_tagged, forget_with_policy, list_files, prune, prune_excluding, rebuild_index,
+    restore_filtered, retag, verify_with_progress,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -750,17 +750,39 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone());
             let mut dest =
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
-            match snapshot {
-                Some(snapshot) => {
-                    let id = resolve_snapshot(&source, &snapshot).await?;
-                    let new_id = copy_snapshot(&source, &mut dest, &id).await?;
-                    println!("{new_id}");
+            let target_id = match &snapshot {
+                Some(s) => Some(resolve_snapshot(&source, s).await?),
+                None => None,
+            };
+            // A live spinner on a terminal (offsite copies can move a lot of
+            // data); hidden when piped.
+            let spinner = std::io::stderr().is_terminal().then(|| {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner:.green} {pos} blobs copied").unwrap(),
+                );
+                pb.enable_steady_tick(std::time::Duration::from_millis(120));
+                pb
+            });
+            let tick = || {
+                if let Some(pb) = &spinner {
+                    pb.inc(1);
                 }
-                None => {
-                    let ids = copy_all(&source, &mut dest).await?;
-                    println!("copied {} snapshot(s)", ids.len());
-                }
+            };
+            let progress: Option<sluice_engine::CopyProgressFn> =
+                if spinner.is_some() { Some(&tick) } else { None };
+            let outcome = match target_id {
+                Some(id) => copy_snapshot_with_progress(&source, &mut dest, &id, progress)
+                    .await
+                    .map(|new_id| new_id.to_string()),
+                None => copy_all_with_progress(&source, &mut dest, progress)
+                    .await
+                    .map(|ids| format!("copied {} snapshot(s)", ids.len())),
+            };
+            if let Some(pb) = &spinner {
+                pb.finish_and_clear();
             }
+            println!("{}", outcome?);
         }
         Command::Snapshots {
             repo,

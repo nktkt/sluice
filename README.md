@@ -213,7 +213,8 @@ sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempo
 ```
 
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
-source's). Re-running copies only what is missing.
+source's). Re-running copies only what is missing. Like backup, restore and
+verify, copy shows a live spinner on a terminal (hidden when piped).
 
 ### Shell completions and man pages
 

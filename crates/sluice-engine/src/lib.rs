@@ -558,9 +558,23 @@ pub async fn copy_snapshot<S: StorageBackend, D: StorageBackend>(
     dst: &mut Repository<D>,
     snapshot: &Id,
 ) -> Result<Id> {
+    copy_snapshot_with_progress(src, dst, snapshot, None).await
+}
+
+/// A callback invoked once per content blob as it is copied into the destination,
+/// for progress display.
+pub type CopyProgressFn<'a> = &'a dyn Fn();
+
+/// Like [`copy_snapshot`], invoking `progress` (if any) once per copied blob.
+pub async fn copy_snapshot_with_progress<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    snapshot: &Id,
+    progress: Option<CopyProgressFn<'_>>,
+) -> Result<Id> {
     let snap = src.load_snapshot(snapshot).await?;
     let lock = dst.acquire_lock(false).await?;
-    let result = copy_snapshot_inner(src, dst, &snap).await;
+    let result = copy_snapshot_inner(src, dst, &snap, progress).await;
     let _ = dst.release_lock(&lock).await;
     result
 }
@@ -572,9 +586,18 @@ pub async fn copy_all<S: StorageBackend, D: StorageBackend>(
     src: &Repository<S>,
     dst: &mut Repository<D>,
 ) -> Result<Vec<Id>> {
+    copy_all_with_progress(src, dst, None).await
+}
+
+/// Like [`copy_all`], invoking `progress` (if any) once per copied blob.
+pub async fn copy_all_with_progress<S: StorageBackend, D: StorageBackend>(
+    src: &Repository<S>,
+    dst: &mut Repository<D>,
+    progress: Option<CopyProgressFn<'_>>,
+) -> Result<Vec<Id>> {
     let mut ids = Vec::new();
     for snapshot in src.list_snapshots().await? {
-        ids.push(copy_snapshot(src, dst, &snapshot).await?);
+        ids.push(copy_snapshot_with_progress(src, dst, &snapshot, progress).await?);
     }
     Ok(ids)
 }
@@ -584,8 +607,9 @@ async fn copy_snapshot_inner<S: StorageBackend, D: StorageBackend>(
     src: &Repository<S>,
     dst: &mut Repository<D>,
     snap: &Snapshot,
+    progress: Option<CopyProgressFn<'_>>,
 ) -> Result<Id> {
-    let tree = copy_tree(src, dst, snap.tree).await?;
+    let tree = copy_tree(src, dst, snap.tree, progress).await?;
     dst.flush().await?;
     let new_snapshot = Snapshot {
         tree,
@@ -601,6 +625,7 @@ fn copy_tree<'a, S: StorageBackend, D: StorageBackend>(
     src: &'a Repository<S>,
     dst: &'a mut Repository<D>,
     tree_id: Id,
+    progress: Option<CopyProgressFn<'a>>,
 ) -> Pin<Box<dyn Future<Output = Result<Id>> + 'a>> {
     Box::pin(async move {
         let tree = src.load_tree(&tree_id).await?;
@@ -609,7 +634,7 @@ fn copy_tree<'a, S: StorageBackend, D: StorageBackend>(
             let (content, subtree) = match node.kind {
                 EntryKind::Dir => {
                     let sub = match node.subtree {
-                        Some(child) => Some(copy_tree(src, dst, child).await?),
+                        Some(child) => Some(copy_tree(src, dst, child, progress).await?),
                         None => None,
                     };
                     (Vec::new(), sub)
@@ -619,6 +644,9 @@ fn copy_tree<'a, S: StorageBackend, D: StorageBackend>(
                     for chunk in &node.content {
                         let data = src.load_blob(chunk).await?;
                         copied.push(dst.save_blob(BlobKind::Data, &data).await?);
+                        if let Some(p) = progress {
+                            p();
+                        }
                     }
                     (copied, None)
                 }
