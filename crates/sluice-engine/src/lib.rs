@@ -4810,6 +4810,106 @@ mod tests {
         }
     }
 
+    /// Like [`build_random_tree`], but also varies file modes and drops in
+    /// relative symlinks, for the metadata-fidelity round-trip below.
+    #[cfg(unix)]
+    fn build_random_tree_meta(dir: &Path, depth: u32, s: &mut u64) {
+        use std::os::unix::fs::PermissionsExt;
+        let nfiles = rnd(s) % 4;
+        for i in 0..nfiles {
+            let len = (rnd(s) % 3000) as usize;
+            let data: Vec<u8> = (0..len).map(|_| (rnd(s) >> 33) as u8).collect();
+            let f = dir.join(format!("f{i}"));
+            std::fs::write(&f, data).unwrap();
+            // Give some files a non-default mode so the comparison can detect a
+            // mode-replay regression.
+            if rnd(s) % 2 == 0 {
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o640)).unwrap();
+            }
+        }
+        // A relative symlink to one of this directory's files.
+        if nfiles > 0 && rnd(s) % 2 == 0 {
+            symlink(
+                &OsString::from(format!("f{}", rnd(s) % nfiles)),
+                &dir.join("link"),
+            )
+            .unwrap();
+        }
+        if depth > 0 {
+            for i in 0..(rnd(s) % 3) {
+                let sub = dir.join(format!("d{i}"));
+                std::fs::create_dir(&sub).unwrap();
+                build_random_tree_meta(&sub, depth - 1, s);
+            }
+        }
+    }
+
+    /// A fingerprint of every entry under `root` (paths relative to it): mode and
+    /// mtime plus content for files, mode and mtime for directories, and the
+    /// target for symlinks (whose own mode/mtime are not part of the claim).
+    #[cfg(unix)]
+    fn collect_meta(root: &Path) -> std::collections::BTreeMap<PathBuf, (String, Vec<u8>)> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                let ft = meta.file_type();
+                let mode = meta.permissions().mode() & 0o7777;
+                let entry = if ft.is_symlink() {
+                    (
+                        "link".to_string(),
+                        std::fs::read_link(&path)
+                            .unwrap()
+                            .into_os_string()
+                            .into_encoded_bytes(),
+                    )
+                } else if ft.is_dir() {
+                    stack.push(path.clone());
+                    (
+                        format!("dir mode={mode:o} mtime={}", mtime_ns(&meta)),
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        format!("file mode={mode:o} mtime={}", mtime_ns(&meta)),
+                        std::fs::read(&path).unwrap(),
+                    )
+                };
+                out.insert(rel, entry);
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn random_tree_roundtrip_preserves_metadata() {
+        for seed in [3u64, 71, 5_000, 88_888] {
+            let src = tempfile::tempdir().unwrap();
+            let mut s = seed;
+            build_random_tree_meta(src.path(), 3, &mut s);
+
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+                .await
+                .unwrap();
+            let snap = backup(&mut repo, src.path()).await.unwrap();
+
+            let dst = tempfile::tempdir().unwrap();
+            restore(&repo, &snap, dst.path()).await.unwrap();
+
+            // Every entry's structure, content, mode, mtime, and link target survive.
+            assert_eq!(
+                collect_meta(src.path()),
+                collect_meta(dst.path()),
+                "metadata mismatch for seed {seed}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn backup_of_a_nonexistent_source_errors() {
         let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
