@@ -602,6 +602,59 @@ fn password_file_is_read_and_newline_stripped() {
 }
 
 #[test]
+fn password_command_supplies_the_passphrase() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hi").unwrap();
+
+    // A command authenticated only by SLUICE_PASSWORD_COMMAND (its stdout is the
+    // passphrase) — the secret-manager integration path.
+    let by_command = || {
+        let mut cmd = Command::cargo_bin("sluice").unwrap();
+        cmd.env_remove("SLUICE_PASSWORD")
+            .env_remove("SLUICE_PASSWORD_FILE")
+            .env("SLUICE_KDF_MEMORY_KIB", "16")
+            .env("SLUICE_KDF_PASSES", "1")
+            .env("SLUICE_PASSWORD_COMMAND", "printf cmd-secret");
+        cmd
+    };
+    by_command().arg("init").arg(&repo).assert().success();
+    by_command()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // The repository opens with the command's stdout passed directly.
+    let mut direct = Command::cargo_bin("sluice").unwrap();
+    direct
+        .env_remove("SLUICE_PASSWORD_FILE")
+        .env_remove("SLUICE_PASSWORD_COMMAND")
+        .env("SLUICE_KDF_MEMORY_KIB", "16")
+        .env("SLUICE_KDF_PASSES", "1")
+        .env("SLUICE_PASSWORD", "cmd-secret");
+    direct.arg("snapshots").arg(&repo).assert().success();
+
+    // A command that fails is surfaced as an error, not a silent empty passphrase.
+    let mut failing = Command::cargo_bin("sluice").unwrap();
+    failing
+        .env_remove("SLUICE_PASSWORD")
+        .env_remove("SLUICE_PASSWORD_FILE")
+        .env("SLUICE_KDF_MEMORY_KIB", "16")
+        .env("SLUICE_KDF_PASSES", "1")
+        .env("SLUICE_PASSWORD_COMMAND", "exit 7");
+    failing
+        .arg("snapshots")
+        .arg(&repo)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("password command"));
+}
+
+#[test]
 fn info_shows_repository_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

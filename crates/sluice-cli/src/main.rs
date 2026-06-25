@@ -1,10 +1,10 @@
 //! `sluice` — command-line interface for the encrypted, deduplicating backup
 //! and disaster-recovery tool (see `DESIGN.md` §7).
 //!
-//! The passphrase comes from the file named by `SLUICE_PASSWORD_FILE`, else the
-//! `SLUICE_PASSWORD` environment variable, else an interactive no-echo prompt when
-//! a terminal is attached. A repository is a local path or an object-store URL
-//! such as `s3://bucket/prefix`.
+//! The passphrase comes from the stdout of `SLUICE_PASSWORD_COMMAND`, else the
+//! file named by `SLUICE_PASSWORD_FILE`, else the `SLUICE_PASSWORD` environment
+//! variable, else an interactive no-echo prompt when a terminal is attached. A
+//! repository is a local path or an object-store URL such as `s3://bucket/prefix`.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -986,13 +986,12 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             json,
         } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
-            // The destination may use a different passphrase: from
-            // SLUICE_DEST_PASSWORD_FILE, then SLUICE_DEST_PASSWORD, else the
-            // source's. Mirrors the SLUICE_PASSWORD/_FILE precedence.
-            let dest_pass = if let Ok(path) = std::env::var("SLUICE_DEST_PASSWORD_FILE") {
-                passphrase_from_file(&path)?
-            } else {
-                std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone())
+            // The destination may use a different passphrase, from the
+            // SLUICE_DEST_PASSWORD{_COMMAND,_FILE,} sources; otherwise the
+            // source's. Mirrors the SLUICE_PASSWORD precedence.
+            let dest_pass = match passphrase_from_sources("SLUICE_DEST_PASSWORD") {
+                Some(result) => result?,
+                None => passphrase.clone(),
             };
             let mut dest =
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
@@ -2082,20 +2081,51 @@ fn passphrase_from_file(path: &str) -> Result<String, Box<dyn Error>> {
     Ok(contents.lines().next().unwrap_or("").to_string())
 }
 
-/// Read the passphrase: from the file named by `SLUICE_PASSWORD_FILE` if set,
-/// else from `SLUICE_PASSWORD`, else prompt with no echo when a terminal is
-/// attached. With `confirm` set (for `init` at a prompt), it is entered twice.
+/// Run `command` via `sh -c` and take the first line of its stdout as the
+/// passphrase, so it can come from a secret manager (`pass`, a vault, the OS
+/// keychain) without ever touching a file or the environment.
+fn passphrase_from_command(command: &str) -> Result<String, Box<dyn Error>> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .output()
+        .map_err(|e| format!("running password command: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("password command exited with {}", output.status).into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Resolve a passphrase from `{prefix}_COMMAND`, then `{prefix}_FILE`, then the
+/// `{prefix}` variable itself (in that order), or `None` if none is set — so the
+/// caller can fall back to a prompt, or (for a copy) the source passphrase. Used
+/// with the `SLUICE_PASSWORD` and `SLUICE_DEST_PASSWORD` prefixes.
+fn passphrase_from_sources(prefix: &str) -> Option<Result<String, Box<dyn Error>>> {
+    if let Ok(cmd) = std::env::var(format!("{prefix}_COMMAND")) {
+        return Some(passphrase_from_command(&cmd));
+    }
+    if let Ok(path) = std::env::var(format!("{prefix}_FILE")) {
+        return Some(passphrase_from_file(&path));
+    }
+    std::env::var(prefix).ok().map(Ok)
+}
+
+/// Read the passphrase from the `SLUICE_PASSWORD{_COMMAND,_FILE,}` sources, else
+/// prompt with no echo when a terminal is attached. With `confirm` set (for
+/// `init` at a prompt), it is entered twice.
 fn read_passphrase(confirm: bool) -> Result<String, Box<dyn Error>> {
     use std::io::IsTerminal;
-    if let Ok(path) = std::env::var("SLUICE_PASSWORD_FILE") {
-        return passphrase_from_file(&path);
-    }
-    if let Ok(passphrase) = std::env::var("SLUICE_PASSWORD") {
-        return Ok(passphrase);
+    if let Some(result) = passphrase_from_sources("SLUICE_PASSWORD") {
+        return result;
     }
     if !std::io::stdin().is_terminal() {
         return Err(
-            "no passphrase: set SLUICE_PASSWORD or SLUICE_PASSWORD_FILE, or run in a terminal"
+            "no passphrase: set SLUICE_PASSWORD, SLUICE_PASSWORD_FILE or \
+                    SLUICE_PASSWORD_COMMAND, or run in a terminal"
                 .into(),
         );
     }
