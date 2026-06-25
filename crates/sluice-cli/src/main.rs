@@ -225,6 +225,10 @@ enum Command {
         /// with --json, output becomes `[{group, snapshots}]`).
         #[arg(long = "group-by", value_enum)]
         group_by: Option<GroupByArg>,
+        /// One terse line per snapshot — id, date and tags only, dropping the file
+        /// count, size and source paths (human output only).
+        #[arg(long)]
+        compact: bool,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1093,6 +1097,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             path,
             last,
             group_by,
+            compact,
             json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
@@ -1163,6 +1168,9 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 } else {
                     format!("  [{}]", snap.tags.join(","))
                 };
+                if compact {
+                    return format!("{}  {}{tags}", &hex[..16], format_utc(snap.time_ns));
+                }
                 format!(
                     "{}  {}  {files} files, {}  {}{tags}",
                     &hex[..16],

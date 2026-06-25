@@ -1754,6 +1754,40 @@ fn verify_targets_one_snapshot() {
 }
 
 #[test]
+fn snapshots_compact_drops_paths_and_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("srcdir");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"hi").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--tag", "daily"])
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Compact: id, date and tag present; file count, size and source path gone.
+    sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--compact")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&snap[..16]))
+        .stdout(predicate::str::contains("[daily]"))
+        .stdout(predicate::str::contains("files").not())
+        .stdout(predicate::str::contains("srcdir").not());
+}
+
+#[test]
 fn snapshots_group_by_host() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
