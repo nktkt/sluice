@@ -5058,6 +5058,51 @@ mod tests {
         }
     }
 
+    /// Full-stack round trip over the object-store backend (the offsite/S3 code
+    /// path): init, back up, reopen via a fresh handle on the same store (which
+    /// rebuilds the index from the store), then verify and restore. Uses an
+    /// in-memory object store, so no network or MinIO is needed. This exercises
+    /// the object-store put/list and especially the native ranged `GET` used to
+    /// read one blob out of a pack — a path no `MemoryBackend` test covers.
+    #[tokio::test]
+    async fn object_store_backend_full_roundtrip() {
+        use object_store::{ObjectStore, memory::InMemory};
+        use sluice_store::ObjectStoreBackend;
+        use std::sync::Arc;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let src = tempfile::tempdir().unwrap();
+        let mut s = 0x5104_1ce5u64;
+        build_random_tree(src.path(), 3, &mut s);
+        // A multi-megabyte incompressible file spans several packs, so restore and
+        // verify must read individual blobs back with ranged GETs.
+        let mut big = vec![0u8; 5 * 1024 * 1024];
+        let mut x = 1u32;
+        for b in big.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        std::fs::write(src.path().join("big.bin"), &big).unwrap();
+
+        // init + backup over the object store.
+        let snap = {
+            let mut repo = Repository::init(ObjectStoreBackend::new(store.clone()), b"pw", fast())
+                .await
+                .unwrap();
+            backup(&mut repo, src.path()).await.unwrap()
+        };
+
+        // Reopen through a fresh backend on the same store, then verify + restore.
+        let repo = Repository::open(ObjectStoreBackend::new(store.clone()), b"pw")
+            .await
+            .unwrap();
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap]);
+        assert!(verify(&repo).await.is_ok());
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, out.path()).await.unwrap();
+        assert_eq!(collect_files(src.path()), collect_files(out.path()));
+    }
+
     /// Like [`build_random_tree`], but also varies file modes and drops in
     /// relative symlinks, for the metadata-fidelity round-trip below.
     #[cfg(unix)]

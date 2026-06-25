@@ -1962,6 +1962,7 @@ dependencies = [
  "filetime",
  "futures",
  "globset",
+ "object_store",
  "redb",
  "rustix",
  "serde",

@@ -28,3 +28,4 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
+object_store = { workspace = true }
