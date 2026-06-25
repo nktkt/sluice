@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 221 tests across
+machine-readable JSON output, and stable exit codes. Backed by 223 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -93,7 +93,8 @@ sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes (M shows size/mod
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
 sluice tag       ./repo <snapshot> --add keep --remove daily   # edit a snapshot's tags
 sluice info      ./repo                         # repository overview (counts, cipher, chunker)
-sluice stats     ./repo                         # logical vs stored bytes, dedup %
+sluice stats     ./repo                         # repo-wide: logical vs stored bytes, dedup %
+sluice stats     ./repo <snapshot>              # one snapshot: restore size, entry counts, deduped raw size
 sluice cat       ./repo snapshot <id>           # decrypted object as JSON (config|snapshot|tree)
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
@@ -357,7 +358,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 221 tests
+cargo test     # 223 tests
 ```
 
 ## Caveats

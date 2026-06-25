@@ -737,6 +737,49 @@ fn snapshots_and_stats_emit_json() {
 }
 
 #[test]
+fn stats_for_a_single_snapshot_counts_entries_and_dedups() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    // a.bin and sub/b.bin are byte-identical (and compressible) so they dedup to
+    // one stored blob; c.txt is distinct.
+    let dup = vec![7u8; 4000];
+    std::fs::write(src.join("a.bin"), &dup).unwrap();
+    std::fs::write(src.join("sub/b.bin"), &dup).unwrap();
+    std::fs::write(src.join("c.txt"), vec![9u8; 1000]).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snapshot = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let out = sluice()
+        .arg("stats")
+        .arg(&repo)
+        .arg(&snapshot[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["snapshot"], snapshot);
+    assert_eq!(v["files"], 3);
+    assert_eq!(v["dirs"], 1);
+    assert_eq!(v["restore_bytes"], 4000 + 4000 + 1000);
+    assert_eq!(v["blobs"], 2, "sub/b.bin reuses a.bin's blob");
+    let raw = v["raw_bytes"].as_u64().unwrap();
+    assert!(raw > 0 && raw < 9000, "raw {raw} below restore size");
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

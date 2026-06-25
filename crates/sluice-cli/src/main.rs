@@ -23,7 +23,8 @@ use sluice_engine::{
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
     check, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
     forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
-    prune_excluding_with_progress, rebuild_index, restore_filtered, retag, verify_with_progress,
+    prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
+    verify_with_progress,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -316,6 +317,10 @@ enum Command {
     Stats {
         /// Repository path or object-store URL.
         repo: String,
+        /// A snapshot id (or unique prefix) to report on. Without it, the whole
+        /// repository is summarized; with it, that one snapshot's restore size,
+        /// entry counts, and deduplicated raw footprint are shown.
+        snapshot: Option<String>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1347,8 +1352,45 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("stored:      {}", format_bytes(stored));
             }
         }
-        Command::Stats { repo, json } => {
+        Command::Stats {
+            repo,
+            snapshot,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+
+            // With a snapshot selector, report on that one snapshot instead of
+            // the whole repository.
+            if let Some(prefix) = snapshot {
+                let id = resolve_snapshot(&repository, &prefix).await?;
+                let s = snapshot_stats(&repository, &id).await?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "snapshot": id.to_string(),
+                            "files": s.files,
+                            "dirs": s.dirs,
+                            "other": s.other,
+                            "restore_bytes": s.restore_bytes,
+                            "blobs": s.blobs,
+                            "raw_bytes": s.raw_bytes,
+                        }))?
+                    );
+                } else {
+                    println!("snapshot:      {id}");
+                    println!("files:         {}", s.files);
+                    println!("dirs:          {}", s.dirs);
+                    if s.other > 0 {
+                        println!("other:         {}", s.other);
+                    }
+                    println!("restore size:  {}", format_bytes(s.restore_bytes));
+                    println!("unique blobs:  {}", s.blobs);
+                    println!("raw size:      {}", format_bytes(s.raw_bytes));
+                }
+                return Ok(0);
+            }
+
             let pack_ids = repository.backend().list(FileType::Pack).await?;
             let mut stored = 0u64;
             for pid in &pack_ids {

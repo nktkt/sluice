@@ -644,6 +644,17 @@ impl<B: StorageBackend> Repository<B> {
         self.index.contains_key(id) || self.pending_index.contains_key(id)
     }
 
+    /// Stored (compressed + encrypted) length of a blob as it sits in its pack,
+    /// or `None` if the blob is not present. This is the blob's true on-disk
+    /// footprint, used to size a snapshot's deduplicated raw data.
+    #[must_use]
+    pub fn blob_stored_len(&self, id: &Id) -> Option<u64> {
+        self.index
+            .get(id)
+            .map(|(_, e)| u64::from(e.length))
+            .or_else(|| self.pending_index.get(id).map(|e| u64::from(e.length)))
+    }
+
     /// Associated data binding a sealed blob to this repository and its kind.
     fn blob_aad(&self, kind: BlobKind) -> Vec<u8> {
         let mut aad = Vec::with_capacity(Id::LEN + 1);

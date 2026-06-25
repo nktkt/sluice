@@ -1686,6 +1686,85 @@ pub async fn list_files<B: StorageBackend>(
     Ok(out)
 }
 
+/// Per-snapshot size and entry counts produced by [`snapshot_stats`]. Distinct
+/// from `sluice_core::SnapshotStats`, which is the backup summary persisted in a
+/// snapshot; this is computed on demand by walking the snapshot's trees.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SnapshotSize {
+    /// Regular files in the snapshot.
+    pub files: usize,
+    /// Directories in the snapshot.
+    pub dirs: usize,
+    /// Symlinks and other non-file, non-directory entries.
+    pub other: usize,
+    /// Restore size: total logical bytes that restoring this snapshot would
+    /// write, i.e. the sum of every file's size.
+    pub restore_bytes: u64,
+    /// Number of unique content blobs referenced, after deduplication within
+    /// the snapshot.
+    pub blobs: usize,
+    /// Raw data size: the stored (compressed + encrypted) footprint of this
+    /// snapshot's unique content blobs, each counted once.
+    pub raw_bytes: u64,
+}
+
+/// Compute statistics for a single snapshot: how large a restore would be, how
+/// many entries it holds, and the deduplicated stored footprint of its content.
+///
+/// Walking only trees (never reading data blobs), this is cheap even for a huge
+/// snapshot. `restore_bytes` counts every file's logical size, while `raw_bytes`
+/// sums each *unique* referenced blob's stored length exactly once — so a
+/// snapshot full of duplicate files reports a raw size far below its restore
+/// size. A blob missing from the index (a damaged repository) contributes zero
+/// to `raw_bytes` rather than aborting; use [`check`] to detect such gaps.
+pub async fn snapshot_stats<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+) -> Result<SnapshotSize> {
+    let snap = repo.load_snapshot(snapshot).await?;
+    let mut stats = SnapshotSize::default();
+    let mut content: HashSet<Id> = HashSet::new();
+    collect_stats(repo, snap.tree, &mut stats, &mut content).await?;
+    stats.blobs = content.len();
+    stats.raw_bytes = content
+        .iter()
+        .map(|id| repo.blob_stored_len(id).unwrap_or(0))
+        .sum();
+    Ok(stats)
+}
+
+/// Recursively tally the entries of tree `tree_id`, counting each directory node
+/// once and collecting the ids of every content blob the files reference.
+fn collect_stats<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    stats: &'a mut SnapshotSize,
+    content: &'a mut HashSet<Id>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        for node in &tree.nodes {
+            match node.kind {
+                EntryKind::Dir => {
+                    stats.dirs += 1;
+                    if let Some(subtree) = node.subtree {
+                        collect_stats(repo, subtree, stats, content).await?;
+                    }
+                }
+                EntryKind::File => {
+                    stats.files += 1;
+                    stats.restore_bytes += node.size;
+                    for id in &node.content {
+                        content.insert(*id);
+                    }
+                }
+                _ => stats.other += 1,
+            }
+        }
+        Ok(())
+    })
+}
+
 /// One hit from [`find`]: the snapshot a matching entry lives in, and the entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FindMatch {
@@ -5347,6 +5426,50 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         restore(&repo, &snap, out.path()).await.unwrap();
         assert_eq!(collect_files(src.path()), collect_files(out.path()));
+    }
+
+    /// `snapshot_stats` counts files and directories, sums the restore (logical)
+    /// size, and reports a deduplicated raw footprint: two byte-identical files
+    /// share their blob, so the unique-blob count and raw size reflect the data
+    /// stored once even though both files' logical bytes are counted.
+    #[tokio::test]
+    async fn snapshot_stats_counts_entries_and_dedups_raw_size() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        // a.bin and sub/b.bin are byte-identical (and compressible), so they
+        // dedup to the same blob; c.txt is distinct.
+        let dup = vec![7u8; 5000];
+        std::fs::write(src.path().join("a.bin"), &dup).unwrap();
+        std::fs::write(src.path().join("sub/b.bin"), &dup).unwrap();
+        std::fs::write(src.path().join("c.txt"), vec![9u8; 3000]).unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+
+        let stats = snapshot_stats(&repo, &snap).await.unwrap();
+        assert_eq!(stats.files, 3, "a.bin, sub/b.bin, c.txt");
+        assert_eq!(stats.dirs, 1, "the sub/ directory");
+        assert_eq!(stats.other, 0);
+        // Restore size counts every file's logical bytes, duplicates included.
+        assert_eq!(stats.restore_bytes, 5000 + 5000 + 3000);
+        // But only two unique blobs are stored: the shared dup and c.txt.
+        assert_eq!(stats.blobs, 2, "b.bin reuses a.bin's blob");
+        // Raw size sums each unique blob once, and compression shrinks it, so it
+        // sits well below the restore size.
+        assert!(stats.raw_bytes > 0);
+        assert!(
+            stats.raw_bytes < stats.restore_bytes,
+            "raw {} should be below restore {} (dedup + compression)",
+            stats.raw_bytes,
+            stats.restore_bytes
+        );
     }
 
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
