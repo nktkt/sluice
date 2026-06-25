@@ -1219,6 +1219,51 @@ fn backup_time_override_dates_the_snapshot() {
 }
 
 #[test]
+fn snapshots_group_by_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"hi").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    for host in ["alpha", "alpha", "beta"] {
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .args(["--host", host, "--force"])
+            .assert()
+            .success();
+    }
+
+    // Grouped JSON: one entry per host (sorted by label), each with its snapshots.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .args(["--group-by", "host", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let groups = v.as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0]["group"], "alpha");
+    assert_eq!(groups[0]["snapshots"].as_array().unwrap().len(), 2);
+    assert_eq!(groups[1]["group"], "beta");
+    assert_eq!(groups[1]["snapshots"].as_array().unwrap().len(), 1);
+
+    // The human listing prints a header per host.
+    sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .args(["--group-by", "host"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("host alpha"))
+        .stdout(predicate::str::contains("host beta"));
+}
+
+#[test]
 fn backup_host_override_attributes_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

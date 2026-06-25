@@ -204,6 +204,10 @@ enum Command {
         /// Show only the N most recent snapshots.
         #[arg(long, value_name = "N")]
         last: Option<usize>,
+        /// Group the listing by host or by source paths (each group gets a header;
+        /// with --json, output becomes `[{group, snapshots}]`).
+        #[arg(long = "group-by", value_enum)]
+        group_by: Option<GroupByArg>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1001,6 +1005,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             host,
             path,
             last,
+            group_by,
             json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
@@ -1034,54 +1039,111 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 let drop = snaps.len().saturating_sub(n);
                 snaps.drain(..drop);
             }
-            if json {
-                let arr: Vec<serde_json::Value> = snaps
+
+            // One snapshot as a JSON object / a human-readable line.
+            let snap_json = |id: &Id, snap: &sluice_core::Snapshot| -> serde_json::Value {
+                let files = snap.summary.files_new
+                    + snap.summary.files_changed
+                    + snap.summary.files_unmodified;
+                let paths: Vec<String> = snap
+                    .paths
                     .iter()
-                    .map(|(id, snap)| {
-                        let files = snap.summary.files_new
-                            + snap.summary.files_changed
-                            + snap.summary.files_unmodified;
-                        let paths: Vec<String> = snap
-                            .paths
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                serde_json::json!({
+                    "id": id.to_string(),
+                    "time_ns": snap.time_ns,
+                    "hostname": snap.hostname,
+                    "username": snap.username,
+                    "tags": snap.tags,
+                    "paths": paths,
+                    "files": files,
+                    "bytes": snap.summary.bytes_processed,
+                })
+            };
+            let snap_line = |id: &Id, snap: &sluice_core::Snapshot| -> String {
+                let files = snap.summary.files_new
+                    + snap.summary.files_changed
+                    + snap.summary.files_unmodified;
+                let paths: Vec<String> = snap
+                    .paths
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect();
+                let hex = id.to_string();
+                let tags = if snap.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  [{}]", snap.tags.join(","))
+                };
+                format!(
+                    "{}  {}  {files} files, {}  {}{tags}",
+                    &hex[..16],
+                    format_utc(snap.time_ns),
+                    format_bytes(snap.summary.bytes_processed),
+                    paths.join(", ")
+                )
+            };
+
+            // The group label for a snapshot, or None when not grouping.
+            let label_of = |snap: &sluice_core::Snapshot| -> Option<String> {
+                match group_by {
+                    Some(GroupByArg::Host) => Some(snap.hostname.clone()),
+                    Some(GroupByArg::Paths) => Some(
+                        snap.paths
                             .iter()
                             .map(|p| String::from_utf8_lossy(p).into_owned())
-                            .collect();
-                        serde_json::json!({
-                            "id": id.to_string(),
-                            "time_ns": snap.time_ns,
-                            "hostname": snap.hostname,
-                            "username": snap.username,
-                            "tags": snap.tags,
-                            "paths": paths,
-                            "files": files,
-                            "bytes": snap.summary.bytes_processed,
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                    None => None,
+                }
+            };
+
+            if group_by.is_some() {
+                // Partition into groups (sorted by label), each keeping the
+                // chronological order from above.
+                let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+                    std::collections::BTreeMap::new();
+                for (i, (_, snap)) in snaps.iter().enumerate() {
+                    groups
+                        .entry(label_of(snap).unwrap_or_default())
+                        .or_default()
+                        .push(i);
+                }
+                if json {
+                    let arr: Vec<serde_json::Value> = groups
+                        .iter()
+                        .map(|(label, idxs)| {
+                            serde_json::json!({
+                                "group": label,
+                                "snapshots": idxs
+                                    .iter()
+                                    .map(|&i| snap_json(&snaps[i].0, &snaps[i].1))
+                                    .collect::<Vec<_>>(),
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&arr)?);
+                } else {
+                    let kind = match group_by {
+                        Some(GroupByArg::Host) => "host",
+                        _ => "paths",
+                    };
+                    for (label, idxs) in &groups {
+                        println!("{kind} {label}");
+                        for &i in idxs {
+                            println!("  {}", snap_line(&snaps[i].0, &snaps[i].1));
+                        }
+                    }
+                }
+            } else if json {
+                let arr: Vec<serde_json::Value> =
+                    snaps.iter().map(|(id, snap)| snap_json(id, snap)).collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
                 for (id, snap) in &snaps {
-                    let files = snap.summary.files_new
-                        + snap.summary.files_changed
-                        + snap.summary.files_unmodified;
-                    let paths: Vec<String> = snap
-                        .paths
-                        .iter()
-                        .map(|p| String::from_utf8_lossy(p).into_owned())
-                        .collect();
-                    let hex = id.to_string();
-                    let tags = if snap.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!("  [{}]", snap.tags.join(","))
-                    };
-                    println!(
-                        "{}  {}  {files} files, {}  {}{tags}",
-                        &hex[..16],
-                        format_utc(snap.time_ns),
-                        format_bytes(snap.summary.bytes_processed),
-                        paths.join(", ")
-                    );
+                    println!("{}", snap_line(id, snap));
                 }
             }
         }
