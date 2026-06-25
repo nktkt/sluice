@@ -2067,6 +2067,58 @@ fn verify_targets_one_snapshot() {
 }
 
 #[test]
+fn verify_subset_covers_everything_and_conflicts_with_sample() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    for i in 0u8..12 {
+        std::fs::write(src.join(format!("f{i}")), vec![i; 5000]).unwrap();
+    }
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    let blobs = |args: &[&str]| -> u64 {
+        let o = sluice()
+            .arg("verify")
+            .arg(&repo)
+            .args(args)
+            .arg("--json")
+            .assert()
+            .success();
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+        v["blobs"].as_u64().unwrap()
+    };
+
+    // The three --subset partitions read every blob exactly once.
+    let total = blobs(&[]);
+    let sum: u64 = (1..=3)
+        .map(|n| blobs(&["--subset", &format!("{n}/3")]))
+        .sum();
+    assert_eq!(sum, total, "the 3 subsets partition all blobs");
+
+    // --subset conflicts with --sample, and a malformed/out-of-range N/M is rejected.
+    sluice()
+        .arg("verify")
+        .arg(&repo)
+        .args(["--subset", "1/3", "--sample", "50"])
+        .assert()
+        .failure();
+    sluice()
+        .arg("verify")
+        .arg(&repo)
+        .args(["--subset", "9/3"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn snapshots_compact_drops_paths_and_size() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

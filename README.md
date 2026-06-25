@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 279 tests across
+machine-readable JSON output, and stable exit codes. Backed by 281 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -192,6 +192,7 @@ sluice check  ./repo <snapshot>   # structural check of just one snapshot
 sluice verify ./repo              # thorough: read & authenticate every blob (read-data check)
 sluice verify ./repo <snapshot>   # verify just one snapshot (fast targeted integrity check)
 sluice verify ./repo --sample 10  # spot-check: read & authenticate a random 10% of blobs
+sluice verify ./repo --subset 1/7 # scrub a deterministic 1/7 of blobs (1/7..7/7 = full, once)
 ```
 
 `check` decrypts only the tree objects and confirms each referenced blob is
@@ -200,7 +201,12 @@ which authenticates all stored data. `verify --sample <PERCENT>` walks every
 tree but reads only a uniformly random fraction of the content blobs, catching
 bit-rot probabilistically: cheap enough to run often on a large repository,
 while a periodic full `verify` still reads everything, showing a live spinner on
-a terminal (hidden when piped or with `--json`). Passing a snapshot id to either
+a terminal (hidden when piped or with `--json`). `verify --subset N/M` instead
+reads a *deterministic* 1-of-M partition of the blobs (chosen by id), so running
+`--subset 1/M` through `M/M` on a schedule reads every blob exactly once — a
+rotating scrub that guarantees full cold-storage coverage over M runs at bounded
+per-run cost (where `--sample` only covers probabilistically). It conflicts with
+`--sample`. Passing a snapshot id to either
 `check` or `verify` restricts it to just that one snapshot — a fast targeted
 integrity check of a single important backup before relying on it. All three exit with code 13
 (corruption) on any integrity failure — a missing referenced blob, or a failed
@@ -497,7 +503,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 279 tests
+cargo test     # 281 tests
 ```
 
 ## Caveats

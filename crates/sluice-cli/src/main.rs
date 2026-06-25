@@ -277,6 +277,12 @@ enum Command {
         /// for a fast probabilistic spot-check. Trees are always fully verified.
         #[arg(long, value_name = "PERCENT")]
         sample: Option<u8>,
+        /// Instead read a deterministic 1-of-M partition of the content blobs
+        /// (format N/M, 1 <= N <= M). Running --subset 1/M through M/M over time
+        /// reads every blob exactly once — a schedulable rotating scrub for
+        /// catching cold-storage bit-rot. Conflicts with --sample.
+        #[arg(long, value_name = "N/M", conflicts_with = "sample")]
+        subset: Option<String>,
         /// Emit the result (counts) as machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1366,12 +1372,17 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             repo,
             snapshot,
             sample,
+            subset,
             json,
         } => {
             let sample_percent = match sample {
                 Some(p) if (1..=100).contains(&p) => p,
                 Some(p) => return Err(format!("--sample must be 1-100, got {p}").into()),
                 None => VerifyOptions::default().sample_percent,
+            };
+            let subset = match subset.as_deref() {
+                Some(s) => Some(parse_subset(s)?),
+                None => None,
             };
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             // Resolve an optional snapshot prefix to verify just that one.
@@ -1382,6 +1393,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             let options = VerifyOptions {
                 sample_percent,
                 only,
+                subset,
             };
             // A live spinner on a terminal (verify can read a lot of data); hidden
             // when piped or with --json.
@@ -2232,6 +2244,25 @@ async fn backend(repo: &str, create: bool) -> Result<Arc<dyn StorageBackend>, Bo
     } else {
         Ok(Arc::new(LocalBackend::open(repo)))
     }
+}
+
+/// Parse a `--subset N/M` argument into `(n, m)` with `1 <= n <= m`.
+fn parse_subset(s: &str) -> Result<(u32, u32), Box<dyn Error>> {
+    let (n, m) = s
+        .split_once('/')
+        .ok_or("--subset must look like N/M, e.g. 1/7")?;
+    let n: u32 = n
+        .trim()
+        .parse()
+        .map_err(|_| "--subset N must be a number")?;
+    let m: u32 = m
+        .trim()
+        .parse()
+        .map_err(|_| "--subset M must be a number")?;
+    if n == 0 || m == 0 || n > m {
+        return Err(format!("--subset N/M requires 1 <= N <= M, got {n}/{m}").into());
+    }
+    Ok((n, m))
 }
 
 /// True if `snap` passes the optional tag/host/path filters; a `None` filter

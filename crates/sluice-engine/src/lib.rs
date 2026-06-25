@@ -1220,6 +1220,13 @@ pub struct VerifyOptions {
     /// verifies the whole repository; `Some(id)` targets one snapshot — a fast
     /// integrity check of a single important backup before relying on it.
     pub only: Option<Id>,
+    /// Read a deterministic 1-of-`m` partition of the content blobs — the
+    /// `(n, m)` with `1 <= n <= m`, chosen by blob id — instead of a random
+    /// `sample_percent` subset. Running `n = 1..=m` over successive scrubs reads
+    /// every blob exactly once, so a large cold archive is fully covered on a
+    /// rotating schedule at bounded per-run cost. `None` falls back to
+    /// `sample_percent`.
+    pub subset: Option<(u32, u32)>,
 }
 
 impl Default for VerifyOptions {
@@ -1227,6 +1234,7 @@ impl Default for VerifyOptions {
         Self {
             sample_percent: 100,
             only: None,
+            subset: None,
         }
     }
 }
@@ -1294,13 +1302,20 @@ pub async fn verify_with_progress<B: StorageBackend>(
     }
     report.total_blobs = content.len();
 
-    // Choose which blobs to read: all of them for a full verify, or a uniformly
-    // random subset (at least one) when sampling.
-    let percent = options.sample_percent.clamp(1, 100);
-    let to_read: Vec<Id> = if percent >= 100 {
-        content.into_iter().collect()
+    // Choose which blobs to read: a deterministic id-partition for a rotating
+    // scrub, else a uniformly random sample, else (the default) everything.
+    let to_read: Vec<Id> = if let Some((n, m)) = options.subset {
+        content
+            .into_iter()
+            .filter(|id| id_bucket(id, m) == n - 1)
+            .collect()
     } else {
-        sample_ids(content.into_iter().collect(), percent)
+        let percent = options.sample_percent.clamp(1, 100);
+        if percent >= 100 {
+            content.into_iter().collect()
+        } else {
+            sample_ids(content.into_iter().collect(), percent)
+        }
     };
     report.blobs = to_read.len();
 
@@ -1321,6 +1336,15 @@ pub async fn verify_with_progress<B: StorageBackend>(
 /// Select `ceil(len * percent / 100)` ids (at least one when non-empty) from
 /// `ids` uniformly at random, via a partial Fisher-Yates shuffle seeded from the
 /// OS CSPRNG.
+/// Map a blob id to one of `m` buckets (`0..m`), deterministically and uniformly,
+/// from the leading bytes of its (uniformly distributed) hash. `--subset n/m`
+/// reads the bucket `n - 1`, so `n = 1..=m` partitions the blobs into `m`
+/// disjoint scrubs that together cover every blob exactly once.
+fn id_bucket(id: &Id, m: u32) -> u32 {
+    let lead = u64::from_be_bytes(id.as_bytes()[..8].try_into().unwrap());
+    (lead % u64::from(m.max(1))) as u32
+}
+
 fn sample_ids(mut ids: Vec<Id>, percent: u8) -> Vec<Id> {
     let n = ids.len();
     if n == 0 {
@@ -3591,6 +3615,59 @@ mod tests {
         assert_eq!(one.snapshots, 1);
         assert_eq!(one.total_blobs, 1);
         assert_eq!(one.blobs, 1);
+    }
+
+    /// `--subset n/m` partitions the content blobs into `m` disjoint scrubs that
+    /// together cover every blob exactly once, deterministically.
+    #[tokio::test]
+    async fn verify_subset_partitions_cover_every_blob_once() {
+        let src = tempfile::tempdir().unwrap();
+        for i in 0u8..30 {
+            std::fs::write(src.path().join(format!("f{i}")), vec![i; 6000]).unwrap();
+        }
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup(&mut repo, src.path()).await.unwrap();
+        let total = verify(&repo).await.unwrap().total_blobs;
+        assert!(total >= 25, "distinct file contents yield many blobs");
+
+        // The m subsets are disjoint and their union is the whole set.
+        let m = 4u32;
+        let mut sum = 0usize;
+        for n in 1..=m {
+            let r = verify_with(
+                &repo,
+                VerifyOptions {
+                    subset: Some((n, m)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(r.total_blobs, total, "denominator stays the full set");
+            sum += r.blobs;
+        }
+        assert_eq!(sum, total, "the m subsets partition the blobs exactly once");
+
+        // 1/1 reads everything, and a given partition is stable across runs.
+        let whole = verify_with(
+            &repo,
+            VerifyOptions {
+                subset: Some((1, 1)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(whole.blobs, total);
+        let opts = || VerifyOptions {
+            subset: Some((2, 4)),
+            ..Default::default()
+        };
+        let p1 = verify_with(&repo, opts()).await.unwrap().blobs;
+        let p2 = verify_with(&repo, opts()).await.unwrap().blobs;
+        assert_eq!(p1, p2, "the same partition is deterministic across runs");
     }
 
     /// Targeting a snapshot structurally checks only that snapshot's trees and
