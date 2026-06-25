@@ -1414,8 +1414,12 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 Some(GroupByArg::Paths) => GroupBy::Paths,
             };
             let verb = if dry_run { "would forget" } else { "forgot" };
+            // The single-id form already prints the id; the tag/policy forms print
+            // only a count, so a dry run lists which snapshots they would remove.
+            let mut single_by_id = false;
             let forgotten: Vec<Id> = match (snapshot, tag, policy.is_empty()) {
                 (Some(snapshot), None, true) => {
+                    single_by_id = true;
                     let id = resolve_snapshot(&repository, &snapshot).await?;
                     if !dry_run {
                         forget(&repository, &id).await?;
@@ -1448,6 +1452,21 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     );
                 }
             };
+            // On a dry run, list the snapshots a tag/policy would remove (id + date)
+            // so retention can be reviewed before pruning.
+            if dry_run && !json && !single_by_id && !forgotten.is_empty() {
+                for id in forgotten.iter().take(50) {
+                    let when = repository
+                        .load_snapshot(id)
+                        .await
+                        .map(|s| format_utc(s.time_ns))
+                        .unwrap_or_default();
+                    println!("  {}  {when}", &id.to_string()[..16]);
+                }
+                if forgotten.len() > 50 {
+                    println!("  ... and {} more", forgotten.len() - 50);
+                }
+            }
             let pruned = if do_prune {
                 // Under --dry-run the snapshots are still present, so treat the
                 // would-be-forgotten ones as excluded to preview the reclamation.

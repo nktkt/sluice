@@ -1449,6 +1449,62 @@ fn forget_keep_hourly() {
 }
 
 #[test]
+fn forget_dry_run_lists_affected_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"x").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Three snapshots dated today, yesterday and two days ago (newest first).
+    let mut ids = Vec::new();
+    for days in [0i64, 1, 2] {
+        let a = sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .args(["--time", &(now - days * 86400).to_string(), "--force"])
+            .assert()
+            .success();
+        ids.push(
+            String::from_utf8(a.get_output().stdout.clone())
+                .unwrap()
+                .trim()
+                .to_string(),
+        );
+    }
+
+    // keep-last 1 keeps the newest (ids[0]); a dry run lists the other two with
+    // their dates, and removes nothing.
+    sluice()
+        .arg("forget")
+        .arg(&repo)
+        .args(["--keep-last", "1", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would forget 2 snapshot(s)"))
+        .stdout(predicate::str::contains(&ids[1][..16]))
+        .stdout(predicate::str::contains(&ids[2][..16]))
+        .stdout(predicate::str::contains("UTC"))
+        .stdout(predicate::str::contains(&ids[0][..16]).not());
+
+    // The dry run did not actually forget anything.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 3);
+}
+
+#[test]
 fn forget_keep_within_daily() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

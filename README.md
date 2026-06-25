@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 260 tests across
+machine-readable JSON output, and stable exit codes. Backed by 261 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -205,7 +205,7 @@ sluice forget ./repo --keep-within-daily 30d --keep-within-monthly 1y   # 1/day 
 sluice forget ./repo --keep-last 7 --group-by host         # apply the rules per host
 sluice forget ./repo --tag daily          # or forget by tag
 sluice forget ./repo <snapshot>           # or a single snapshot
-sluice forget ./repo --keep-last 7 --dry-run   # preview without removing
+sluice forget ./repo --keep-last 7 --dry-run   # preview (lists which snapshots, with dates) without removing
 sluice forget ./repo --keep-last 7 --prune     # forget, then reclaim in one step
 
 sluice prune ./repo                  # mark-and-sweep GC: drop dead packs, repack partial ones
@@ -424,7 +424,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 260 tests
+cargo test     # 261 tests
 ```
 
 ## Caveats
