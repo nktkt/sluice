@@ -2081,15 +2081,26 @@ pub async fn find<B: StorageBackend>(
     repo: &Repository<B>,
     pattern: &str,
 ) -> Result<Vec<FindMatch>> {
+    let all = repo.list_snapshots().await?;
+    find_in_snapshots(repo, pattern, &all).await
+}
+
+/// Like [`find`], but restricted to the given `snapshots` (in the order given) —
+/// used to search only a tag/host/path/last-filtered selection.
+pub async fn find_in_snapshots<B: StorageBackend>(
+    repo: &Repository<B>,
+    pattern: &str,
+    snapshots: &[Id],
+) -> Result<Vec<FindMatch>> {
     let matcher = Glob::new(pattern)
         .map_err(|e| EngineError::Pattern(e.to_string()))?
         .compile_matcher();
     let mut matches = Vec::new();
-    for snapshot in repo.list_snapshots().await? {
-        for entry in list_files(repo, &snapshot).await? {
+    for snapshot in snapshots {
+        for entry in list_files(repo, snapshot).await? {
             if matcher.is_match(&entry.path) {
                 matches.push(FindMatch {
-                    snapshot,
+                    snapshot: *snapshot,
                     path: entry.path,
                     kind: entry.kind,
                     size: entry.size,
@@ -7709,6 +7720,19 @@ mod tests {
         let logs = find(&repo, "**/*.log").await.unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].path, "sub/needle.log");
+
+        // Restricting the search to a subset of snapshots only reports matches
+        // from those: `a.txt` is in both, but searching just snap1 finds one.
+        let only_first = find_in_snapshots(&repo, "a.txt", &[snap1]).await.unwrap();
+        assert_eq!(only_first.len(), 1);
+        assert_eq!(only_first[0].snapshot, snap1);
+        // An empty snapshot set yields no matches.
+        assert!(
+            find_in_snapshots(&repo, "a.txt", &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

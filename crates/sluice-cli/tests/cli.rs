@@ -3050,3 +3050,50 @@ fn dump_file_is_verbatim_and_dump_directory_is_a_tar() {
         Some(&b"bravo"[..])
     );
 }
+
+#[test]
+fn find_can_be_restricted_to_selected_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("needle.log"), b"x").unwrap();
+    std::fs::write(b.join("needle.log"), b"y").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .args(["--tag", "keep"])
+        .assert()
+        .success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&b)
+        .args(["--tag", "scratch"])
+        .assert()
+        .success();
+
+    let count = |args: &[&str]| -> usize {
+        let o = sluice()
+            .arg("find")
+            .arg(&repo)
+            .arg("**/needle.log")
+            .args(args)
+            .arg("--json")
+            .assert()
+            .success();
+        let v: serde_json::Value =
+            serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+        v.as_array().unwrap().len()
+    };
+
+    // Unfiltered, the file is found in both snapshots; the filters narrow it.
+    assert_eq!(count(&[]), 2);
+    assert_eq!(count(&["--tag", "keep"]), 1);
+    assert_eq!(count(&["--last", "1"]), 1);
+    assert_eq!(count(&["--tag", "nope"]), 0);
+}

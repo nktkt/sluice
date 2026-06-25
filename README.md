@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 283 tests across
+machine-readable JSON output, and stable exit codes. Backed by 284 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -130,6 +130,7 @@ sluice snapshots ./repo --compact              # one terse line per snapshot (id
 sluice ls        ./repo <snapshot> [path]      # list a snapshot's entries (or just a subpath)
 sluice ls -l     ./repo <snapshot>             # long format: mode, owner, size/device, mtime, target
 sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
+sluice find      ./repo '**/*.pdf' --tag prod --last 5   # ...only within selected snapshots
 sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes (M shows size/mode/owner/mtime/...)
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
 sluice dump      ./repo <snapshot> path/to/dir | tar -x   # a directory as a tar stream
@@ -510,7 +511,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 283 tests
+cargo test     # 284 tests
 ```
 
 ## Caveats

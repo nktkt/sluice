@@ -22,8 +22,8 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
-    check_only, copy_snapshots_with_progress, diff, dump_into, find, forget, forget_tagged,
-    forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
+    check_only, copy_snapshots_with_progress, diff, dump_into, find, find_in_snapshots, forget,
+    forget_tagged, forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
     prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
     verify_with_progress,
 };
@@ -399,6 +399,18 @@ enum Command {
         repo: String,
         /// Glob matched against full paths (use ** to cross directories).
         pattern: String,
+        /// Search only snapshots with this tag.
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Search only snapshots taken on this host.
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Search only snapshots that backed up this source path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Search only the N most recent snapshots (after the other filters).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1767,10 +1779,27 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         Command::Find {
             repo,
             pattern,
+            tag,
+            host,
+            path,
+            last,
             json,
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let matches = find(&repository, &pattern).await?;
+            // Search every snapshot, or only the tag/host/path/last-filtered set.
+            let matches = if tag.is_some() || host.is_some() || path.is_some() || last.is_some() {
+                let snapshots = select_snapshots(
+                    &repository,
+                    tag.as_deref(),
+                    host.as_deref(),
+                    path.as_deref(),
+                    last,
+                )
+                .await?;
+                find_in_snapshots(&repository, &pattern, &snapshots).await?
+            } else {
+                find(&repository, &pattern).await?
+            };
             if json {
                 let arr: Vec<serde_json::Value> = matches
                     .iter()
@@ -2266,6 +2295,31 @@ fn parse_subset(s: &str) -> Result<(u32, u32), Box<dyn Error>> {
         return Err(format!("--subset N/M requires 1 <= N <= M, got {n}/{m}").into());
     }
     Ok((n, m))
+}
+
+/// Resolve the snapshots matching the optional tag/host/path filters, oldest
+/// first, then keep only the most recent `last` of them. Shared by `find`'s
+/// filtered search (and mirrors the `copy`/`snapshots` selectors).
+async fn select_snapshots<B: StorageBackend>(
+    repo: &Repository<B>,
+    tag: Option<&str>,
+    host: Option<&str>,
+    path: Option<&str>,
+    last: Option<usize>,
+) -> Result<Vec<Id>, Box<dyn Error>> {
+    let mut matched: Vec<(Id, sluice_core::Snapshot)> = Vec::new();
+    for id in repo.list_snapshots().await? {
+        let snap = repo.load_snapshot(&id).await?;
+        if snapshot_matches(&snap, tag, host, path) {
+            matched.push((id, snap));
+        }
+    }
+    matched.sort_by_key(|s| s.1.time_ns);
+    if let Some(n) = last {
+        let drop = matched.len().saturating_sub(n);
+        matched.drain(..drop);
+    }
+    Ok(matched.into_iter().map(|(id, _)| id).collect())
 }
 
 /// True if `snap` passes the optional tag/host/path filters; a `None` filter
