@@ -4922,6 +4922,97 @@ mod tests {
         assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap1]);
     }
 
+    /// A backend that flips a byte in every read of a chosen FileType, to
+    /// simulate silent on-disk corruption (bit rot) of a pack.
+    struct CorruptBackend {
+        inner: std::sync::Arc<MemoryBackend>,
+        corrupt: FileType,
+    }
+
+    fn flip_middle(mut v: Vec<u8>) -> bytes::Bytes {
+        if !v.is_empty() {
+            let i = v.len() / 2;
+            v[i] ^= 0xff;
+        }
+        v.into()
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for CorruptBackend {
+        async fn get(&self, ty: FileType, id: &Id) -> sluice_store::Result<bytes::Bytes> {
+            let bytes = self.inner.get(ty, id).await?;
+            Ok(if ty == self.corrupt {
+                flip_middle(bytes.to_vec())
+            } else {
+                bytes
+            })
+        }
+        async fn get_range(
+            &self,
+            ty: FileType,
+            id: &Id,
+            offset: u64,
+            len: u64,
+        ) -> sluice_store::Result<bytes::Bytes> {
+            let bytes = self.inner.get_range(ty, id, offset, len).await?;
+            Ok(if ty == self.corrupt {
+                flip_middle(bytes.to_vec())
+            } else {
+                bytes
+            })
+        }
+        async fn put(&self, ty: FileType, id: &Id, data: bytes::Bytes) -> sluice_store::Result<()> {
+            self.inner.put(ty, id, data).await
+        }
+        async fn exists(&self, ty: FileType, id: &Id) -> sluice_store::Result<bool> {
+            self.inner.exists(ty, id).await
+        }
+        async fn list(&self, ty: FileType) -> sluice_store::Result<Vec<Id>> {
+            self.inner.list(ty).await
+        }
+        async fn remove(&self, ty: FileType, id: &Id) -> sluice_store::Result<()> {
+            self.inner.remove(ty, id).await
+        }
+        async fn size(&self, ty: FileType, id: &Id) -> sluice_store::Result<u64> {
+            self.inner.size(ty, id).await
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_detects_a_flipped_byte_in_a_pack() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"alpha content").unwrap();
+        std::fs::write(src.path().join("b"), vec![7u8; 6000]).unwrap();
+        {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap();
+        }
+
+        // Healthy baseline: an untampered read verifies fine.
+        let healthy = Repository::open(mem.clone(), b"pw").await.unwrap();
+        assert!(verify(&healthy).await.is_ok());
+
+        // A single flipped byte in a pack is caught — the AEAD tag (or the
+        // recomputed id) no longer matches, so verify fails rather than returning
+        // corrupt data. The index is built from the (untouched) index segments, so
+        // open still succeeds; the corruption surfaces only when the pack is read.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Pack,
+            },
+            b"pw",
+        )
+        .await
+        .unwrap();
+        assert!(
+            verify(&repo).await.is_err(),
+            "a flipped byte in a pack must be detected"
+        );
+    }
+
     #[tokio::test]
     async fn restore_subpath_restores_only_a_subtree() {
         let src = tempfile::tempdir().unwrap();
