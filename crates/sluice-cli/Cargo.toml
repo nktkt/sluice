@@ -39,3 +39,4 @@ fuse = ["dep:fuser", "dep:libc"]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+tar = { workspace = true }

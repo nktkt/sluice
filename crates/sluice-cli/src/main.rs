@@ -22,7 +22,7 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
-    check_only, copy_snapshots_with_progress, diff, dump, find, forget, forget_tagged,
+    check_only, copy_snapshots_with_progress, diff, dump_into, find, forget, forget_tagged,
     forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
     prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
     verify_with_progress,
@@ -415,13 +415,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Write a single file from a snapshot to stdout.
+    /// Write a file from a snapshot to stdout, or a directory as a tar archive.
     Dump {
         /// Repository path or object-store URL.
         repo: String,
         /// Snapshot id (a unique hex prefix is accepted).
         snapshot: String,
-        /// Path of the file within the snapshot.
+        /// Path within the snapshot. A regular file streams out verbatim; a
+        /// directory streams as a tar archive of its whole subtree (pipe to
+        /// `tar -x` to extract a subset without a full restore).
         path: String,
     },
     /// Show repository metadata.
@@ -1849,9 +1851,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
-            let data = dump(&repository, &id, &path).await?;
-            use std::io::Write;
-            std::io::stdout().write_all(&data)?;
+            // A regular file streams out verbatim; a directory streams as a tar
+            // archive of its subtree.
+            let mut out = std::io::stdout().lock();
+            dump_into(&repository, &id, &path, &mut out).await?;
         }
         Command::Info { repo, json } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;

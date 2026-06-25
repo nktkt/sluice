@@ -2290,6 +2290,116 @@ pub async fn dump<B: StorageBackend>(
     }
 }
 
+/// Convert raw entry-name bytes to a path, preserving non-UTF-8 names on unix.
+fn bytes_to_path(b: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(b))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(b).into_owned())
+    }
+}
+
+/// Write the entry at `path` from `snapshot` to `out`: a regular file's bytes
+/// verbatim, or a **directory as a streamed tar archive** of its whole subtree
+/// (so a subset of a backup can be extracted without a full restore, e.g.
+/// `sluice dump repo snap etc | tar -x`). Returns the kind that was dumped.
+///
+/// Tar entries carry each node's mode, mtime, and owner ids; files, directories
+/// and symlinks are emitted, while any special node (device, FIFO) is skipped.
+/// Hardlinked files are written as independent regular entries.
+pub async fn dump_into<B: StorageBackend, W: std::io::Write>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    path: &str,
+    out: &mut W,
+) -> Result<EntryKind> {
+    let root = repo.load_snapshot(snapshot).await?.tree;
+    let node = find_node(repo, root, path).await?;
+    let here = Path::new(path);
+    match node.kind {
+        EntryKind::File => {
+            let content = repo.load_file(&node.content).await?;
+            out.write_all(&content).map_err(|e| io_err(here, e))?;
+            Ok(EntryKind::File)
+        }
+        EntryKind::Dir => {
+            let subtree = node
+                .subtree
+                .ok_or_else(|| EngineError::NotInSnapshot(path.to_string()))?;
+            let mut builder = tar::Builder::new(out);
+            // The dumped directory itself, then its subtree depth-first. A `Dir`
+            // node's entry is emitted before its children are visited.
+            let base = bytes_to_path(&node.name);
+            append_tar_node(&mut builder, &base, &node, &[])?;
+            let mut stack = vec![(subtree, base)];
+            while let Some((tree_id, prefix)) = stack.pop() {
+                let tree = repo.load_tree(&tree_id).await?;
+                for child in tree.nodes {
+                    let child_path = prefix.join(bytes_to_path(&child.name));
+                    let content = match child.kind {
+                        EntryKind::File => repo.load_file(&child.content).await?,
+                        _ => Vec::new(),
+                    };
+                    append_tar_node(&mut builder, &child_path, &child, &content)?;
+                    if child.kind == EntryKind::Dir {
+                        if let Some(sub) = child.subtree {
+                            stack.push((sub, child_path));
+                        }
+                    }
+                }
+            }
+            builder.finish().map_err(|e| io_err(here, e))?;
+            Ok(EntryKind::Dir)
+        }
+        other => Err(EngineError::NotInSnapshot(format!(
+            "{path} is a {other:?}, not a file or directory"
+        ))),
+    }
+}
+
+/// Append one node to a tar `builder` at `path`. Files carry `content`; dirs and
+/// symlinks ignore it; other kinds (devices, FIFOs) are skipped.
+fn append_tar_node<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    node: &Node,
+    content: &[u8],
+) -> Result<()> {
+    let mut h = tar::Header::new_gnu();
+    h.set_mode(node.mode & 0o7777);
+    h.set_uid(u64::from(node.uid));
+    h.set_gid(u64::from(node.gid));
+    h.set_mtime((node.mtime_ns.max(0) / 1_000_000_000) as u64);
+    let to_io = |e: std::io::Error| io_err(path, e);
+    match node.kind {
+        EntryKind::File => {
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_size(content.len() as u64);
+            builder.append_data(&mut h, path, content).map_err(to_io)?;
+        }
+        EntryKind::Dir => {
+            h.set_entry_type(tar::EntryType::Directory);
+            h.set_size(0);
+            builder
+                .append_data(&mut h, path, std::io::empty())
+                .map_err(to_io)?;
+        }
+        EntryKind::Symlink => {
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            let target = bytes_to_path(node.link_target.as_deref().unwrap_or(&[]));
+            builder.append_link(&mut h, path, &target).map_err(to_io)?;
+        }
+        // Devices, FIFOs and sockets have no portable tar representation here.
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Navigate a tree DAG to the node at `path`.
 async fn find_node<B: StorageBackend>(
     repo: &Repository<B>,
@@ -5347,6 +5457,63 @@ mod tests {
         assert_eq!(dump(&repo, &snap, "top").await.unwrap(), b"top-level");
         assert!(dump(&repo, &snap, "missing").await.is_err());
         assert!(dump(&repo, &snap, "sub").await.is_err()); // a directory, not a file
+    }
+
+    /// `dump_into` streams a directory as a tar archive of its whole subtree
+    /// (files, nested directories and modes), and a regular file verbatim.
+    #[tokio::test]
+    async fn dump_into_streams_a_directory_as_tar() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("d/sub")).unwrap();
+        std::fs::write(src.path().join("d/a.txt"), b"alpha").unwrap();
+        std::fs::write(src.path().join("d/sub/b.txt"), b"bravo").unwrap();
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        // Dump the "d" subtree into a tar buffer and read it back.
+        let mut buf = Vec::new();
+        assert_eq!(
+            dump_into(&repo, &snap, "d", &mut buf).await.unwrap(),
+            EntryKind::Dir
+        );
+        let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
+        let mut files = std::collections::BTreeMap::new();
+        let mut dirs = std::collections::BTreeSet::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let path = entry
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .trim_end_matches('/')
+                .to_string();
+            if entry.header().entry_type().is_dir() {
+                dirs.insert(path);
+            } else {
+                let mut content = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut content).unwrap();
+                files.insert(path, content);
+            }
+        }
+        assert!(
+            dirs.contains("d") && dirs.contains("d/sub"),
+            "dirs: {dirs:?}"
+        );
+        assert_eq!(files.get("d/a.txt").map(Vec::as_slice), Some(&b"alpha"[..]));
+        assert_eq!(
+            files.get("d/sub/b.txt").map(Vec::as_slice),
+            Some(&b"bravo"[..])
+        );
+
+        // A regular file dumps its bytes verbatim, with no tar wrapping.
+        let mut fbuf = Vec::new();
+        assert_eq!(
+            dump_into(&repo, &snap, "d/a.txt", &mut fbuf).await.unwrap(),
+            EntryKind::File
+        );
+        assert_eq!(fbuf, b"alpha");
     }
 
     #[tokio::test]

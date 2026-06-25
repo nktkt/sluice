@@ -2990,3 +2990,63 @@ fn ls_and_find_emit_json() {
     assert_eq!(arr[0]["kind"], "file");
     assert_eq!(arr[0]["snapshot"].as_str().unwrap().len(), 64);
 }
+
+#[test]
+fn dump_file_is_verbatim_and_dump_directory_is_a_tar() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("d/sub")).unwrap();
+    std::fs::write(src.join("d/a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("d/sub/b.txt"), b"bravo").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    let snap = snaps[0]["id"].as_str().unwrap().to_string();
+
+    // A regular file dumps its bytes verbatim.
+    let o = sluice()
+        .arg("dump")
+        .arg(&repo)
+        .arg(&snap)
+        .arg("d/a.txt")
+        .assert()
+        .success();
+    assert_eq!(o.get_output().stdout, b"alpha");
+
+    // A directory dumps as a tar archive of its subtree.
+    let o = sluice()
+        .arg("dump")
+        .arg(&repo)
+        .arg(&snap)
+        .arg("d")
+        .assert()
+        .success();
+    let mut archive = tar::Archive::new(std::io::Cursor::new(o.get_output().stdout.clone()));
+    let mut files = std::collections::BTreeMap::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().to_string_lossy().into_owned();
+        if !entry.header().entry_type().is_dir() {
+            let mut c = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut c).unwrap();
+            files.insert(path, c);
+        }
+    }
+    assert_eq!(files.get("d/a.txt").map(Vec::as_slice), Some(&b"alpha"[..]));
+    assert_eq!(
+        files.get("d/sub/b.txt").map(Vec::as_slice),
+        Some(&b"bravo"[..])
+    );
+}

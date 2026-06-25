@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 281 tests across
+machine-readable JSON output, and stable exit codes. Backed by 283 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -132,6 +132,7 @@ sluice ls -l     ./repo <snapshot>             # long format: mode, owner, size/
 sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
 sluice diff      ./repo <snap-a> <snap-b>      # +/-/M changes (M shows size/mode/owner/mtime/...)
 sluice dump      ./repo <snapshot> path/to/f   # one file's contents to stdout
+sluice dump      ./repo <snapshot> path/to/dir | tar -x   # a directory as a tar stream
 sluice tag       ./repo <snapshot> --add keep --remove daily   # edit a snapshot's tags
 sluice info      ./repo                         # repository overview (counts, cipher, chunker)
 sluice stats     ./repo                         # repo-wide: logical vs stored bytes, dedup %
@@ -176,6 +177,12 @@ with `--dry-run` to preview the deletions first. `--verify` re-reads each
 file after writing and fails if its contents do not match the snapshot. Like
 backup, restore shows a live spinner on a terminal (hidden when piped), while
 `-v` prints each restored file.
+
+For a lighter touch than a full restore, `dump` writes a single file's contents
+to stdout, or a *directory* as a tar archive of its whole subtree — so a subset
+of a backup can be extracted and piped (`sluice dump repo snap etc | tar -x`)
+without staging a tree on disk. The tar carries each entry's mode, mtime and
+owner ids for files, directories and symlinks.
 
 Every listing and result command accepts `--json` for machine-readable output,
 and commands return stable exit codes (3 restore finished with warnings, 10 repo
@@ -503,7 +510,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 281 tests
+cargo test     # 283 tests
 ```
 
 ## Caveats
