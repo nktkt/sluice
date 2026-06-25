@@ -600,6 +600,14 @@ impl<B: StorageBackend> Repository<B> {
         &self.config
     }
 
+    /// Id of the key object whose passphrase unlocked this handle. This is the
+    /// "current" key — the one [`change_passphrase`](Self::change_passphrase)
+    /// rotates out, and the one a caller should keep when pruning other keys.
+    #[must_use]
+    pub fn active_key_id(&self) -> Id {
+        self.key_id
+    }
+
     /// The repository's unique id.
     #[must_use]
     pub fn id(&self) -> Id {
@@ -1317,6 +1325,38 @@ mod tests {
         let keys = repo.list_keys().await.unwrap();
         assert_eq!(keys.len(), 2);
         assert!(keys.contains(&added));
+    }
+
+    #[tokio::test]
+    async fn active_key_id_tracks_the_unlocking_passphrase() {
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let second = {
+            let repo = Repository::init(backend.clone(), b"first", fast())
+                .await
+                .unwrap();
+            // The init handle's active key is its sole (first) key.
+            assert_eq!(repo.list_keys().await.unwrap(), vec![repo.active_key_id()]);
+            repo.add_key(b"second", fast()).await.unwrap()
+        };
+
+        // Opening with each passphrase reports that passphrase's key as active.
+        let by_second = Repository::open(backend.clone(), b"second").await.unwrap();
+        assert_eq!(by_second.active_key_id(), second);
+        let by_first = Repository::open(backend.clone(), b"first").await.unwrap();
+        assert_ne!(
+            by_first.active_key_id(),
+            second,
+            "the first passphrase is not the second key"
+        );
+        assert!(
+            by_first
+                .list_keys()
+                .await
+                .unwrap()
+                .contains(&by_first.active_key_id())
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 199 tests across
+machine-readable JSON output, and stable exit codes. Backed by 201 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -146,11 +146,15 @@ deleting fully-dead packs and repacking partially-dead ones to recover space.
 A repository can have several passphrases, each unwrapping the same master key.
 
 ```sh
-sluice key list   ./repo                  # list key ids
+sluice key list   ./repo                  # list key ids (the one you opened with is marked active)
+sluice key list   ./repo --json           # same, as machine-readable JSON
 sluice key add    ./repo                  # add a passphrase (SLUICE_NEW_PASSWORD or prompt)
 sluice key passwd ./repo                  # rotate the current passphrase
 sluice key remove ./repo <key-id>         # remove a key (the last one is refused)
 ```
+
+`key list` marks the key your passphrase unlocked as **active** — the one
+`key passwd` rotates, and the one to keep when removing the others.
 
 ### Maintenance
 
@@ -289,7 +293,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 199 tests
+cargo test     # 201 tests
 ```
 
 ## Caveats

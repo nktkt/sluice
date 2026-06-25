@@ -223,6 +223,46 @@ fn check_reports_missing_blobs_and_exits_13() {
 }
 
 #[test]
+fn key_list_marks_the_active_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    sluice().arg("init").arg(&repo).assert().success();
+
+    // Add a second passphrase (read from SLUICE_NEW_PASSWORD).
+    sluice()
+        .env("SLUICE_NEW_PASSWORD", "second-pass")
+        .arg("key")
+        .arg("add")
+        .arg(&repo)
+        .assert()
+        .success();
+
+    // JSON list: two keys, exactly one flagged active.
+    let out = sluice()
+        .arg("key")
+        .arg("list")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "init key plus the added one");
+    let active: Vec<_> = arr.iter().filter(|k| k["active"] == true).collect();
+    assert_eq!(active.len(), 1, "exactly one key is active");
+
+    // The human listing marks it.
+    sluice()
+        .arg("key")
+        .arg("list")
+        .arg(&repo)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("(active)"));
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -349,10 +349,13 @@ enum CatObject {
 /// Sub-commands of `key`.
 #[derive(Subcommand)]
 enum KeyCmd {
-    /// List the repository's keys.
+    /// List the repository's keys (the active one is marked).
     List {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit the key list as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Add a passphrase (read from SLUICE_NEW_PASSWORD or prompted).
     Add {
@@ -1160,12 +1163,27 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             println!("rebuilt index for {n} pack(s)");
         }
         Command::Key { action } => match action {
-            KeyCmd::List { repo } => {
+            KeyCmd::List { repo, json } => {
                 let repository = Repository::open(backend(&repo, false).await?, pw).await?;
                 let keys = repository.list_keys().await?;
-                println!("{} key(s):", keys.len());
-                for id in &keys {
-                    println!("  {id}");
+                let active = repository.active_key_id();
+                if json {
+                    let arr: Vec<serde_json::Value> = keys
+                        .iter()
+                        .map(|id| {
+                            serde_json::json!({
+                                "id": id.to_string(),
+                                "active": *id == active,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&arr)?);
+                } else {
+                    println!("{} key(s):", keys.len());
+                    for id in &keys {
+                        let marker = if *id == active { " (active)" } else { "" };
+                        println!("  {id}{marker}");
+                    }
                 }
             }
             KeyCmd::Add { repo } => {
