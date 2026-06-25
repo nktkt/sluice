@@ -6857,6 +6857,45 @@ mod tests {
         }
     }
 
+    /// Directory permissions and mtime survive a round trip. The random-tree test
+    /// only varies *file* modes, so a non-default *directory* mode (0700) here
+    /// proves restore replays the stored mode rather than defaulting to 0755 —
+    /// restoring a private directory as world-readable would be a security bug.
+    #[tokio::test]
+    async fn restore_replays_directory_mode_and_mtime() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+        let src = tempfile::tempdir().unwrap();
+        let sub = src.path().join("private");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("f"), b"secret").unwrap();
+        // Set the non-default mode and a fixed mtime last (writing the file above
+        // would otherwise bump the directory's mtime).
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::File::open(&sub)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        let want = std::fs::symlink_metadata(&sub).unwrap();
+        let want_mode = want.permissions().mode() & 0o7777;
+        let want_mtime = mtime_ns(&want);
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+
+        let got = std::fs::symlink_metadata(dst.path().join("private")).unwrap();
+        assert_eq!(
+            got.permissions().mode() & 0o7777,
+            want_mode,
+            "directory mode (0700) must be restored, not defaulted"
+        );
+        assert_eq!(mtime_ns(&got), want_mtime, "directory mtime preserved");
+    }
+
     /// Copying a complex random tree to a second repository (re-encrypting every
     /// blob and rebuilding every tree under independent keys) yields a faithful
     /// replica: restoring from the copy reproduces the source's structure,
