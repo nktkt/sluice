@@ -1183,6 +1183,50 @@ fn backup_force_rereads_unchanged_files() {
 }
 
 #[test]
+fn forget_keep_hourly() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"x").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Snapshots at this hour and 1, 2 and 30 hours ago (exact-hour offsets keep
+    // each in a distinct hour bucket).
+    for hours in [0i64, 1, 2, 30] {
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .args(["--time", &(now - hours * 3600).to_string(), "--force"])
+            .assert()
+            .success();
+    }
+
+    // --keep-hourly 3 keeps the three recent hours, forgets the 30-hour-old one.
+    let o = sluice()
+        .arg("forget")
+        .arg(&repo)
+        .args(["--keep-hourly", "3", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["count"], 1);
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 3);
+}
+
+#[test]
 fn forget_keep_within_daily() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

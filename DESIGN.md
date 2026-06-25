@@ -606,8 +606,8 @@ pack サイズ・object count・アクセスタイミング（high-threat ユー
 > `--skip-existing`（再開）、`--verify`、`--delete`（ミラー＝対象をスナップショットに完全一致、
 > 生バイト比較・シンボリックリンク非追従で安全）、sparse 自動再現。
 > **整合性/保守**: `verify`/`verify --sample`/`check`（いずれも `<snapshot>` 指定で単一スナップショット・ターゲティング可）、
-> `forget`（keep-last/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・
-> `--keep-within-daily/weekly/monthly/yearly`・`--group-by`・`--prune`）/
+> `forget`（keep-last/hourly/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・
+> `--keep-within-hourly/daily/weekly/monthly/yearly`・`--group-by`・`--prune`）/
 > `prune`（`--max-unused`）、`copy`（リポジトリ間、宛先鍵で再封緘、`--compression` で再圧縮）。
 > **横断**: 全 result/変更系コマンドが `--json`、安定 exit code（3/10/11/12/13）、
 > backup/restore/verify/copy/prune のインタラクティブ進捗スピナー、読み取り専用 FUSE mount

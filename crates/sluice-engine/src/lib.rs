@@ -1408,6 +1408,8 @@ pub async fn retag<B: StorageBackend>(
 pub struct RetentionPolicy {
     /// Keep the N most recent snapshots.
     pub last: usize,
+    /// Keep the most recent snapshot of each of the last N hours.
+    pub hourly: usize,
     /// Keep the most recent snapshot of each of the last N UTC days.
     pub daily: usize,
     /// Keep the most recent snapshot of each of the last N (Monday-aligned) weeks.
@@ -1420,6 +1422,8 @@ pub struct RetentionPolicy {
     pub keep_tags: Vec<String>,
     /// Always keep snapshots taken within this many nanoseconds of now (0 = off).
     pub keep_within_ns: i64,
+    /// Within this window, keep the most recent snapshot of each hour (0 = off).
+    pub within_hourly_ns: i64,
     /// Within this many nanoseconds of now, keep the most recent snapshot of each
     /// UTC day (0 = off). Like `daily`, but bounded by a time window rather than a
     /// count.
@@ -1439,12 +1443,14 @@ impl RetentionPolicy {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.last == 0
+            && self.hourly == 0
             && self.daily == 0
             && self.weekly == 0
             && self.monthly == 0
             && self.yearly == 0
             && self.keep_tags.is_empty()
             && self.keep_within_ns == 0
+            && self.within_hourly_ns == 0
             && self.within_daily_ns == 0
             && self.within_weekly_ns == 0
             && self.within_monthly_ns == 0
@@ -1495,8 +1501,10 @@ fn select_kept(
     for (id, _, _) in snapshots.iter().take(policy.last) {
         keep.insert(*id);
     }
-    // `--keep-daily`/`weekly`/`monthly`/`yearly`: most recent per bucket, last N.
-    let bucketed: [(usize, fn(i64) -> i64); 4] = [
+    // `--keep-hourly`/`daily`/`weekly`/`monthly`/`yearly`: most recent per bucket,
+    // last N.
+    let bucketed: [(usize, fn(i64) -> i64); 5] = [
+        (policy.hourly, hour_bucket),
         (policy.daily, day_bucket),
         (policy.weekly, week_bucket),
         (policy.monthly, month_bucket),
@@ -1515,7 +1523,8 @@ fn select_kept(
     // `--keep-within-daily/weekly/monthly/yearly DUR`: most recent per bucket, for
     // snapshots within `DUR` of now. Like the count rules above, but bounded by a
     // time window instead of a number of buckets.
-    let windowed: [(i64, fn(i64) -> i64); 4] = [
+    let windowed: [(i64, fn(i64) -> i64); 5] = [
+        (policy.within_hourly_ns, hour_bucket),
         (policy.within_daily_ns, day_bucket),
         (policy.within_weekly_ns, week_bucket),
         (policy.within_monthly_ns, month_bucket),
@@ -1558,6 +1567,13 @@ fn select_kept(
 
 /// Nanoseconds per UTC day; `Snapshot::time_ns` is ns since the Unix epoch.
 const NS_PER_DAY: i64 = 86_400_000_000_000;
+/// Nanoseconds per hour.
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// The hour index (hours since the epoch) containing `time_ns`.
+fn hour_bucket(time_ns: i64) -> i64 {
+    time_ns.div_euclid(NS_PER_HOUR)
+}
 
 /// The UTC day index (days since the epoch) containing `time_ns`.
 fn day_bucket(time_ns: i64) -> i64 {
@@ -4417,6 +4433,57 @@ mod tests {
             .unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([today, d1, d2]));
+    }
+
+    /// `--keep-hourly N` keeps the most recent snapshot of each of the last N
+    /// hours, dropping older ones.
+    #[tokio::test]
+    async fn forget_keeps_recent_hours() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const HOUR: i64 = 3_600_000_000_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        // Exact-hour offsets put each snapshot in a distinct hour bucket.
+        let h0 = repo.commit_snapshot(&at(now)).await.unwrap();
+        let h1 = repo.commit_snapshot(&at(now - HOUR)).await.unwrap();
+        let h2 = repo.commit_snapshot(&at(now - 2 * HOUR)).await.unwrap();
+        let _h30 = repo.commit_snapshot(&at(now - 30 * HOUR)).await.unwrap();
+
+        // Keep the three most recent hours; the 30-hour-old one is forgotten.
+        let policy = RetentionPolicy {
+            hourly: 3,
+            ..Default::default()
+        };
+        forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([h0, h1, h2]));
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 248 tests across
+machine-readable JSON output, and stable exit codes. Backed by 250 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -185,7 +185,7 @@ authentication tag — so a scheduled check can alert on a non-zero status.
 
 ```sh
 # Keep rules combine as a union (restic semantics); a snapshot kept by any rule survives.
-sluice forget ./repo --keep-last 7 --keep-daily 14 --keep-weekly 8 \
+sluice forget ./repo --keep-hourly 24 --keep-daily 14 --keep-weekly 8 \
                      --keep-monthly 12 --keep-yearly 5
 sluice forget ./repo --keep-last 7 --keep-tag important   # protect tagged snapshots
 sluice forget ./repo --keep-last 7 --keep-id <snapshot>   # pin a specific snapshot
@@ -202,7 +202,7 @@ sluice prune ./repo --max-unused 5   # leave packs that are <=5% dead instead of
 sluice prune ./repo --dry-run        # report reclaimable bytes without touching storage
 ```
 
-Keep rules combine as a union: `--keep-last/-daily/-weekly/-monthly/-yearly N`
+Keep rules combine as a union: `--keep-last/-hourly/-daily/-weekly/-monthly/-yearly N`
 keep counts of each bucket, `--keep-within <DUR>` keeps everything in a window,
 and `--keep-within-daily/-weekly/-monthly/-yearly <DUR>` keep one snapshot per
 bucket *within* a window (e.g. `--keep-within-daily 30d` = one per day for the
@@ -412,7 +412,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 248 tests
+cargo test     # 250 tests
 ```
 
 ## Caveats

@@ -271,6 +271,9 @@ enum Command {
         /// Keep the N most recent snapshots (combinable with the other --keep rules).
         #[arg(long, value_name = "N")]
         keep_last: Option<usize>,
+        /// Keep the most recent snapshot of each of the last N hours.
+        #[arg(long, value_name = "N")]
+        keep_hourly: Option<usize>,
         /// Keep the most recent snapshot of each of the last N days.
         #[arg(long, value_name = "N")]
         keep_daily: Option<usize>,
@@ -293,6 +296,9 @@ enum Command {
         /// Keep all snapshots taken within this window, e.g. 7d, 24h, 2w.
         #[arg(long = "keep-within", value_name = "DURATION")]
         keep_within: Option<String>,
+        /// Within this window, keep the most recent snapshot of each hour, e.g. 48h.
+        #[arg(long = "keep-within-hourly", value_name = "DURATION")]
+        keep_within_hourly: Option<String>,
         /// Within this window, keep the most recent snapshot of each day, e.g. 30d.
         #[arg(long = "keep-within-daily", value_name = "DURATION")]
         keep_within_daily: Option<String>,
@@ -1332,6 +1338,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             repo,
             snapshot,
             keep_last,
+            keep_hourly,
             keep_daily,
             keep_weekly,
             keep_monthly,
@@ -1339,6 +1346,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             keep_tag,
             keep_id,
             keep_within,
+            keep_within_hourly,
             keep_within_daily,
             keep_within_weekly,
             keep_within_monthly,
@@ -1365,12 +1373,14 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             }
             let policy = RetentionPolicy {
                 last: keep_last.unwrap_or(0),
+                hourly: keep_hourly.unwrap_or(0),
                 daily: keep_daily.unwrap_or(0),
                 weekly: keep_weekly.unwrap_or(0),
                 monthly: keep_monthly.unwrap_or(0),
                 yearly: keep_yearly.unwrap_or(0),
                 keep_tags: keep_tag,
                 keep_within_ns,
+                within_hourly_ns: within(&keep_within_hourly)?,
                 within_daily_ns: within(&keep_within_daily)?,
                 within_weekly_ns: within(&keep_within_weekly)?,
                 within_monthly_ns: within(&keep_within_monthly)?,
@@ -1412,7 +1422,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 _ => {
                     return Err(
                         "specify exactly one of: <snapshot>, --tag T, or one or more \
-                         --keep-last/-daily/-weekly/-monthly/-yearly rules"
+                         --keep-last/-hourly/-daily/-weekly/-monthly/-yearly rules"
                             .into(),
                     );
                 }
