@@ -1141,6 +1141,48 @@ fn init_tag_unlock_rebuild_index_emit_json() {
 }
 
 #[test]
+fn backup_force_rereads_unchanged_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("b.txt"), b"bravo").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // A normal re-backup reuses both unchanged files.
+    let o = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["files_unmodified"], 2);
+    assert_eq!(v["files_changed"], 0);
+
+    // --force re-reads them regardless of the size+mtime heuristic.
+    let o = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--force", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["files_unmodified"], 0, "--force bypasses reuse");
+    assert_eq!(v["files_changed"], 2);
+}
+
+#[test]
 fn backup_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

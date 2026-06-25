@@ -106,6 +106,11 @@ enum Command {
         /// unaffected, so only newly stored chunks use the new level.
         #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=22))]
         compression: Option<i32>,
+        /// Re-read every file instead of trusting the size+mtime heuristic, to
+        /// catch a content change that preserved the file's mtime. Identical
+        /// content still deduplicates, so this costs I/O but not storage.
+        #[arg(long)]
+        force: bool,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -569,6 +574,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude_caches,
             cache,
             compression,
+            force,
             dry_run,
             verbose,
             json,
@@ -654,6 +660,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     one_file_system,
                     exclude_if_present,
                     exclude_caches,
+                    force,
                     cache_path: cache,
                     dry_run,
                 };

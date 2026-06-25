@@ -140,6 +140,11 @@ pub struct BackupOptions {
     /// Skip a subdirectory holding a `CACHEDIR.TAG` that carries the standard
     /// cache signature (the convention used by build tools and browsers).
     pub exclude_caches: bool,
+    /// Re-read every file instead of reusing its chunks from the parent snapshot
+    /// or stat cache. Catches a content change the size+mtime heuristic misses
+    /// (e.g. an mtime-preserving edit); identical content still deduplicates, so
+    /// only genuinely changed data is stored.
+    pub force: bool,
     /// Path to an on-disk [`StatCache`]. When set, an unchanged file is reused
     /// from its cached chunk ids without re-reading it or loading the previous
     /// snapshot's trees (see `DESIGN.md` §5.2). Absent ⇒ reuse comes from the
@@ -262,6 +267,7 @@ async fn backup_sources_inner<B: StorageBackend>(
         root_dev: None,
         exclude_if_present: &options.exclude_if_present,
         exclude_caches: options.exclude_caches,
+        force: options.force,
         cache: cache.as_ref(),
         cache_updates: cache_updates.as_ref(),
         progress,
@@ -2132,6 +2138,9 @@ struct BackupCtx<'a> {
     exclude_if_present: &'a [String],
     /// Whether a subdirectory bearing a signed `CACHEDIR.TAG` is excluded.
     exclude_caches: bool,
+    /// Re-read every file, bypassing parent-tree and stat-cache reuse, to catch a
+    /// content change the size+mtime heuristic would miss.
+    force: bool,
     /// On-disk stat cache to reuse unchanged files from, if enabled.
     cache: Option<&'a StatCache>,
     /// Batched cache updates (flushed once after the walk); present iff `cache`.
@@ -2181,11 +2190,16 @@ async fn backup_file<B: StorageBackend>(
     // cache hit is trusted only if every chunk it names is still present in the
     // repository, so a stale or foreign cache degrades to a re-read.
     let mut from_cache = false;
-    let mut reuse = parent.and_then(|prev| {
-        (prev.kind == EntryKind::File && prev.size == meta.len() && prev.mtime_ns == mtime)
-            .then(|| prev.content.clone())
-    });
-    if reuse.is_none() && cache_ino != 0 {
+    // --force bypasses both reuse paths so the file is always re-read.
+    let mut reuse = (!ctx.force)
+        .then(|| {
+            parent.and_then(|prev| {
+                (prev.kind == EntryKind::File && prev.size == meta.len() && prev.mtime_ns == mtime)
+                    .then(|| prev.content.clone())
+            })
+        })
+        .flatten();
+    if !ctx.force && reuse.is_none() && cache_ino != 0 {
         if let Some(cache) = ctx.cache {
             if let Some(entry) = cache.lookup(cache_dev, cache_ino) {
                 if entry.size == meta.len()
@@ -5777,6 +5791,78 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         restore(&high_dest, &new, out.path()).await.unwrap();
         assert_eq!(std::fs::read(out.path().join("blob.bin")).unwrap(), data);
+    }
+
+    /// `--force` catches a content change that preserved the file's size and
+    /// mtime — which the incremental heuristic misses — by re-reading every file.
+    /// The test first demonstrates the miss (a normal re-backup restores the stale
+    /// content), then that a forced backup captures the new content.
+    #[tokio::test]
+    async fn force_catches_an_mtime_preserving_edit() {
+        let src = tempfile::tempdir().unwrap();
+        let path = src.path().join("f");
+        std::fs::write(&path, b"alpha111").unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap();
+
+        // Edit the content but keep the same length, then reset the mtime so the
+        // size+mtime heuristic sees an unchanged file.
+        std::fs::write(&path, b"bravo222").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        // A normal backup trusts the heuristic and reuses the old chunks, so the
+        // restored file is stale — the change was missed.
+        let missed =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap();
+        assert_eq!(
+            missed.summary.files_unmodified, 1,
+            "heuristic saw no change"
+        );
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &missed.snapshot.unwrap(), out.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("f")).unwrap(),
+            b"alpha111",
+            "without --force the edit is missed"
+        );
+
+        // With --force the file is re-read and the new content is captured.
+        let forced = BackupOptions {
+            force: true,
+            ..Default::default()
+        };
+        let caught = backup_sources_with_options(&mut repo, &sources, &[], &forced, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            caught.summary.files_changed, 1,
+            "--force re-read and saw it"
+        );
+        let out2 = tempfile::tempdir().unwrap();
+        restore(&repo, &caught.snapshot.unwrap(), out2.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out2.path().join("f")).unwrap(),
+            b"bravo222",
+            "--force captured the new content"
+        );
     }
 
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
