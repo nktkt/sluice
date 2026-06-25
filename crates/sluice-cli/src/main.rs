@@ -506,6 +506,9 @@ enum KeyCmd {
     Add {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit the new key id as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a key by id (refused if it is the last key).
     Remove {
@@ -513,11 +516,17 @@ enum KeyCmd {
         repo: String,
         /// The key id to remove (as shown by `key list`).
         id: String,
+        /// Emit the result as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Change the current passphrase, rotating out its key.
     Passwd {
         /// Repository path or object-store URL.
         repo: String,
+        /// Emit the new key id as machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1850,27 +1859,56 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     }
                 }
             }
-            KeyCmd::Add { repo } => {
+            KeyCmd::Add { repo, json } => {
                 let repository = Repository::open(backend(&repo, false).await?, pw).await?;
                 let new_pass = read_new_passphrase()?;
                 let id = repository
                     .add_key(new_pass.as_bytes(), kdf_params())
                     .await?;
-                println!("added key {id}");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "key_id": id.to_string() })
+                        )?
+                    );
+                } else {
+                    println!("added key {id}");
+                }
             }
-            KeyCmd::Remove { repo, id } => {
+            KeyCmd::Remove { repo, id, json } => {
                 let repository = Repository::open(backend(&repo, false).await?, pw).await?;
                 let key_id: Id = id.parse().map_err(|_| "invalid key id")?;
                 repository.remove_key(&key_id).await?;
-                println!("removed key {key_id}");
+                if json {
+                    let remaining = repository.list_keys().await?.len();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "removed": key_id.to_string(),
+                            "keys": remaining,
+                        }))?
+                    );
+                } else {
+                    println!("removed key {key_id}");
+                }
             }
-            KeyCmd::Passwd { repo } => {
+            KeyCmd::Passwd { repo, json } => {
                 let repository = Repository::open(backend(&repo, false).await?, pw).await?;
                 let new_pass = read_new_passphrase()?;
                 let id = repository
                     .change_passphrase(new_pass.as_bytes(), kdf_params())
                     .await?;
-                println!("changed passphrase; new key {id}");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(
+                            &serde_json::json!({ "key_id": id.to_string() })
+                        )?
+                    );
+                } else {
+                    println!("changed passphrase; new key {id}");
+                }
             }
         },
         Command::Cat { object } => {

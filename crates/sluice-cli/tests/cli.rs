@@ -1297,6 +1297,72 @@ fn init_tag_unlock_rebuild_index_emit_json() {
 }
 
 #[test]
+fn key_add_remove_passwd_emit_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    sluice().arg("init").arg(&repo).assert().success();
+
+    // key add --json reports the new key id.
+    let o = sluice()
+        .env("SLUICE_NEW_PASSWORD", "second")
+        .arg("key")
+        .arg("add")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let added = v["key_id"].as_str().unwrap().to_string();
+    assert_eq!(added.len(), 64);
+
+    // Now there are two keys.
+    let o = sluice()
+        .arg("key")
+        .arg("list")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 2);
+
+    // key remove --json reports the removed id and the remaining count.
+    let o = sluice()
+        .arg("key")
+        .arg("remove")
+        .arg(&repo)
+        .arg(&added)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["removed"], added);
+    assert_eq!(v["keys"], 1);
+
+    // key passwd --json rotates the primary key (do this last: it invalidates the
+    // helper's integration-pw). The new id differs from the removed one.
+    let o = sluice()
+        .env("SLUICE_NEW_PASSWORD", "rotated")
+        .arg("key")
+        .arg("passwd")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let rotated = v["key_id"].as_str().unwrap();
+    assert_eq!(rotated.len(), 64);
+    assert_ne!(rotated, added);
+
+    // The rotated passphrase now opens the repository.
+    let mut cmd = Command::cargo_bin("sluice").unwrap();
+    cmd.env("SLUICE_PASSWORD", "rotated")
+        .env("SLUICE_KDF_MEMORY_KIB", "16")
+        .env("SLUICE_KDF_PASSES", "1");
+    cmd.arg("snapshots").arg(&repo).assert().success();
+}
+
+#[test]
 fn backup_force_rereads_unchanged_files() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
