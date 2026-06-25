@@ -5705,6 +5705,51 @@ mod tests {
         );
     }
 
+    /// The integrity guarantee that matters most on the read path: restore must
+    /// never hand back silently-corrupt data. A flipped byte in a pack makes the
+    /// AEAD tag fail to authenticate, so the restore errors instead of writing
+    /// wrong bytes — even though the same data restores fine when untampered.
+    #[tokio::test]
+    async fn restore_detects_a_corrupt_pack_rather_than_writing_wrong_data() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), vec![7u8; 6000]).unwrap();
+        let snap = {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap()
+        };
+
+        // Healthy baseline: an untampered restore reproduces the data.
+        {
+            let repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+            let out = tempfile::tempdir().unwrap();
+            restore(&repo, &snap, out.path()).await.unwrap();
+            assert_eq!(
+                std::fs::read(out.path().join("a")).unwrap(),
+                vec![7u8; 6000]
+            );
+        }
+
+        // With a flipped byte in a pack, the restore fails rather than returning
+        // unauthenticated bytes.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Pack,
+                target: None,
+            },
+            b"pw",
+        )
+        .await
+        .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            restore(&repo, &snap, out.path()).await.is_err(),
+            "restoring corrupt data must error, never write silently-wrong bytes"
+        );
+    }
+
     #[tokio::test]
     async fn corrupted_metadata_is_a_clean_error_not_a_panic() {
         use std::sync::Arc;
