@@ -1,5 +1,8 @@
-//! `sluice-scan` — parallel filesystem discovery, ignore rules, incremental
-//! change detection, and bounded-memory tree assembly.
+//! `sluice-scan` — placeholder for a standalone filesystem-scanner crate.
 //!
-//! Unchanged files are detected from a local stat-cache and bypass the CPU
-//! pipeline entirely (see `DESIGN.md` §5.1). Pre-alpha skeleton (milestone M1).
+//! The filesystem discovery the design envisaged here — the parallel directory
+//! walk, ignore/exclude rules, incremental change detection against the parent
+//! snapshot or the stat cache, and bounded-memory tree assembly — is **already
+//! implemented and shipped**, but inside `sluice-engine`'s backup walk rather than
+//! this crate (see `DESIGN.md` §5.1). This crate is intentionally empty, reserving
+//! the name should that scanner ever be extracted into a standalone module.

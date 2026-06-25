@@ -199,6 +199,8 @@ sluice/                          # Cargo workspace root
 
 依存方向は厳格に一方向: `core ← crypto, chunk, store ← index, scan ← repo ← engine ← cli`。`sluice-core` は I/O・UI に非依存で、エンジンと CLI を分離する seam を作る（FUSE/daemon フロントエンドの再利用を可能にする）。
 
+> **現状の注記**: 上図はクレート分割の理想形。出荷済みの実装では **`sluice-index` と `sluice-scan` は空のプレースホルダ**で、それぞれの機能は他クレートに統合されている — 重複排除インデックス（chunk id → pack 位置のマップ、open 時に pack フッタから再構築、`rebuild-index`）と redb stat-cache は `sluice-repo`/`sluice-engine` に、ファイル走査（並列ウォーク・除外規則・増分判定・有界メモリ木組立）は `sluice-engine` のバックアップウォークに実装済み。両クレート名は将来のモジュール抽出のために予約されている。`sluice-store` の `S3Worm` 実装も未着手。
+
 ---
 
 ## 5. 主要サブシステム
