@@ -667,8 +667,29 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 // With --verbose, print each file as it is restored (to stderr,
                 // like `backup -v`, leaving stdout for the completion line).
                 let report_file = |path: &std::path::Path| eprintln!("{}", path.display());
-                let progress: Option<sluice_engine::RestoreProgressFn> =
-                    if verbose { Some(&report_file) } else { None };
+                // Otherwise show a live spinner on a terminal (hidden when piped).
+                let spinner = (!verbose && std::io::stderr().is_terminal()).then(|| {
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(
+                        ProgressStyle::with_template("{spinner:.green} {pos} files  {wide_msg}")
+                            .unwrap(),
+                    );
+                    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+                    pb
+                });
+                let tick = |path: &std::path::Path| {
+                    if let Some(pb) = &spinner {
+                        pb.inc(1);
+                        pb.set_message(path.display().to_string());
+                    }
+                };
+                let progress: Option<sluice_engine::RestoreProgressFn> = if verbose {
+                    Some(&report_file)
+                } else if spinner.is_some() {
+                    Some(&tick)
+                } else {
+                    None
+                };
                 let mut report = RestoreReport::default();
                 if paths.is_empty() {
                     report = restore_filtered(
@@ -696,6 +717,9 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         report.warnings += r.warnings;
                         report.messages.extend(r.messages);
                     }
+                }
+                if let Some(pb) = &spinner {
+                    pb.finish_and_clear();
                 }
                 println!("restored {id} into {}", target.display());
                 if report.warnings > 0 {

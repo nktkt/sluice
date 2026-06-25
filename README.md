@@ -110,7 +110,9 @@ prunes a matching entry, and a matching directory along with its whole subtree.
 `--skip-existing` makes a restore idempotent and resumable: an entry already
 present and matching (for files, same size and mtime) is left untouched, so
 re-running after an interruption only fills the gaps. `--verify` re-reads each
-file after writing and fails if its contents do not match the snapshot.
+file after writing and fails if its contents do not match the snapshot. Like
+backup, restore shows a live spinner on a terminal (hidden when piped), while
+`-v` prints each restored file.
 
 Every listing and result command accepts `--json` for machine-readable output,
 and commands return stable exit codes (3 restore finished with warnings, 10 repo
