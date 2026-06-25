@@ -599,12 +599,14 @@ pack サイズ・object count・アクセスタイミング（high-threat ユー
 > `--files-from`、`--stdin`、オンディスク stat-cache（`--cache`、redb、`(dev,ino)→chunk-ids`、
 > 再利用はリポジトリ内 blob 存在で必ずゲート）、**チャンク毎 compress+encrypt の rayon 並列化**、
 > および実行単位の上書き — `--compression`（dedup 不変）/`--force`（mtime 据え置き編集の捕捉）/
-> `--time`（明示タイムスタンプ、retention の基準）/`--host`（明示ホスト名）。
-> **inspect**: `snapshots`（`--tag/--host/--path/--last/--group-by host|paths`）、`ls`、`find`、`diff`、
+> `--time`（明示タイムスタンプ、retention の基準）/`--host`（明示ホスト名）、
+> `--skip-if-unchanged`（親と tree 同一ならスナップショット作成を省略）、`--dry-run`（プレビュー）。
+> **inspect**: `snapshots`（`--tag/--host/--path/--last/--group-by host|paths/--compact`）、`ls`、`find`、`diff`、
 > `dump`、`cat`、`info`、`stats`（リポジトリ全体 + `stats <snapshot>` で復元サイズ・エントリ数・dedup 後 raw サイズ）。
 > **restore**: フル/サブパス/glob フィルタ（`--include`/`--exclude` + `--include-from`/`--exclude-from`）、
-> `--skip-existing`（再開）、`--verify`、`--delete`（ミラー＝対象をスナップショットに完全一致、
-> 生バイト比較・シンボリックリンク非追従で安全）、sparse 自動再現。
+> `--skip-existing`（再開）、`--skip-newer`（ローカルが新しいファイルを保護）、`--verify`、
+> `--delete`（ミラー＝対象をスナップショットに完全一致、生バイト比較・シンボリックリンク非追従で安全）、
+> `--dry-run`（`-v` で対象ファイル一覧）、sparse 自動再現。
 > **整合性/保守**: `verify`/`verify --sample`/`check`（いずれも `<snapshot>` 指定で単一スナップショット・ターゲティング可）、
 > `forget`（keep-last/hourly/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・
 > `--keep-within-hourly/daily/weekly/monthly/yearly`・`--group-by`・`--prune`）/
