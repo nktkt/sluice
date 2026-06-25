@@ -6092,6 +6092,67 @@ mod tests {
         assert_eq!(std::fs::read(out.path().join("blob.bin")).unwrap(), data);
     }
 
+    /// Copy is a faithful replica: it re-encrypts under the destination's keys
+    /// (so the snapshot id changes) but preserves every other snapshot field
+    /// (time, host, tags, user, summary), restores byte-identically, and is
+    /// idempotent (re-copying yields the same id without a duplicate).
+    #[tokio::test]
+    async fn copy_preserves_snapshot_metadata() {
+        let src_dir = tempfile::tempdir().unwrap();
+        std::fs::write(src_dir.path().join("f"), b"payload data").unwrap();
+
+        let mut srcrepo = Repository::init(MemoryBackend::new(), b"src-pw", fast())
+            .await
+            .unwrap();
+        srcrepo.set_snapshot_time(Some(1_577_836_800_000_000_000)); // 2020-01-01 UTC
+        srcrepo.set_snapshot_host(Some("fileserver".into()));
+        let src_id = backup_sources_with_options(
+            &mut srcrepo,
+            &[src_dir.path().to_path_buf()],
+            &["important".into(), "weekly".into()],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        let src = srcrepo.load_snapshot(&src_id).await.unwrap();
+
+        // Destination uses a different passphrase (independent keys).
+        let mut dstrepo = Repository::init(MemoryBackend::new(), b"dst-pw", fast())
+            .await
+            .unwrap();
+        let new_id = copy_snapshot(&srcrepo, &mut dstrepo, &src_id)
+            .await
+            .unwrap();
+
+        // Re-encryption changes the id but nothing else of substance.
+        assert_ne!(new_id, src_id, "re-encryption gives a new id");
+        let dst = dstrepo.load_snapshot(&new_id).await.unwrap();
+        assert_eq!(dst.time_ns, src.time_ns);
+        assert_eq!(dst.hostname, "fileserver");
+        assert_eq!(dst.username, src.username);
+        assert_eq!(dst.tags, src.tags);
+        assert_eq!(dst.summary, src.summary);
+        assert!(dst.parent.is_none());
+
+        // The copied data restores byte-identically.
+        let out = tempfile::tempdir().unwrap();
+        restore(&dstrepo, &new_id, out.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("f")).unwrap(),
+            b"payload data"
+        );
+
+        // Re-copying is idempotent: same destination id, no second snapshot.
+        let again = copy_snapshot(&srcrepo, &mut dstrepo, &src_id)
+            .await
+            .unwrap();
+        assert_eq!(again, new_id);
+        assert_eq!(dstrepo.list_snapshots().await.unwrap().len(), 1);
+    }
+
     /// `--force` catches a content change that preserved the file's size and
     /// mtime — which the incremental heuristic misses — by re-reading every file.
     /// The test first demonstrates the miss (a normal re-backup restores the stale

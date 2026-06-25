@@ -968,6 +968,61 @@ fn restore_emits_json() {
 }
 
 #[test]
+fn copy_preserves_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"data").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    // Back up with non-default host, tag and time.
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args([
+            "--host",
+            "fileserver",
+            "--tag",
+            "important",
+            "--time",
+            "1577836800",
+        ])
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .arg(&snap[..12])
+        .assert()
+        .success();
+
+    // The destination snapshot keeps the host, tag and time but has a new id.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&dest)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["hostname"], "fileserver");
+    assert_eq!(arr[0]["tags"], serde_json::json!(["important"]));
+    assert_eq!(arr[0]["time_ns"], 1_577_836_800_000_000_000i64);
+    assert_ne!(arr[0]["id"].as_str().unwrap(), snap, "copy re-encrypts");
+}
+
+#[test]
 fn copy_emits_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
