@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 241 tests across
+machine-readable JSON output, and stable exit codes. Backed by 243 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -160,6 +160,7 @@ could not apply — ownership, extended attributes, or device nodes it had to sk
 ```sh
 sluice check  ./repo              # fast: authenticate trees, confirm referenced blobs exist
 sluice verify ./repo              # thorough: read & authenticate every blob (read-data check)
+sluice verify ./repo <snapshot>   # verify just one snapshot (fast targeted integrity check)
 sluice verify ./repo --sample 10  # spot-check: read & authenticate a random 10% of blobs
 ```
 
@@ -169,7 +170,9 @@ which authenticates all stored data. `verify --sample <PERCENT>` walks every
 tree but reads only a uniformly random fraction of the content blobs, catching
 bit-rot probabilistically: cheap enough to run often on a large repository,
 while a periodic full `verify` still reads everything, showing a live spinner on
-a terminal (hidden when piped or with `--json`). All three exit with code 13
+a terminal (hidden when piped or with `--json`). Passing a snapshot id verifies
+just that one snapshot's blobs — a fast targeted integrity check of a single
+important backup before relying on it. All three exit with code 13
 (corruption) on any integrity failure — a missing referenced blob, or a failed
 authentication tag — so a scheduled check can alert on a non-zero status.
 
@@ -395,7 +398,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 241 tests
+cargo test     # 243 tests
 ```
 
 ## Caveats

@@ -232,6 +232,9 @@ enum Command {
     Verify {
         /// Repository path or object-store URL.
         repo: String,
+        /// Verify only this snapshot (a unique hex prefix); omit to verify every
+        /// snapshot in the repository.
+        snapshot: Option<String>,
         /// Read only this percentage (1-100) of content blobs, chosen at random,
         /// for a fast probabilistic spot-check. Trees are always fully verified.
         #[arg(long, value_name = "PERCENT")]
@@ -1175,13 +1178,27 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 println!("no change");
             }
         }
-        Command::Verify { repo, sample, json } => {
-            let options = match sample {
-                Some(p) if (1..=100).contains(&p) => VerifyOptions { sample_percent: p },
+        Command::Verify {
+            repo,
+            snapshot,
+            sample,
+            json,
+        } => {
+            let sample_percent = match sample {
+                Some(p) if (1..=100).contains(&p) => p,
                 Some(p) => return Err(format!("--sample must be 1-100, got {p}").into()),
-                None => VerifyOptions::default(),
+                None => VerifyOptions::default().sample_percent,
             };
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+            // Resolve an optional snapshot prefix to verify just that one.
+            let only = match &snapshot {
+                Some(s) => Some(resolve_snapshot(&repository, s).await?),
+                None => None,
+            };
+            let options = VerifyOptions {
+                sample_percent,
+                only,
+            };
             // A live spinner on a terminal (verify can read a lot of data); hidden
             // when piped or with --json.
             let spinner = (!json && std::io::stderr().is_terminal()).then(|| {

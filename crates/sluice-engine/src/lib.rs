@@ -1130,12 +1130,17 @@ pub struct VerifyOptions {
     /// everything; a smaller value trades completeness for speed, so a large
     /// repository can be spot-checked often and fully verified occasionally.
     pub sample_percent: u8,
+    /// Verify only this snapshot's blobs instead of every snapshot's. `None`
+    /// verifies the whole repository; `Some(id)` targets one snapshot — a fast
+    /// integrity check of a single important backup before relying on it.
+    pub only: Option<Id>,
 }
 
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
             sample_percent: 100,
+            only: None,
         }
     }
 }
@@ -1191,7 +1196,12 @@ pub async fn verify_with_progress<B: StorageBackend>(
 
     let mut report = VerifyReport::default();
     let mut content: HashSet<Id> = HashSet::new();
-    for snapshot in repo.list_snapshots().await? {
+    // Verify one snapshot if targeted, otherwise the whole repository.
+    let snapshots = match options.only {
+        Some(id) => vec![id],
+        None => repo.list_snapshots().await?,
+    };
+    for snapshot in snapshots {
         let snap = repo.load_snapshot(&snapshot).await?;
         report.snapshots += 1;
         collect_verify(repo, snap.tree, &mut report, &mut content).await?;
@@ -3325,9 +3335,15 @@ mod tests {
 
         // A 25% sample reads ten of the forty, still reporting the true total,
         // and the reads themselves authenticate (so it returns Ok).
-        let sampled = verify_with(&repo, VerifyOptions { sample_percent: 25 })
-            .await
-            .unwrap();
+        let sampled = verify_with(
+            &repo,
+            VerifyOptions {
+                sample_percent: 25,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(sampled.total_blobs, 40, "denominator is the full set");
         assert_eq!(sampled.blobs, 10, "ceil(40 * 25/100) == 10 read");
         assert_eq!(sampled.snapshots, full.snapshots);
@@ -3338,11 +3354,65 @@ mod tests {
             &repo,
             VerifyOptions {
                 sample_percent: 100,
+                ..Default::default()
             },
         )
         .await
         .unwrap();
         assert_eq!(whole.blobs, 40);
+    }
+
+    /// Targeting a snapshot verifies only that snapshot's blobs, not the whole
+    /// repository's.
+    #[tokio::test]
+    async fn verify_targets_a_single_snapshot() {
+        let s1 = tempfile::tempdir().unwrap();
+        std::fs::write(s1.path().join("a"), vec![1u8; 5000]).unwrap();
+        let s2 = tempfile::tempdir().unwrap();
+        std::fs::write(s2.path().join("b"), vec![2u8; 5000]).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup_sources_with_options(
+            &mut repo,
+            &[s1.path().to_path_buf()],
+            &[],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        backup_sources_with_options(
+            &mut repo,
+            &[s2.path().to_path_buf()],
+            &[],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The whole repository has two snapshots and two distinct blobs.
+        let whole = verify(&repo).await.unwrap();
+        assert_eq!(whole.snapshots, 2);
+        assert_eq!(whole.total_blobs, 2);
+
+        // Targeting snap1 verifies just its one snapshot and one blob.
+        let one = verify_with(
+            &repo,
+            VerifyOptions {
+                only: Some(snap1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(one.snapshots, 1);
+        assert_eq!(one.total_blobs, 1);
+        assert_eq!(one.blobs, 1);
     }
 
     #[tokio::test]
