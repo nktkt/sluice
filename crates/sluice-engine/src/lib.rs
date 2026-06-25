@@ -6435,6 +6435,40 @@ mod tests {
         }
     }
 
+    /// Copying a complex random tree to a second repository (re-encrypting every
+    /// blob and rebuilding every tree under independent keys) yields a faithful
+    /// replica: restoring from the copy reproduces the source's structure,
+    /// content, mode, mtime and link targets exactly. Exercises copy across all
+    /// the entry kinds build_random_tree_meta produces, not just a single file.
+    #[tokio::test]
+    async fn copy_of_a_random_tree_is_a_faithful_replica() {
+        for seed in [3u64, 71, 5_000] {
+            let src = tempfile::tempdir().unwrap();
+            let mut s = seed;
+            build_random_tree_meta(src.path(), 3, &mut s);
+
+            let mut srcrepo = Repository::init(MemoryBackend::new(), b"src", fast())
+                .await
+                .unwrap();
+            let snap = backup(&mut srcrepo, src.path()).await.unwrap();
+
+            // Copy to a destination with independent keys, then restore from it.
+            let mut dstrepo = Repository::init(MemoryBackend::new(), b"dst", fast())
+                .await
+                .unwrap();
+            let new_id = copy_snapshot(&srcrepo, &mut dstrepo, &snap).await.unwrap();
+
+            let out = tempfile::tempdir().unwrap();
+            restore(&dstrepo, &new_id, out.path()).await.unwrap();
+
+            assert_eq!(
+                collect_meta(src.path()),
+                collect_meta(out.path()),
+                "copy metadata mismatch for seed {seed}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn backup_of_a_nonexistent_source_errors() {
         let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
