@@ -333,6 +333,11 @@ enum Command {
         /// Shell to generate completions for.
         shell: clap_complete::Shell,
     },
+    /// Write troff man pages (sluice.1 and one per subcommand) into a directory.
+    Man {
+        /// Directory to write the man pages into (created if absent).
+        dir: PathBuf,
+    },
 }
 
 /// How `forget` partitions snapshots before applying retention.
@@ -438,7 +443,7 @@ fn exit_code(error: &(dyn Error + 'static)) -> i32 {
 #[tokio::main]
 async fn run() -> Result<i32, Box<dyn Error>> {
     let cli = Cli::parse();
-    // Generating completions needs neither a repository nor a passphrase.
+    // Generating completions or man pages needs neither a repository nor a passphrase.
     if let Command::Completions { shell } = &cli.command {
         clap_complete::generate(
             *shell,
@@ -446,6 +451,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             "sluice",
             &mut std::io::stdout(),
         );
+        return Ok(0);
+    }
+    if let Command::Man { dir } = &cli.command {
+        write_man_pages(dir)?;
         return Ok(0);
     }
     let confirm = matches!(cli.command, Command::Init { .. });
@@ -1348,9 +1357,33 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             }
         }
         // Handled before the passphrase prompt above.
-        Command::Completions { .. } => unreachable!(),
+        Command::Completions { .. } | Command::Man { .. } => unreachable!(),
     }
     Ok(exit)
+}
+
+/// Write a troff man page for the top-level command and one for each subcommand
+/// into `dir` (creating it if absent). Used by `sluice man`.
+fn write_man_pages(dir: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir_all(dir)?;
+    let render = |cmd: clap::Command, file: PathBuf| -> Result<(), Box<dyn Error>> {
+        let mut buf = Vec::new();
+        clap_mangen::Man::new(cmd).render(&mut buf)?;
+        std::fs::write(file, &buf)?;
+        Ok(())
+    };
+    let cmd = Cli::command();
+    render(cmd.clone(), dir.join("sluice.1"))?;
+    let mut count = 1usize;
+    for sub in cmd.get_subcommands() {
+        render(
+            sub.clone(),
+            dir.join(format!("sluice-{}.1", sub.get_name())),
+        )?;
+        count += 1;
+    }
+    eprintln!("wrote {count} man pages to {}", dir.display());
+    Ok(())
 }
 
 /// Open (or, when `create`, create) the storage backend for `repo` — a local

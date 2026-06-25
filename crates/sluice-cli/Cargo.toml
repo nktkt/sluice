@@ -20,6 +20,7 @@ sluice-repo = { path = "../sluice-repo" }
 sluice-store = { path = "../sluice-store" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
+clap_mangen = { workspace = true }
 tokio = { workspace = true }
 rpassword = { workspace = true }
 object_store = { workspace = true }

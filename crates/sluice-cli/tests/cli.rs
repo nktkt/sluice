@@ -292,6 +292,25 @@ fn completions_generate_without_a_passphrase() {
 }
 
 #[test]
+fn man_pages_are_written_without_a_passphrase() {
+    let dir = tempfile::tempdir().unwrap();
+    // No SLUICE_PASSWORD set: man-page generation must not require it.
+    Command::cargo_bin("sluice")
+        .unwrap()
+        .arg("man")
+        .arg(dir.path())
+        .assert()
+        .success();
+
+    let top = std::fs::read_to_string(dir.path().join("sluice.1")).unwrap();
+    assert!(top.contains(".TH"), "sluice.1 is a troff man page");
+    assert!(top.to_lowercase().contains("sluice"));
+    // A page is written per subcommand.
+    assert!(dir.path().join("sluice-backup.1").exists());
+    assert!(dir.path().join("sluice-restore.1").exists());
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 207 tests across
+machine-readable JSON output, and stable exit codes. Backed by 208 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -198,14 +198,16 @@ sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempo
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
 source's). Re-running copies only what is missing.
 
-### Shell completions
+### Shell completions and man pages
 
 ```sh
 sluice completions bash  > /etc/bash_completion.d/sluice   # also: zsh, fish, powershell, elvish
+sluice man /usr/share/man/man1                             # writes sluice.1 and sluice-<cmd>.1
 ```
 
-`completions <shell>` prints a completion script to stdout; it needs no
-repository or passphrase.
+`completions <shell>` prints a completion script to stdout, and `man <dir>`
+writes a troff man page for the tool and one per subcommand into `<dir>`. Neither
+needs a repository or passphrase.
 
 ### Offsite: object storage
 
@@ -331,7 +333,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 207 tests
+cargo test     # 208 tests
 ```
 
 ## Caveats
