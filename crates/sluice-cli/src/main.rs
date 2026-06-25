@@ -501,6 +501,13 @@ enum CatObject {
         /// Tree object id (full hex, as shown by `cat snapshot`).
         id: String,
     },
+    /// A data blob's raw decrypted bytes (written to stdout, not JSON).
+    Blob {
+        /// Repository path or object-store URL.
+        repo: String,
+        /// Blob (chunk) id (full hex, as shown by `cat tree` under `content`).
+        id: String,
+    },
 }
 
 /// Sub-commands of `key`.
@@ -2052,6 +2059,16 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         })
                         .collect();
                     serde_json::json!({ "nodes": nodes })
+                }
+                CatObject::Blob { repo, id } => {
+                    // A blob is arbitrary bytes, not JSON: decrypt and stream the
+                    // raw contents to stdout, then return.
+                    let repository = Repository::open(backend(&repo, false).await?, pw).await?;
+                    let bid: Id = id.parse().map_err(|_| "invalid blob id")?;
+                    let bytes = repository.load_blob(&bid).await?;
+                    use std::io::Write;
+                    std::io::stdout().write_all(&bytes)?;
+                    return Ok(0);
                 }
             };
             println!("{}", serde_json::to_string_pretty(&value)?);

@@ -2493,6 +2493,77 @@ fn diff_emits_json() {
 }
 
 #[test]
+fn cat_blob_dumps_raw_decrypted_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // A small file fits in a single chunk, so its one content blob equals the file.
+    let content = b"hello, this is the blob content";
+    std::fs::write(src.join("f"), content).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let snap = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // Walk cat snapshot -> tree -> the file node's content blob id.
+    let s: serde_json::Value = serde_json::from_slice(
+        &sluice()
+            .arg("cat")
+            .arg("snapshot")
+            .arg(&repo)
+            .arg(&snap[..12])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    let tree = s["tree"].as_str().unwrap().to_string();
+    let t: serde_json::Value = serde_json::from_slice(
+        &sluice()
+            .arg("cat")
+            .arg("tree")
+            .arg(&repo)
+            .arg(&tree)
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .unwrap();
+    let node = t["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"] == "f")
+        .unwrap();
+    let blob = node["content"][0].as_str().unwrap().to_string();
+
+    // cat blob writes the raw decrypted bytes — here, the whole file.
+    let out = sluice()
+        .arg("cat")
+        .arg("blob")
+        .arg(&repo)
+        .arg(&blob)
+        .assert()
+        .success();
+    assert_eq!(out.get_output().stdout, content);
+}
+
+#[test]
 fn cat_emits_config_snapshot_and_tree_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

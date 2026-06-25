@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 272 tests across
+machine-readable JSON output, and stable exit codes. Backed by 273 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -135,6 +135,7 @@ sluice info      ./repo                         # repository overview (counts, c
 sluice stats     ./repo                         # repo-wide: logical vs stored bytes, dedup %
 sluice stats     ./repo <snapshot>              # one snapshot: restore size, entry counts, deduped raw size
 sluice cat       ./repo snapshot <id>           # decrypted object as JSON (config|snapshot|tree)
+sluice cat       ./repo blob <id>               # a data blob's raw decrypted bytes (audit any chunk)
 sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix ok)
 sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
 sluice restore   ./repo <snapshot> ./out --include '**/*.pdf'        # only matching files (glob)
@@ -480,7 +481,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 272 tests
+cargo test     # 273 tests
 ```
 
 ## Caveats
