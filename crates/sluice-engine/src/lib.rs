@@ -1028,7 +1028,21 @@ pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyRep
     verify_with(repo, VerifyOptions::default()).await
 }
 
+/// A callback invoked once per content blob as it is read and authenticated by
+/// [`verify_with_progress`], for progress display.
+pub type VerifyProgressFn<'a> = &'a (dyn Fn() + Sync);
+
 /// Verify `repo`, optionally reading only a random sample of the content blobs.
+/// Equivalent to [`verify_with_progress`] without a progress callback.
+pub async fn verify_with<B: StorageBackend>(
+    repo: &Repository<B>,
+    options: VerifyOptions,
+) -> Result<VerifyReport> {
+    verify_with_progress(repo, options, None).await
+}
+
+/// Verify `repo`, invoking `progress` (if any) once per content blob as it is
+/// read.
 ///
 /// The trees are always walked and authenticated in full (this is cheap and
 /// proves the snapshot structure), collecting the set of referenced content
@@ -1041,9 +1055,10 @@ pub async fn verify<B: StorageBackend>(repo: &Repository<B>) -> Result<VerifyRep
 ///
 /// Returns the counts on success, or an error identifying a missing or corrupt
 /// object.
-pub async fn verify_with<B: StorageBackend>(
+pub async fn verify_with_progress<B: StorageBackend>(
     repo: &Repository<B>,
     options: VerifyOptions,
+    progress: Option<VerifyProgressFn<'_>>,
 ) -> Result<VerifyReport> {
     use futures::stream::{StreamExt, TryStreamExt};
 
@@ -1070,7 +1085,12 @@ pub async fn verify_with<B: StorageBackend>(
     // checks the AEAD tag, so any corrupt or missing blob surfaces as an error.
     futures::stream::iter(to_read.iter().map(|id| repo.load_blob(id)))
         .buffer_unordered(VERIFY_CONCURRENCY)
-        .try_for_each(|_| async { Ok(()) })
+        .try_for_each(|_| async {
+            if let Some(p) = progress {
+                p();
+            }
+            Ok(())
+        })
         .await?;
     Ok(report)
 }

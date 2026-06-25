@@ -22,7 +22,8 @@ use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
     check, copy_all, copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy,
-    list_files, prune, prune_excluding, rebuild_index, restore_filtered, retag, verify_with,
+    list_files, prune, prune_excluding, rebuild_index, restore_filtered, retag,
+    verify_with_progress,
 };
 use sluice_repo::{RepoError, Repository};
 use sluice_store::{FileType, LocalBackend, ObjectStoreBackend, StorageBackend};
@@ -869,7 +870,27 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 None => VerifyOptions::default(),
             };
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let report = verify_with(&repository, options).await?;
+            // A live spinner on a terminal (verify can read a lot of data); hidden
+            // when piped or with --json.
+            let spinner = (!json && std::io::stderr().is_terminal()).then(|| {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner:.green} {pos} blobs verified").unwrap(),
+                );
+                pb.enable_steady_tick(std::time::Duration::from_millis(120));
+                pb
+            });
+            let tick = || {
+                if let Some(pb) = &spinner {
+                    pb.inc(1);
+                }
+            };
+            let progress: Option<sluice_engine::VerifyProgressFn> =
+                if spinner.is_some() { Some(&tick) } else { None };
+            let report = verify_with_progress(&repository, options, progress).await?;
+            if let Some(pb) = &spinner {
+                pb.finish_and_clear();
+            }
             if json {
                 println!(
                     "{}",

@@ -134,9 +134,10 @@ present via the index, without reading file data — much cheaper than `verify`,
 which authenticates all stored data. `verify --sample <PERCENT>` walks every
 tree but reads only a uniformly random fraction of the content blobs, catching
 bit-rot probabilistically: cheap enough to run often on a large repository,
-while a periodic full `verify` still reads everything. All three exit with code
-13 (corruption) on any integrity failure — a missing referenced blob, or a
-failed authentication tag — so a scheduled check can alert on a non-zero status.
+while a periodic full `verify` still reads everything, showing a live spinner on
+a terminal (hidden when piped or with `--json`). All three exit with code 13
+(corruption) on any integrity failure — a missing referenced blob, or a failed
+authentication tag — so a scheduled check can alert on a non-zero status.
 
 ### Retention and pruning
 
