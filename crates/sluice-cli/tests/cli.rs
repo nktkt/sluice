@@ -3334,3 +3334,77 @@ fn copy_verify_confirms_the_destination() {
         .success();
     assert_eq!(std::fs::read(out.join("f")).unwrap(), b"hello");
 }
+
+#[test]
+fn tag_bulk_edits_snapshots_by_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("f"), b"x").unwrap();
+    std::fs::write(b.join("f"), b"y").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .args(["--host", "db1"])
+        .assert()
+        .success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&b)
+        .args(["--host", "db1"])
+        .assert()
+        .success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .args(["--host", "web1"])
+        .assert()
+        .success();
+
+    // Bulk-tag every db1-host snapshot with 'keep'.
+    let o = sluice()
+        .arg("tag")
+        .arg(&repo)
+        .args(["--host", "db1", "--add", "keep", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    assert_eq!(v["matched"], 2);
+    assert_eq!(v["changed"], 2);
+
+    // Exactly the two db1 snapshots are tagged; the web1 one is untouched.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    let arr = snaps.as_array().unwrap();
+    let has_keep =
+        |s: &serde_json::Value| s["tags"].as_array().unwrap().iter().any(|t| t == "keep");
+    assert_eq!(arr.iter().filter(|s| has_keep(s)).count(), 2);
+    assert_eq!(
+        arr.iter()
+            .filter(|s| s["hostname"] == "web1" && has_keep(s))
+            .count(),
+        0
+    );
+
+    // A snapshot id together with a selector is rejected.
+    let snap = arr[0]["id"].as_str().unwrap().to_string();
+    sluice()
+        .arg("tag")
+        .arg(&repo)
+        .arg(&snap)
+        .args(["--host", "db1", "--add", "z"])
+        .assert()
+        .failure();
+}

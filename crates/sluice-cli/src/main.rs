@@ -265,14 +265,27 @@ enum Command {
     Tag {
         /// Repository path or object-store URL.
         repo: String,
-        /// Snapshot id (a unique hex prefix is accepted).
-        snapshot: String,
+        /// Snapshot id (a unique hex prefix). Omit to edit every snapshot the
+        /// --tag/--host/--path/--last selectors match (one of the two is required).
+        snapshot: Option<String>,
         /// Tag to add (repeatable).
         #[arg(long = "add", value_name = "TAG")]
         add: Vec<String>,
         /// Tag to remove (repeatable).
         #[arg(long = "remove", value_name = "TAG")]
         remove: Vec<String>,
+        /// Edit only snapshots that already have this tag (bulk selector).
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
+        /// Edit only snapshots taken on this host (bulk selector).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Edit only snapshots that backed up this source path (bulk selector).
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Edit only the N most recent of the selected snapshots.
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1393,27 +1406,88 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             snapshot,
             add,
             remove,
+            tag,
+            host,
+            path,
+            last,
             json,
         } => {
+            if add.is_empty() && remove.is_empty() {
+                return Err("specify at least one --add or --remove".into());
+            }
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let id = resolve_snapshot(&repository, &snapshot).await?;
-            let new_id = retag(&repository, &id, &add, &remove).await?;
-            let changed = new_id != id;
-            if json {
-                // Report the resulting snapshot's id and its tags after the edit.
-                let tags = repository.load_snapshot(&new_id).await?.tags;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "snapshot": new_id.to_string(),
-                        "changed": changed,
-                        "tags": tags,
-                    }))?
+            // A single snapshot id, or every snapshot the selectors match.
+            let filtered = tag.is_some() || host.is_some() || path.is_some() || last.is_some();
+            if snapshot.is_some() && filtered {
+                return Err(
+                    "a snapshot id cannot be combined with --tag/--host/--path/--last".into(),
                 );
-            } else if changed {
-                println!("{new_id}");
+            }
+            let single = snapshot.is_some();
+            let targets: Vec<Id> = match &snapshot {
+                Some(s) => vec![resolve_snapshot(&repository, s).await?],
+                None if filtered => {
+                    select_snapshots(
+                        &repository,
+                        tag.as_deref(),
+                        host.as_deref(),
+                        path.as_deref(),
+                        last,
+                    )
+                    .await?
+                }
+                None => {
+                    return Err(
+                        "specify a snapshot id or a --tag/--host/--path/--last selector".into(),
+                    );
+                }
+            };
+            // Retag each target; retag commits a new snapshot (same tree/history)
+            // and forgets the old, so the ids change only where tags changed.
+            let mut results: Vec<(Id, bool)> = Vec::with_capacity(targets.len());
+            for id in &targets {
+                let new_id = retag(&repository, id, &add, &remove).await?;
+                results.push((new_id, new_id != *id));
+            }
+
+            if single {
+                // Preserve the original single-snapshot output.
+                let (new_id, changed) = results[0];
+                if json {
+                    let tags = repository.load_snapshot(&new_id).await?.tags;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "snapshot": new_id.to_string(),
+                            "changed": changed,
+                            "tags": tags,
+                        }))?
+                    );
+                } else if changed {
+                    println!("{new_id}");
+                } else {
+                    println!("no change");
+                }
             } else {
-                println!("no change");
+                let changed = results.iter().filter(|(_, c)| *c).count();
+                if json {
+                    let arr: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|(id, c)| {
+                            serde_json::json!({ "snapshot": id.to_string(), "changed": c })
+                        })
+                        .collect();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "matched": results.len(),
+                            "changed": changed,
+                            "snapshots": arr,
+                        }))?
+                    );
+                } else {
+                    println!("retagged {changed} of {} snapshot(s)", results.len());
+                }
             }
         }
         Command::Verify {
