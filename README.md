@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 286 tests across
+machine-readable JSON output, and stable exit codes. Backed by 288 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -226,7 +226,11 @@ per-run cost (where `--sample` only covers probabilistically). It conflicts with
 `check` or `verify` restricts it to just that one snapshot — a fast targeted
 integrity check of a single important backup before relying on it. All three exit with code 13
 (corruption) on any integrity failure — a missing referenced blob, or a failed
-authentication tag — so a scheduled check can alert on a non-zero status.
+authentication tag — so a scheduled check can alert on a non-zero status. When
+`check` finds missing blobs it also names the **affected files** — which snapshot
+and path each is (in the human output and in `--json`'s `damaged` array) — so you
+can triage exactly what a lost pack cost and which files a `restore
+--ignore-errors` would skip, rather than staring at opaque blob ids.
 
 ### Retention and pruning
 
@@ -519,7 +523,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 286 tests
+cargo test     # 288 tests
 ```
 
 ## Caveats

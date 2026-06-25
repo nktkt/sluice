@@ -1475,6 +1475,17 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             let report = check_only(&repository, only).await?;
             if json {
                 let missing: Vec<String> = report.missing.iter().map(|id| id.to_string()).collect();
+                let damaged: Vec<serde_json::Value> = report
+                    .damaged
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "snapshot": d.snapshot.to_string(),
+                            "path": d.path,
+                            "missing_blobs": d.missing_blobs,
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1483,6 +1494,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         "trees": report.trees,
                         "blobs": report.blobs,
                         "missing": missing,
+                        "damaged": damaged,
                     }))?
                 );
                 if !report.missing.is_empty() {
@@ -1495,13 +1507,21 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     report.snapshots, report.trees, report.blobs
                 );
             } else {
+                // Report the affected files (more actionable than raw blob ids):
+                // these are exactly what a `restore --ignore-errors` would skip.
                 eprintln!(
-                    "FAILED: {} of {} referenced blobs missing",
+                    "FAILED: {} of {} referenced blobs missing, affecting {} file(s):",
                     report.missing.len(),
-                    report.blobs
+                    report.blobs,
+                    report.damaged.len()
                 );
-                for id in &report.missing {
-                    eprintln!("  missing {id}");
+                for d in &report.damaged {
+                    eprintln!(
+                        "  {} in {} ({} blob(s) missing)",
+                        d.path,
+                        &d.snapshot.to_string()[..16],
+                        d.missing_blobs
+                    );
                 }
                 // A missing referenced blob is data corruption (DESIGN.md §7).
                 return Ok(13);

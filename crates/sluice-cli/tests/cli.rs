@@ -3168,3 +3168,65 @@ fn restore_ignore_errors_salvages_a_damaged_repo() {
         "the unrecoverable file is left absent, not half-written"
     );
 }
+
+#[test]
+fn check_reports_files_affected_by_a_lost_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a"), b"AAAA").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let pack1 = std::fs::read_dir(repo.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    let snap1 = snaps[0]["id"].as_str().unwrap().to_string();
+    // Add b; a is reused from pack1, b and the new trees land in a new pack.
+    std::fs::write(src.join("b"), b"BBBB").unwrap();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    // Drop snapshot1 (its tree lives in pack1) so only snapshot2 remains, then
+    // lose pack1 and rebuild the index from the survivors.
+    sluice()
+        .arg("forget")
+        .arg(&repo)
+        .arg(&snap1)
+        .assert()
+        .success();
+    std::fs::remove_file(&pack1).unwrap();
+    sluice().arg("rebuild-index").arg(&repo).assert().success();
+
+    // check flags file a (it referenced the lost blob), names it, and exits 13.
+    let o = sluice()
+        .arg("check")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .code(13);
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let damaged = v["damaged"].as_array().unwrap();
+    assert_eq!(damaged.len(), 1, "exactly file a is affected");
+    assert_eq!(damaged[0]["path"], "a");
+    assert_eq!(damaged[0]["missing_blobs"], 1);
+}

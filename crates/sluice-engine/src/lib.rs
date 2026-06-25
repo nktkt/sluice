@@ -1417,6 +1417,22 @@ pub struct CheckReport {
     pub blobs: usize,
     /// Referenced content blobs absent from the repository.
     pub missing: Vec<Id>,
+    /// The files affected by those missing blobs — which snapshot and path each
+    /// is — so a damaged repository can be triaged ("what have I actually lost?")
+    /// and lined up with what `restore --ignore-errors` would skip.
+    pub damaged: Vec<DamagedFile>,
+}
+
+/// A file that cannot be fully restored because some of its content blobs are
+/// missing (see [`CheckReport::damaged`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DamagedFile {
+    /// The snapshot the file belongs to.
+    pub snapshot: Id,
+    /// The file's path within that snapshot.
+    pub path: String,
+    /// How many of the file's content blobs are missing.
+    pub missing_blobs: usize,
 }
 
 /// Structural integrity check: walk every snapshot's trees (decrypting and
@@ -1443,7 +1459,7 @@ pub async fn check_only<B: StorageBackend>(
     for snapshot in snapshots {
         let snap = repo.load_snapshot(&snapshot).await?;
         report.snapshots += 1;
-        check_tree(repo, snap.tree, &mut report).await?;
+        check_tree(repo, snap.tree, snapshot, String::new(), &mut report).await?;
     }
     Ok(report)
 }
@@ -1453,24 +1469,41 @@ pub async fn check_only<B: StorageBackend>(
 fn check_tree<'a, B: StorageBackend>(
     repo: &'a Repository<B>,
     tree_id: Id,
+    snapshot: Id,
+    prefix: String,
     report: &'a mut CheckReport,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
     Box::pin(async move {
         let tree = repo.load_tree(&tree_id).await?;
         report.trees += 1;
         for node in &tree.nodes {
+            let name = String::from_utf8_lossy(&node.name);
+            let path = if prefix.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
             match node.kind {
                 EntryKind::Dir => {
                     if let Some(subtree) = node.subtree {
-                        check_tree(repo, subtree, report).await?;
+                        check_tree(repo, subtree, snapshot, path, report).await?;
                     }
                 }
                 EntryKind::File => {
+                    let mut file_missing = 0;
                     for id in &node.content {
                         report.blobs += 1;
                         if !repo.has_blob(id) {
                             report.missing.push(*id);
+                            file_missing += 1;
                         }
+                    }
+                    if file_missing > 0 {
+                        report.damaged.push(DamagedFile {
+                            snapshot,
+                            path,
+                            missing_blobs: file_missing,
+                        });
                     }
                 }
                 _ => {}
@@ -3958,6 +3991,89 @@ mod tests {
         backend.remove(FileType::Pack, &content_pack).await.unwrap();
         let reopened = Repository::open(backend.clone(), b"pw").await.unwrap();
         assert!(verify(&reopened).await.is_err());
+    }
+
+    /// `check` names the files affected by a missing blob (not just the opaque
+    /// blob id), so a damaged repository can be triaged before a salvage restore.
+    #[tokio::test]
+    async fn check_reports_the_files_affected_by_a_missing_blob() {
+        use sluice_core::BlobKind;
+        use std::sync::Arc;
+
+        let backend = Arc::new(MemoryBackend::new());
+        let mut repo = Repository::init(backend.clone(), b"pw", fast())
+            .await
+            .unwrap();
+        // A content blob alone in its own pack, then a tree referencing it (in a
+        // separate pack) and a snapshot — so the content can be lost on its own.
+        let chunk = repo
+            .save_blob(BlobKind::Data, b"file contents")
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let content_pack = repo.backend().list(FileType::Pack).await.unwrap()[0];
+        let node = Node {
+            name: b"f".to_vec(),
+            kind: EntryKind::File,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            size: 13,
+            content: vec![chunk],
+            subtree: None,
+            link_target: None,
+            dev: 0,
+            ino: 0,
+            xattrs: Vec::new(),
+            rdev: 0,
+            sparse: false,
+        };
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![node],
+            })
+            .await
+            .unwrap();
+        repo.flush().await.unwrap();
+        let snap = repo
+            .commit_snapshot(&Snapshot {
+                version: SNAPSHOT_VERSION,
+                time_ns: 0,
+                tree,
+                paths: vec![],
+                hostname: "h".into(),
+                username: "u".into(),
+                uid: 0,
+                gid: 0,
+                tags: vec![],
+                parent: None,
+                program_version: "test".into(),
+                summary: SnapshotStats::default(),
+            })
+            .await
+            .unwrap();
+
+        // Healthy: nothing is damaged.
+        assert!(check(&repo).await.unwrap().damaged.is_empty());
+
+        // Lose the content pack and rebuild the index from the survivors, so the
+        // chunk is genuinely absent from the index (the tree's pack is intact).
+        backend.remove(FileType::Pack, &content_pack).await.unwrap();
+        {
+            let mut r = Repository::open(backend.clone(), b"pw").await.unwrap();
+            rebuild_index(&mut r).await.unwrap();
+        }
+
+        let repo = Repository::open(backend.clone(), b"pw").await.unwrap();
+        let report = check(&repo).await.unwrap();
+        assert_eq!(report.missing, vec![chunk], "the blob id is still reported");
+        assert_eq!(report.damaged.len(), 1, "exactly file f is affected");
+        assert_eq!(report.damaged[0].path, "f");
+        assert_eq!(report.damaged[0].snapshot, snap);
+        assert_eq!(report.damaged[0].missing_blobs, 1);
     }
 
     #[tokio::test]
