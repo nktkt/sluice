@@ -905,6 +905,122 @@ fn restore_delete_mirrors_the_target() {
 }
 
 #[test]
+fn restore_emits_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("b.txt"), b"bravo").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // A JSON dry run reports the would-restore counts without writing.
+    let o = sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .args(["--json", "--dry-run"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["dry_run"], true);
+    assert_eq!(v["snapshot"], snap);
+    assert_eq!(v["files"], 2);
+    assert_eq!(v["bytes"], 10);
+    assert!(!out.exists(), "dry run wrote nothing");
+
+    // A real JSON restore reports zero warnings and (with --delete) a deleted
+    // count for the extra it removed.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    std::fs::write(out.join("stray.txt"), b"junk").unwrap();
+    let o = sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .args(["--delete", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["dry_run"], false);
+    assert_eq!(v["warnings"], 0);
+    assert_eq!(v["deleted"], 1);
+    assert!(!out.join("stray.txt").exists());
+}
+
+#[test]
+fn copy_emits_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let repo2 = dir.path().join("repo2");
+    let repo3 = dir.path().join("repo3");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"data").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&repo2).assert().success();
+    sluice().arg("init").arg(&repo3).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Copying one snapshot reports a new destination id, which differs from the
+    // source id because copy re-encrypts under the destination's keys.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&repo2)
+        .arg(&snap[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["copied"], 1);
+    let new_id = v["snapshots"][0].as_str().unwrap();
+    assert_eq!(new_id.len(), 64);
+    assert_ne!(new_id, snap, "copy re-encrypts, so the id changes");
+
+    // Copying the whole repository reports the count.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&repo3)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["copied"], 1);
+    assert_eq!(v["snapshots"].as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

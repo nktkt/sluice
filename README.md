@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 226 tests across
+machine-readable JSON output, and stable exit codes. Backed by 228 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -109,6 +109,7 @@ sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: k
 sluice restore   ./repo <snapshot> ./out --delete                    # mirror: also remove extras in ./out
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
 sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
+sluice restore   ./repo <snapshot> ./out --json                      # restore report (warnings, deleted) as JSON
 ```
 
 `--path` restores a subtree by prefix, while `--include`/`--exclude` select by
@@ -227,6 +228,7 @@ to an offsite repo, or rotating keys by re-encryption.
 ```sh
 sluice copy ./repo s3://my-bucket/backups <snapshot>   # one snapshot
 sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempotent)
+sluice copy ./repo s3://my-bucket/backups --json        # report new destination ids as JSON
 ```
 
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
@@ -370,7 +372,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 226 tests
+cargo test     # 228 tests
 ```
 
 ## Caveats

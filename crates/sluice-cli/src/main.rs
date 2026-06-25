@@ -144,6 +144,9 @@ enum Command {
         /// Print each file as it is restored.
         #[arg(short, long)]
         verbose: bool,
+        /// Emit machine-readable JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
     },
     /// Copy snapshots to another repository, re-encrypting under its keys.
     Copy {
@@ -153,6 +156,9 @@ enum Command {
         dst: String,
         /// Snapshot id to copy (a unique hex prefix); omit to copy every snapshot.
         snapshot: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List the snapshots in a repository.
     Snapshots {
@@ -670,6 +676,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             delete,
             verify,
             verbose,
+            json,
         } => {
             // Mirror deletion considers the whole snapshot, so a partial restore
             // would delete everything outside the selected subset; refuse it.
@@ -706,18 +713,42 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 let files = entries.iter().filter(|e| e.kind == EntryKind::File);
                 let count = files.clone().count();
                 let bytes: u64 = files.map(|e| e.size).sum();
-                println!(
-                    "would restore {count} files ({bytes} bytes) into {} (nothing written)",
-                    target.display()
-                );
-                if delete {
-                    let extras = mirror_delete(&repository, &id, &target, true).await?;
-                    println!("would delete {} extra entr(ies):", extras.len());
-                    for p in extras.iter().take(20) {
-                        println!("  {}", p.display());
+                let extras = if delete {
+                    mirror_delete(&repository, &id, &target, true).await?
+                } else {
+                    Vec::new()
+                };
+                if json {
+                    let mut obj = serde_json::json!({
+                        "dry_run": true,
+                        "snapshot": id.to_string(),
+                        "target": target.display().to_string(),
+                        "files": count,
+                        "bytes": bytes,
+                    });
+                    if delete {
+                        obj["would_delete"] = serde_json::json!(extras.len());
+                        obj["delete_paths"] = serde_json::json!(
+                            extras
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                        );
                     }
-                    if extras.len() > 20 {
-                        println!("  ... and {} more", extras.len() - 20);
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                } else {
+                    println!(
+                        "would restore {count} files ({bytes} bytes) into {} (nothing written)",
+                        target.display()
+                    );
+                    if delete {
+                        println!("would delete {} extra entr(ies):", extras.len());
+                        for p in extras.iter().take(20) {
+                            println!("  {}", p.display());
+                        }
+                        if extras.len() > 20 {
+                            println!("  ... and {} more", extras.len() - 20);
+                        }
                     }
                 }
             } else {
@@ -728,8 +759,9 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 // With --verbose, print each file as it is restored (to stderr,
                 // like `backup -v`, leaving stdout for the completion line).
                 let report_file = |path: &std::path::Path| eprintln!("{}", path.display());
-                // Otherwise show a live spinner on a terminal (hidden when piped).
-                let spinner = (!verbose && std::io::stderr().is_terminal()).then(|| {
+                // Otherwise show a live spinner on a terminal (hidden when piped or
+                // emitting JSON).
+                let spinner = (!verbose && !json && std::io::stderr().is_terminal()).then(|| {
                     let pb = ProgressBar::new_spinner();
                     pb.set_style(
                         ProgressStyle::with_template("{spinner:.green} {pos} files  {wide_msg}")
@@ -784,33 +816,60 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 }
                 // Mirror mode: after writing the snapshot, remove anything under
                 // the target the snapshot does not contain.
-                if delete {
+                let deleted = if delete {
                     let removed = mirror_delete(&repository, &id, &target, false).await?;
                     if verbose {
                         for p in &removed {
                             eprintln!("- {}", p.display());
                         }
                     }
-                    println!("deleted {} extra entr(ies)", removed.len());
+                    Some(removed.len())
+                } else {
+                    None
+                };
+                if json {
+                    let mut obj = serde_json::json!({
+                        "dry_run": false,
+                        "snapshot": id.to_string(),
+                        "target": target.display().to_string(),
+                        "warnings": report.warnings,
+                        "messages": report.messages,
+                    });
+                    if let Some(n) = deleted {
+                        obj["deleted"] = serde_json::json!(n);
+                    }
+                    println!("{}", serde_json::to_string_pretty(&obj)?);
+                } else {
+                    if let Some(n) = deleted {
+                        println!("deleted {n} extra entr(ies)");
+                    }
+                    println!("restored {id} into {}", target.display());
+                    if report.warnings > 0 {
+                        eprintln!(
+                            "warning: {} metadata operation(s) could not be applied:",
+                            report.warnings
+                        );
+                        for m in report.messages.iter().take(20) {
+                            eprintln!("  {m}");
+                        }
+                        let shown = report.messages.len().min(20) as u64;
+                        if report.warnings > shown {
+                            eprintln!("  ... and {} more", report.warnings - shown);
+                        }
+                    }
                 }
-                println!("restored {id} into {}", target.display());
+                // The exit code reflects warnings regardless of output format.
                 if report.warnings > 0 {
-                    eprintln!(
-                        "warning: {} metadata operation(s) could not be applied:",
-                        report.warnings
-                    );
-                    for m in report.messages.iter().take(20) {
-                        eprintln!("  {m}");
-                    }
-                    let shown = report.messages.len().min(20) as u64;
-                    if report.warnings > shown {
-                        eprintln!("  ... and {} more", report.warnings - shown);
-                    }
                     exit = 3;
                 }
             }
         }
-        Command::Copy { src, dst, snapshot } => {
+        Command::Copy {
+            src,
+            dst,
+            snapshot,
+            json,
+        } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
             // The destination may use a different passphrase.
             let dest_pass =
@@ -821,9 +880,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 Some(s) => Some(resolve_snapshot(&source, s).await?),
                 None => None,
             };
+            let single = target_id.is_some();
             // A live spinner on a terminal (offsite copies can move a lot of
-            // data); hidden when piped.
-            let spinner = std::io::stderr().is_terminal().then(|| {
+            // data); hidden when piped or emitting JSON.
+            let spinner = (!json && std::io::stderr().is_terminal()).then(|| {
                 let pb = ProgressBar::new_spinner();
                 pb.set_style(
                     ProgressStyle::with_template("{spinner:.green} {pos} blobs copied").unwrap(),
@@ -838,18 +898,37 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             };
             let progress: Option<sluice_engine::CopyProgressFn> =
                 if spinner.is_some() { Some(&tick) } else { None };
-            let outcome = match target_id {
-                Some(id) => copy_snapshot_with_progress(&source, &mut dest, &id, progress)
-                    .await
-                    .map(|new_id| new_id.to_string()),
+            // Each new id is the snapshot's re-encrypted id in the destination,
+            // which differs from the source id (copy re-seals under dest keys).
+            let new_ids: Vec<String> = match target_id {
+                Some(id) => vec![
+                    copy_snapshot_with_progress(&source, &mut dest, &id, progress)
+                        .await?
+                        .to_string(),
+                ],
                 None => copy_all_with_progress(&source, &mut dest, progress)
-                    .await
-                    .map(|ids| format!("copied {} snapshot(s)", ids.len())),
+                    .await?
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect(),
             };
             if let Some(pb) = &spinner {
                 pb.finish_and_clear();
             }
-            println!("{}", outcome?);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "copied": new_ids.len(),
+                        "snapshots": new_ids,
+                    }))?
+                );
+            } else if single {
+                // A single-snapshot copy prints the new destination id.
+                println!("{}", new_ids[0]);
+            } else {
+                println!("copied {} snapshot(s)", new_ids.len());
+            }
         }
         Command::Snapshots {
             repo,
