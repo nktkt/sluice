@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 201 tests across
+machine-readable JSON output, and stable exit codes. Backed by 206 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -47,6 +47,7 @@ sluice backup ./repo ~/code --exclude-if-present .nobackup      # skip dirs hold
 sluice backup ./repo ~/code --exclude-caches                    # skip CACHEDIR.TAG cache dirs
 sluice backup ./repo ~/.config/app.toml          # a single file is also a valid source
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
+sluice backup ./repo ~/big --cache ~/.cache/sluice.redb   # reuse unchanged files via a stat cache
 pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a piped stream
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
@@ -54,7 +55,14 @@ sluice backup ./repo ~/documents --json          # outcome (snapshot id + counts
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
-stored chunks without being re-read. Changed files are **streamed** through the
+stored chunks without being re-read. By default that reuse is decided against the
+previous snapshot's trees; pass `--cache <PATH>` to instead keep an on-disk stat
+cache keyed by each file's `(device, inode)`, so a re-backup neither re-reads
+unchanged files nor loads the old trees at all (a per-directory round trip on an
+object-store backend), and a moved or renamed file is recognized too. The cache
+is only ever an accelerator — every reuse is still gated on the chunks actually
+being present in the repository, so a stale or foreign cache falls back to a
+normal read. Changed files are **streamed** through the
 chunker with a bounded buffer, and restored the same way — chunks written as they
 arrive — so a file larger than memory backs up and restores without being loaded
 whole. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
@@ -286,9 +294,10 @@ concurrency model, CLI surface, and threat model — lives in
   `--json` on every result/listing command, stable exit codes — ✅
 - **M8** — streaming & spot-checks: memory-bounded streaming backup/restore with
   ranged reads, sparse-file skipping, `backup --stdin`, `--exclude-if-present` /
-  `--exclude-caches`, `init --compression`, `verify --sample` — ✅
-- **M9** — *planned*: parallel backup pipeline, on-disk stat cache, FUSE mount,
-  Windows support, optional Reed-Solomon self-heal (`verify --repair`)
+  `--exclude-caches`, `init --compression`, `verify --sample`, on-disk stat cache
+  (`backup --cache`) — ✅
+- **M9** — *planned*: parallel backup pipeline, FUSE mount, Windows support,
+  optional Reed-Solomon self-heal (`verify --repair`)
 
 ## Building
 
@@ -298,7 +307,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 201 tests
+cargo test     # 206 tests
 ```
 
 ## Caveats

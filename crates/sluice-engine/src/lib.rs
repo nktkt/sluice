@@ -1,17 +1,20 @@
 //! `sluice-engine` — backup and restore orchestration (see `DESIGN.md` §6, §8).
 //!
-//! This first cut walks a directory tree, storing each regular file as
-//! deduplicated chunks and each directory as a `Tree`, then commits a snapshot;
-//! restore rebuilds the tree and replays mode/mtime. Files, directories, and
-//! symlinks are handled; special files (fifo/socket/device) remain. The walk
-//! uses blocking `std::fs` for now; offloading to a thread pool is a later
-//! refinement.
+//! It walks a directory tree, storing each regular file as deduplicated chunks
+//! and each directory as a `Tree`, then commits a snapshot; restore rebuilds the
+//! tree and replays metadata. Files, directories, symlinks, and special files
+//! (FIFOs, device nodes, hardlinks) are all handled. An optional on-disk
+//! [`StatCache`] accelerates re-backups. The walk uses blocking `std::fs`;
+//! offloading to a thread pool is a later refinement.
+
+mod statcache;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Mutex;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use sluice_core::{
@@ -19,6 +22,8 @@ use sluice_core::{
 };
 use sluice_repo::{PruneReport, RepoError, Repository};
 use sluice_store::{FileType, StorageBackend};
+
+pub use statcache::{CacheEntry, StatCache};
 
 /// Errors from engine operations.
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +140,11 @@ pub struct BackupOptions {
     /// Skip a subdirectory holding a `CACHEDIR.TAG` that carries the standard
     /// cache signature (the convention used by build tools and browsers).
     pub exclude_caches: bool,
+    /// Path to an on-disk [`StatCache`]. When set, an unchanged file is reused
+    /// from its cached chunk ids without re-reading it or loading the previous
+    /// snapshot's trees (see `DESIGN.md` §5.2). Absent ⇒ reuse comes from the
+    /// parent snapshot's trees, as before.
+    pub cache_path: Option<PathBuf>,
     /// Preview only — walk and count, but write nothing; the snapshot is `None`.
     pub dry_run: bool,
 }
@@ -236,16 +246,26 @@ async fn backup_sources_inner<B: StorageBackend>(
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     let excludes = build_globset(&options.exclude_globs)?;
+    let dry_run = options.dry_run;
+    // Open the stat cache (an optimization, never touched on a dry run). When
+    // present it becomes the incremental oracle, so the parent snapshot's trees
+    // are not loaded for reuse.
+    let cache = match &options.cache_path {
+        Some(p) if !dry_run => Some(StatCache::open(p).map_err(|e| io_err(p, e))?),
+        _ => None,
+    };
+    let cache_updates = cache.as_ref().map(|_| Mutex::new(Vec::new()));
     let base_ctx = BackupCtx {
         excludes: &excludes,
-        dry_run: options.dry_run,
+        dry_run,
         max_file_size: options.max_file_size,
         root_dev: None,
         exclude_if_present: &options.exclude_if_present,
         exclude_caches: options.exclude_caches,
+        cache: cache.as_ref(),
+        cache_updates: cache_updates.as_ref(),
         progress,
     };
-    let dry_run = options.dry_run;
     let one_file_system = options.one_file_system;
     // The device of a directory source, for --one-file-system.
     let root_dev = |dir: &Path| -> Option<u64> {
@@ -255,6 +275,9 @@ async fn backup_sources_inner<B: StorageBackend>(
                 .unwrap_or(0)
         })
     };
+    // With a stat cache, reuse is driven entirely by it; skip loading the parent
+    // snapshot's trees (the expensive part on a high-latency backend).
+    let use_parent_trees = cache.is_none();
     let parent = latest_snapshot(repo).await?;
     let mut summary = SnapshotStats::default();
 
@@ -268,12 +291,12 @@ async fn backup_sources_inner<B: StorageBackend>(
                 .as_encoded_bytes()
                 .to_vec();
             let parent_node = match &parent {
-                Some((_, snap)) => repo
+                Some((_, snap)) if use_parent_trees => repo
                     .load_tree(&snap.tree)
                     .await
                     .ok()
                     .and_then(|t| t.nodes.into_iter().find(|n| n.name == name)),
-                None => None,
+                _ => None,
             };
             let node = backup_file(
                 repo,
@@ -296,7 +319,9 @@ async fn backup_sources_inner<B: StorageBackend>(
             }
         } else {
             // Single directory: its tree is the snapshot root.
-            let parent_tree = parent.as_ref().map(|(_, snap)| snap.tree);
+            let parent_tree = use_parent_trees
+                .then(|| parent.as_ref().map(|(_, snap)| snap.tree))
+                .flatten();
             let ctx = BackupCtx {
                 root_dev: root_dev(source),
                 ..base_ctx
@@ -306,7 +331,7 @@ async fn backup_sources_inner<B: StorageBackend>(
     } else {
         // Multiple sources: a synthetic root with one directory entry per source.
         let parent_root: HashMap<Vec<u8>, Node> = match &parent {
-            Some((_, snap)) => match repo.load_tree(&snap.tree).await {
+            Some((_, snap)) if use_parent_trees => match repo.load_tree(&snap.tree).await {
                 Ok(tree) => tree
                     .nodes
                     .into_iter()
@@ -314,7 +339,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     .collect(),
                 Err(_) => HashMap::new(),
             },
-            None => HashMap::new(),
+            _ => HashMap::new(),
         };
         let mut names = HashSet::new();
         let mut nodes = Vec::with_capacity(sources.len());
@@ -386,6 +411,12 @@ async fn backup_sources_inner<B: StorageBackend>(
             repo.save_tree(&tree).await?
         }
     };
+
+    // Persist the batched stat-cache updates in a single transaction (a no-op
+    // when no cache is in use).
+    if let (Some(cache), Some(updates)) = (&cache, &cache_updates) {
+        cache.commit(&updates.lock().unwrap());
+    }
 
     if dry_run {
         return Ok(BackupOutcome {
@@ -1779,6 +1810,10 @@ struct BackupCtx<'a> {
     exclude_if_present: &'a [String],
     /// Whether a subdirectory bearing a signed `CACHEDIR.TAG` is excluded.
     exclude_caches: bool,
+    /// On-disk stat cache to reuse unchanged files from, if enabled.
+    cache: Option<&'a StatCache>,
+    /// Batched cache updates (flushed once after the walk); present iff `cache`.
+    cache_updates: Option<&'a Mutex<Vec<(u64, u64, CacheEntry)>>>,
     /// Per-file progress callback (`--verbose`).
     progress: Option<ProgressFn<'a>>,
 }
@@ -1813,10 +1848,34 @@ async fn backup_file<B: StorageBackend>(
     ctx: BackupCtx<'_>,
 ) -> Result<Node> {
     let mtime = mtime_ns(meta);
-    let reuse = parent.and_then(|prev| {
+    let (dev, ino) = hardlink_ids(meta);
+    // The cache is keyed by the file's true (device, inode), populated for every
+    // file (hardlink_ids is zero for non-hardlinks, by design).
+    let (cache_dev, cache_ino) = file_identity(meta);
+    // Reuse the chunk list of an unchanged file (same size and mtime) without
+    // re-reading it. First try the matching node from the parent snapshot's
+    // tree; otherwise, if a stat cache is in use, look the file up by its
+    // (device, inode) identity — which also catches a renamed or moved file. A
+    // cache hit is trusted only if every chunk it names is still present in the
+    // repository, so a stale or foreign cache degrades to a re-read.
+    let mut from_cache = false;
+    let mut reuse = parent.and_then(|prev| {
         (prev.kind == EntryKind::File && prev.size == meta.len() && prev.mtime_ns == mtime)
             .then(|| prev.content.clone())
     });
+    if reuse.is_none() && cache_ino != 0 {
+        if let Some(cache) = ctx.cache {
+            if let Some(entry) = cache.lookup(cache_dev, cache_ino) {
+                if entry.size == meta.len()
+                    && entry.mtime_ns == mtime
+                    && entry.ids.iter().all(|id| repo.has_blob(id))
+                {
+                    reuse = Some(entry.ids);
+                    from_cache = true;
+                }
+            }
+        }
+    }
     let status = if reuse.is_some() {
         FileStatus::Unmodified
     } else if parent.is_some() {
@@ -1848,7 +1907,22 @@ async fn backup_file<B: StorageBackend>(
         }
     };
     stats.bytes_processed += size;
-    let (dev, ino) = hardlink_ids(meta);
+    // Record this file's identity → chunk ids for the next backup, unless it was
+    // served verbatim from the cache (the entry is already current). Skipped on a
+    // dry run, where `content` is empty.
+    if !from_cache && !ctx.dry_run && cache_ino != 0 {
+        if let Some(updates) = ctx.cache_updates {
+            updates.lock().unwrap().push((
+                cache_dev,
+                cache_ino,
+                CacheEntry {
+                    size,
+                    mtime_ns: mtime,
+                    ids: content.clone(),
+                },
+            ));
+        }
+    }
     Ok(Node {
         name,
         kind: EntryKind::File,
@@ -2376,6 +2450,21 @@ fn hardlink_ids(meta: &std::fs::Metadata) -> (u64, u64) {
 
 #[cfg(not(unix))]
 fn hardlink_ids(_meta: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// The `(device, inode)` identity of a file, used as the stat-cache key (unlike
+/// [`hardlink_ids`], it is populated for every file, not only hardlinks).
+/// Returns `(0, 0)` on platforms without inode numbers, where the cache is a
+/// no-op.
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
     (0, 0)
 }
 
@@ -3247,6 +3336,124 @@ mod tests {
         assert!(
             paths.iter().any(|p| p == "notcache/keep.txt"),
             "a directory whose CACHEDIR.TAG lacks the signature is kept: {paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_cache_reuses_unchanged_files() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+        std::fs::create_dir(src.path().join("d")).unwrap();
+        std::fs::write(src.path().join("d/b.bin"), vec![7u8; 9000]).unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let opts = BackupOptions {
+            cache_path: Some(cache_dir.path().join("cache.redb")),
+            ..Default::default()
+        };
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // First backup: the cache is empty, so both files are read and recorded.
+        let first =
+            backup_sources_with_options(&mut repo, &[src.path().to_path_buf()], &[], &opts, None)
+                .await
+                .unwrap()
+                .summary;
+        assert_eq!(first.files_new, 2);
+        assert_eq!(first.files_unmodified, 0);
+
+        // Second backup of the unchanged tree: every file is served from the cache
+        // (no parent trees are loaded), so nothing is re-read.
+        let second =
+            backup_sources_with_options(&mut repo, &[src.path().to_path_buf()], &[], &opts, None)
+                .await
+                .unwrap()
+                .summary;
+        assert_eq!(
+            second.files_unmodified, 2,
+            "both files reused from the cache"
+        );
+        assert_eq!(second.files_new, 0);
+        assert_eq!(second.files_changed, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_cache_invalidates_on_change() {
+        let src = tempfile::tempdir().unwrap();
+        let f = src.path().join("a.txt");
+        std::fs::write(&f, b"original").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let opts = BackupOptions {
+            cache_path: Some(cache_dir.path().join("c.redb")),
+            ..Default::default()
+        };
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup_sources_with_options(&mut repo, &[src.path().to_path_buf()], &[], &opts, None)
+            .await
+            .unwrap();
+
+        // Rewrite the file (new size) with a distinct mtime so the cached
+        // (size, mtime) no longer matches.
+        std::fs::write(&f, b"changed contents, now quite a bit longer").unwrap();
+        filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+        let second =
+            backup_sources_with_options(&mut repo, &[src.path().to_path_buf()], &[], &opts, None)
+                .await
+                .unwrap()
+                .summary;
+        assert_eq!(second.files_unmodified, 0, "the changed file is not reused");
+        assert_eq!(second.files_new, 1, "it is re-read");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stat_cache_falls_back_when_chunks_are_absent() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"alpha beta gamma delta").unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let opts = BackupOptions {
+            cache_path: Some(cache_dir.path().join("c.redb")),
+            ..Default::default()
+        };
+
+        // Populate the cache against repo1.
+        let mut repo1 = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        backup_sources_with_options(&mut repo1, &[src.path().to_path_buf()], &[], &opts, None)
+            .await
+            .unwrap();
+
+        // Back up the same files into a FRESH repo2 with the same cache: the
+        // cached chunk ids are absent from repo2's index, so the safety check
+        // forces a real read rather than referencing blobs that do not exist.
+        let mut repo2 = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let summary =
+            backup_sources_with_options(&mut repo2, &[src.path().to_path_buf()], &[], &opts, None)
+                .await
+                .unwrap()
+                .summary;
+        assert_eq!(
+            summary.files_unmodified, 0,
+            "a foreign cache is not trusted"
+        );
+        assert_eq!(summary.files_new, 1, "the file is actually read into repo2");
+
+        // repo2 is self-contained and restores byte-identical.
+        assert!(verify(&repo2).await.is_ok());
+        let snap = repo2.list_snapshots().await.unwrap()[0];
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo2, &snap, out.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("a.txt")).unwrap(),
+            b"alpha beta gamma delta"
         );
     }
 

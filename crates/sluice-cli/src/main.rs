@@ -81,6 +81,11 @@ enum Command {
         /// signature (build caches, browser caches, ...).
         #[arg(long = "exclude-caches")]
         exclude_caches: bool,
+        /// Path to an on-disk stat cache. Records each file's chunk ids so a later
+        /// backup reuses unchanged files without re-reading them or loading the
+        /// previous snapshot's trees (notably faster for object-store repos).
+        #[arg(long, value_name = "PATH")]
+        cache: Option<PathBuf>,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -445,6 +450,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             one_file_system,
             exclude_if_present,
             exclude_caches,
+            cache,
             dry_run,
             verbose,
             json,
@@ -480,6 +486,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     one_file_system,
                     exclude_if_present,
                     exclude_caches,
+                    cache_path: cache,
                     dry_run,
                 };
                 backup_sources_with_options(&mut repository, &sources, &tags, &options, progress)

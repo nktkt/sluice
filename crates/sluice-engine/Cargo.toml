@@ -17,6 +17,8 @@ thiserror = { workspace = true }
 filetime = { workspace = true }
 futures = { workspace = true }
 globset = { workspace = true }
+redb = { workspace = true }
+serde = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
