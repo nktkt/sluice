@@ -53,8 +53,13 @@ enum Command {
         repo: String,
         /// Directories to back up (one or more; multiple sources land under a
         /// synthetic root named by each source's final path component).
-        #[arg(required_unless_present = "stdin", num_args = 1..)]
+        #[arg(required_unless_present_any = ["stdin", "files_from"], num_args = 1..)]
         sources: Vec<PathBuf>,
+        /// Read backup source paths from a file, one per line (repeatable; blank
+        /// lines and lines starting with '#' are ignored). Paths are literal (no
+        /// glob or '~' expansion) and add to any sources given on the command line.
+        #[arg(long = "files-from", value_name = "FILE", conflicts_with = "stdin")]
+        files_from: Vec<PathBuf>,
         /// Back up the bytes read from standard input as a single file instead of
         /// walking source paths (for piping a stream).
         #[arg(long, conflicts_with = "sources")]
@@ -504,7 +509,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         }
         Command::Backup {
             repo,
-            sources,
+            mut sources,
+            files_from,
             stdin,
             stdin_filename,
             mut excludes,
@@ -529,6 +535,26 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         excludes.push(line.to_string());
                     }
                 }
+            }
+            // Append source paths read from each --files-from file.
+            for file in &files_from {
+                let contents = std::fs::read_to_string(file)
+                    .map_err(|e| format!("reading {}: {e}", file.display()))?;
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if !line.is_empty() && !line.starts_with('#') {
+                        sources.push(PathBuf::from(line));
+                    }
+                }
+            }
+            // A --files-from file may resolve to nothing (all comments/blank); that
+            // is not a backup of the whole filesystem, it is an error.
+            if !stdin && sources.is_empty() {
+                return Err(
+                    "no backup sources: pass paths on the command line or a non-empty \
+                     --files-from file"
+                        .into(),
+                );
             }
             let max_size = exclude_larger_than.as_deref().map(parse_size).transpose()?;
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;

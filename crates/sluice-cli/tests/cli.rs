@@ -780,6 +780,58 @@ fn stats_for_a_single_snapshot_counts_entries_and_dedups() {
 }
 
 #[test]
+fn backup_reads_sources_from_files_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    // Two separate source directories plus a third given on the command line.
+    let d1 = dir.path().join("d1");
+    let d2 = dir.path().join("d2");
+    let d3 = dir.path().join("d3");
+    std::fs::create_dir_all(&d1).unwrap();
+    std::fs::create_dir_all(&d2).unwrap();
+    std::fs::create_dir_all(&d3).unwrap();
+    std::fs::write(d1.join("a.txt"), b"aaa").unwrap();
+    std::fs::write(d2.join("b.txt"), b"bbb").unwrap();
+    std::fs::write(d3.join("c.txt"), b"ccc").unwrap();
+    let list = dir.path().join("list.txt");
+    std::fs::write(
+        &list,
+        format!("# sources\n{}\n\n{}\n", d1.display(), d2.display()),
+    )
+    .unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+
+    // d1 and d2 come from the file; d3 from the command line — all three land in
+    // one snapshot.
+    let out = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&d3)
+        .arg("--files-from")
+        .arg(&list)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["files_new"], 3, "a.txt + b.txt + c.txt");
+
+    // A --files-from file that resolves to nothing (only comments/blanks) is an
+    // error, not a backup of the whole filesystem.
+    let empty = dir.path().join("empty.txt");
+    std::fs::write(&empty, "# nothing here\n\n").unwrap();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg("--files-from")
+        .arg(&empty)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no backup sources"));
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

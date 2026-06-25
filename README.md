@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 223 tests across
+machine-readable JSON output, and stable exit codes. Backed by 224 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -47,6 +47,7 @@ sluice backup ./repo ~/code --exclude-if-present .nobackup      # skip dirs hold
 sluice backup ./repo ~/code --exclude-caches                    # skip CACHEDIR.TAG cache dirs
 sluice backup ./repo ~/.config/app.toml          # a single file is also a valid source
 sluice backup ./repo ~/documents ~/photos        # several sources -> one snapshot
+sluice backup ./repo --files-from backup.list    # read source paths from a file (one per line)
 sluice backup ./repo ~/big --cache ~/.cache/sluice.redb   # reuse unchanged files via a stat cache
 pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a piped stream
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
@@ -79,7 +80,10 @@ any subdirectory containing the named marker (e.g. `.nobackup`), and
 `--exclude-caches` skips directories tagged with a signed `CACHEDIR.TAG` (build
 and browser caches). A source may be a directory or a
 single file, and several sources (files and/or directories) go into one snapshot
-under a synthetic root named by each source's final path component. The Argon2id
+under a synthetic root named by each source's final path component.
+`--files-from <FILE>` reads additional source paths from a file (one literal path
+per line; `#` comments and blank lines ignored), so a curated backup set lives in
+a file rather than a shell command. The Argon2id
 work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 
 ### Inspect and restore
@@ -358,7 +362,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 223 tests
+cargo test     # 224 tests
 ```
 
 ## Caveats
