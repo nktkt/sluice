@@ -1183,6 +1183,51 @@ fn backup_force_rereads_unchanged_files() {
 }
 
 #[test]
+fn forget_keep_within_daily() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"x").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    // Snapshots dated today, 1, 2 and 10 days ago (exact-day offsets put each in a
+    // distinct UTC day regardless of the current time of day).
+    for days in [0i64, 1, 2, 10] {
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .args(["--time", &(now - days * 86400).to_string(), "--force"])
+            .assert()
+            .success();
+    }
+
+    // A 3-day daily window keeps the three recent days and forgets the 10-day-old.
+    let o = sluice()
+        .arg("forget")
+        .arg(&repo)
+        .args(["--keep-within-daily", "3d", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["count"], 1, "only the 10-day-old snapshot is forgotten");
+    // Three snapshots remain.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 3);
+}
+
+#[test]
 fn backup_time_override_dates_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

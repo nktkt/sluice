@@ -1420,6 +1420,16 @@ pub struct RetentionPolicy {
     pub keep_tags: Vec<String>,
     /// Always keep snapshots taken within this many nanoseconds of now (0 = off).
     pub keep_within_ns: i64,
+    /// Within this many nanoseconds of now, keep the most recent snapshot of each
+    /// UTC day (0 = off). Like `daily`, but bounded by a time window rather than a
+    /// count.
+    pub within_daily_ns: i64,
+    /// Within this window, keep the most recent snapshot of each week (0 = off).
+    pub within_weekly_ns: i64,
+    /// Within this window, keep the most recent snapshot of each month (0 = off).
+    pub within_monthly_ns: i64,
+    /// Within this window, keep the most recent snapshot of each year (0 = off).
+    pub within_yearly_ns: i64,
     /// Always keep these specific snapshots (by full id), regardless of counts.
     pub keep_ids: Vec<Id>,
 }
@@ -1435,6 +1445,10 @@ impl RetentionPolicy {
             && self.yearly == 0
             && self.keep_tags.is_empty()
             && self.keep_within_ns == 0
+            && self.within_daily_ns == 0
+            && self.within_weekly_ns == 0
+            && self.within_monthly_ns == 0
+            && self.within_yearly_ns == 0
             && self.keep_ids.is_empty()
     }
 }
@@ -1474,6 +1488,7 @@ fn group_key(group_by: GroupBy, snap: &Snapshot) -> String {
 fn select_kept(
     snapshots: &[(Id, i64, Vec<String>)],
     policy: &RetentionPolicy,
+    now: i64,
     keep: &mut HashSet<Id>,
 ) {
     // `--keep-last N`: the N most recent snapshots outright.
@@ -1492,6 +1507,32 @@ fn select_kept(
         for (id, time, _) in snapshots {
             let bucket = bucket_of(*time);
             if kept_buckets.last() != Some(&bucket) && kept_buckets.len() < budget {
+                kept_buckets.push(bucket);
+                keep.insert(*id);
+            }
+        }
+    }
+    // `--keep-within-daily/weekly/monthly/yearly DUR`: most recent per bucket, for
+    // snapshots within `DUR` of now. Like the count rules above, but bounded by a
+    // time window instead of a number of buckets.
+    let windowed: [(i64, fn(i64) -> i64); 4] = [
+        (policy.within_daily_ns, day_bucket),
+        (policy.within_weekly_ns, week_bucket),
+        (policy.within_monthly_ns, month_bucket),
+        (policy.within_yearly_ns, year_bucket),
+    ];
+    for (window, bucket_of) in windowed {
+        if window <= 0 {
+            continue;
+        }
+        let cutoff = now - window;
+        let mut kept_buckets: Vec<i64> = Vec::new();
+        for (id, time, _) in snapshots {
+            if *time < cutoff {
+                continue;
+            }
+            let bucket = bucket_of(*time);
+            if kept_buckets.last() != Some(&bucket) {
                 kept_buckets.push(bucket);
                 keep.insert(*id);
             }
@@ -1578,6 +1619,9 @@ pub async fn forget_with_policy<B: StorageBackend>(
     }
     snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
 
+    // A single `now` reference for all time-window rules in this run.
+    let now = now_ns();
+
     // Partition into groups (each preserving the global newest-first order) and
     // apply the policy independently within each, unioning the kept sets.
     let mut groups: HashMap<String, Vec<(Id, i64, Vec<String>)>> = HashMap::new();
@@ -1589,12 +1633,12 @@ pub async fn forget_with_policy<B: StorageBackend>(
     }
     let mut keep: HashSet<Id> = HashSet::new();
     for group in groups.values() {
-        select_kept(group, policy, &mut keep);
+        select_kept(group, policy, now, &mut keep);
     }
     // `--keep-within`: keep every snapshot newer than `now - keep_within_ns`,
     // independent of grouping.
     if policy.keep_within_ns > 0 {
-        let cutoff = now_ns() - policy.keep_within_ns;
+        let cutoff = now - policy.keep_within_ns;
         for (id, time, _, _) in &snapshots {
             if *time >= cutoff {
                 keep.insert(*id);
@@ -4318,6 +4362,61 @@ mod tests {
             .unwrap();
         let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
         assert_eq!(remaining, HashSet::from([recent]));
+    }
+
+    /// `--keep-within-daily DUR` keeps the most recent snapshot of each day within
+    /// the window, dropping anything older — unlike `--keep-daily N`, which is
+    /// bounded by a count rather than a time window.
+    #[tokio::test]
+    async fn forget_keeps_within_a_daily_window() {
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let tree = repo
+            .save_tree(&Tree {
+                version: TREE_VERSION,
+                nodes: vec![],
+            })
+            .await
+            .unwrap();
+        let at = |time_ns: i64| Snapshot {
+            version: SNAPSHOT_VERSION,
+            time_ns,
+            tree,
+            paths: vec![],
+            hostname: "h".into(),
+            username: "u".into(),
+            uid: 0,
+            gid: 0,
+            tags: vec![],
+            parent: None,
+            program_version: "test".into(),
+            summary: SnapshotStats::default(),
+        };
+        const HOUR: i64 = 3_600_000_000_000;
+        const DAY: i64 = 86_400_000_000_000;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        // Subtracting an exact day shifts the day bucket by exactly one, so these
+        // four land in four distinct days regardless of the time of day.
+        let today = repo.commit_snapshot(&at(now - HOUR)).await.unwrap();
+        let d1 = repo.commit_snapshot(&at(now - DAY)).await.unwrap();
+        let d2 = repo.commit_snapshot(&at(now - 2 * DAY)).await.unwrap();
+        let _d10 = repo.commit_snapshot(&at(now - 10 * DAY)).await.unwrap();
+
+        // A 3-day window keeps one snapshot per day for the last three days; the
+        // 10-day-old one falls outside and is forgotten.
+        let policy = RetentionPolicy {
+            within_daily_ns: 3 * DAY,
+            ..Default::default()
+        };
+        forget_with_policy(&repo, &policy, GroupBy::None, false)
+            .await
+            .unwrap();
+        let remaining: HashSet<Id> = repo.list_snapshots().await.unwrap().into_iter().collect();
+        assert_eq!(remaining, HashSet::from([today, d1, d2]));
     }
 
     #[tokio::test]

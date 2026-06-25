@@ -293,6 +293,18 @@ enum Command {
         /// Keep all snapshots taken within this window, e.g. 7d, 24h, 2w.
         #[arg(long = "keep-within", value_name = "DURATION")]
         keep_within: Option<String>,
+        /// Within this window, keep the most recent snapshot of each day, e.g. 30d.
+        #[arg(long = "keep-within-daily", value_name = "DURATION")]
+        keep_within_daily: Option<String>,
+        /// Within this window, keep the most recent snapshot of each week.
+        #[arg(long = "keep-within-weekly", value_name = "DURATION")]
+        keep_within_weekly: Option<String>,
+        /// Within this window, keep the most recent snapshot of each month.
+        #[arg(long = "keep-within-monthly", value_name = "DURATION")]
+        keep_within_monthly: Option<String>,
+        /// Within this window, keep the most recent snapshot of each year.
+        #[arg(long = "keep-within-yearly", value_name = "DURATION")]
+        keep_within_yearly: Option<String>,
         /// Apply the keep rules per group (host or paths) instead of globally.
         #[arg(long = "group-by", value_enum)]
         group_by: Option<GroupByArg>,
@@ -1327,6 +1339,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             keep_tag,
             keep_id,
             keep_within,
+            keep_within_daily,
+            keep_within_weekly,
+            keep_within_monthly,
+            keep_within_yearly,
             group_by,
             tag,
             dry_run,
@@ -1334,10 +1350,14 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             json,
         } => {
             let mut repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let keep_within_ns = match &keep_within {
-                Some(s) => parse_within(s)?,
-                None => 0,
+            // Parse an optional duration string (e.g. 7d, 24h, 2w) to nanoseconds.
+            let within = |s: &Option<String>| -> Result<i64, Box<dyn Error>> {
+                match s {
+                    Some(s) => parse_within(s),
+                    None => Ok(0),
+                }
             };
+            let keep_within_ns = within(&keep_within)?;
             // Resolve each --keep-id prefix to a full snapshot id.
             let mut keep_ids = Vec::with_capacity(keep_id.len());
             for prefix in &keep_id {
@@ -1351,6 +1371,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 yearly: keep_yearly.unwrap_or(0),
                 keep_tags: keep_tag,
                 keep_within_ns,
+                within_daily_ns: within(&keep_within_daily)?,
+                within_weekly_ns: within(&keep_within_weekly)?,
+                within_monthly_ns: within(&keep_within_monthly)?,
+                within_yearly_ns: within(&keep_within_yearly)?,
                 keep_ids,
             };
             let group = match group_by {

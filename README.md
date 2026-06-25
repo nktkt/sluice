@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 246 tests across
+machine-readable JSON output, and stable exit codes. Backed by 248 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -190,6 +190,7 @@ sluice forget ./repo --keep-last 7 --keep-daily 14 --keep-weekly 8 \
 sluice forget ./repo --keep-last 7 --keep-tag important   # protect tagged snapshots
 sluice forget ./repo --keep-last 7 --keep-id <snapshot>   # pin a specific snapshot
 sluice forget ./repo --keep-daily 30 --keep-within 7d      # also keep everything from the last week
+sluice forget ./repo --keep-within-daily 30d --keep-within-monthly 1y   # 1/day for 30d, 1/month for a year
 sluice forget ./repo --keep-last 7 --group-by host         # apply the rules per host
 sluice forget ./repo --tag daily          # or forget by tag
 sluice forget ./repo <snapshot>           # or a single snapshot
@@ -200,6 +201,14 @@ sluice prune ./repo                  # mark-and-sweep GC: drop dead packs, repac
 sluice prune ./repo --max-unused 5   # leave packs that are <=5% dead instead of repacking
 sluice prune ./repo --dry-run        # report reclaimable bytes without touching storage
 ```
+
+Keep rules combine as a union: `--keep-last/-daily/-weekly/-monthly/-yearly N`
+keep counts of each bucket, `--keep-within <DUR>` keeps everything in a window,
+and `--keep-within-daily/-weekly/-monthly/-yearly <DUR>` keep one snapshot per
+bucket *within* a window (e.g. `--keep-within-daily 30d` = one per day for the
+last 30 days) — bounded by time rather than a count. `--keep-tag`/`--keep-id`
+protect specific snapshots, and `--group-by host|paths` applies the rules per
+group.
 
 `forget` only removes snapshots; `prune` reclaims the now-unreferenced storage,
 deleting fully-dead packs and repacking partially-dead ones to recover space. It,
@@ -403,7 +412,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 246 tests
+cargo test     # 248 tests
 ```
 
 ## Caveats

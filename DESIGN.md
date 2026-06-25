@@ -606,14 +606,15 @@ pack サイズ・object count・アクセスタイミング（high-threat ユー
 > `--skip-existing`（再開）、`--verify`、`--delete`（ミラー＝対象をスナップショットに完全一致、
 > 生バイト比較・シンボリックリンク非追従で安全）、sparse 自動再現。
 > **整合性/保守**: `verify`/`verify --sample`/`check`（いずれも `<snapshot>` 指定で単一スナップショット・ターゲティング可）、
-> `forget`（keep-last/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・`--group-by`・`--prune`）/
+> `forget`（keep-last/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・
+> `--keep-within-daily/weekly/monthly/yearly`・`--group-by`・`--prune`）/
 > `prune`（`--max-unused`）、`copy`（リポジトリ間、宛先鍵で再封緘、`--compression` で再圧縮）。
 > **横断**: 全 result/変更系コマンドが `--json`、安定 exit code（3/10/11/12/13）、
 > backup/restore/verify/copy/prune のインタラクティブ進捗スピナー、読み取り専用 FUSE mount
 > （`sluice mount`、任意 `fuse` feature）、shell completions・man。
 > **未実装の主項目**: 完全並列パイプライン（チャンク毎 CPU 並列は実装済み；**ファイル間の並行処理と
 > pack アップロードの I/O オーバーラップは未着手** — §6 の野心的アーキテクチャ）、Windows メタデータ、
-> Reed-Solomon self-heal（`verify --repair`）、辞書圧縮、粒度の細かい retention（`--keep-within-daily` 等）。
+> Reed-Solomon self-heal（`verify --repair`）、辞書圧縮。
 
 ### M0 — Skeleton（~1-2週）
 - Cargo workspace 構築（§4 のクレート/モジュール骨格）。
