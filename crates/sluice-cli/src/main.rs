@@ -745,7 +745,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     }))?
                 );
                 if !report.missing.is_empty() {
-                    return Err("structural integrity check failed".into());
+                    // A missing referenced blob is data corruption (DESIGN.md §7).
+                    return Ok(13);
                 }
             } else if report.missing.is_empty() {
                 println!(
@@ -761,7 +762,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 for id in &report.missing {
                     eprintln!("  missing {id}");
                 }
-                return Err("structural integrity check failed".into());
+                // A missing referenced blob is data corruption (DESIGN.md §7).
+                return Ok(13);
             }
         }
         Command::Forget {

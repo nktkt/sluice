@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 196 tests across
+machine-readable JSON output, and stable exit codes. Backed by 197 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -110,8 +110,9 @@ present via the index, without reading file data — much cheaper than `verify`,
 which authenticates all stored data. `verify --sample <PERCENT>` walks every
 tree but reads only a uniformly random fraction of the content blobs, catching
 bit-rot probabilistically: cheap enough to run often on a large repository,
-while a periodic full `verify` still reads everything. All three exit non-zero
-on any integrity failure.
+while a periodic full `verify` still reads everything. All three exit with code
+13 (corruption) on any integrity failure — a missing referenced blob, or a
+failed authentication tag — so a scheduled check can alert on a non-zero status.
 
 ### Retention and pruning
 
@@ -283,7 +284,7 @@ other system libraries are required.
 
 ```sh
 cargo build
-cargo test     # 196 tests
+cargo test     # 197 tests
 ```
 
 ## Caveats

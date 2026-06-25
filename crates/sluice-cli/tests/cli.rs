@@ -163,6 +163,66 @@ fn verify_and_check_emit_json() {
 }
 
 #[test]
+fn check_reports_missing_blobs_and_exits_13() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    // ~20 MiB of incompressible data so the content spills past the 16 MiB pack
+    // target into a second pack: the first (full) pack holds only content, while
+    // the tree and snapshot land in the smaller final pack.
+    let mut data = vec![0u8; 20 * 1024 * 1024];
+    let mut x: u32 = 0x1234_5678; // a deterministic LCG fill that defeats zstd
+    for b in data.iter_mut() {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *b = (x >> 24) as u8;
+    }
+    std::fs::write(src.join("big.bin"), &data).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+
+    // Drop the largest pack (the content-only one) and its index segment, leaving
+    // the tree intact, so its referenced content blobs become missing.
+    let mut packs: Vec<_> = std::fs::read_dir(repo.join("data"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert!(packs.len() >= 2, "20 MiB should span at least two packs");
+    packs.sort_by_key(|p| std::fs::metadata(p).unwrap().len());
+    let biggest = packs.last().unwrap();
+    let id = biggest.file_name().unwrap().to_owned();
+    std::fs::remove_file(biggest).unwrap();
+    let _ = std::fs::remove_file(repo.join("index").join(&id));
+
+    // Non-JSON check exits 13 (corruption, DESIGN.md §7).
+    sluice()
+        .arg("check")
+        .arg(&repo)
+        .assert()
+        .code(13)
+        .stderr(predicate::str::contains("missing"));
+
+    // JSON check also exits 13 and reports ok:false with a non-empty missing list.
+    let out = sluice()
+        .arg("check")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .code(13);
+    let v: serde_json::Value =
+        serde_json::from_str(&String::from_utf8(out.get_output().stdout.clone()).unwrap()).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(!v["missing"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
