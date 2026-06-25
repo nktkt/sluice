@@ -146,10 +146,18 @@ enum Command {
         /// this glob (repeatable); `**` spans directories, e.g. '**/*.pdf'.
         #[arg(long = "include", value_name = "GLOB")]
         include: Vec<String>,
+        /// Read include globs from a file, one per line (repeatable; blank lines
+        /// and lines starting with '#' are ignored).
+        #[arg(long = "include-from", value_name = "FILE")]
+        include_from: Vec<PathBuf>,
         /// Skip entries whose path matches this glob (repeatable); a matching
         /// directory is pruned with its subtree.
         #[arg(long = "exclude", value_name = "GLOB")]
         exclude: Vec<String>,
+        /// Read exclude globs from a file, one per line (repeatable; blank lines
+        /// and lines starting with '#' are ignored).
+        #[arg(long = "exclude-from", value_name = "FILE")]
+        exclude_from: Vec<PathBuf>,
         /// Report what would be restored (file count and bytes) without writing.
         #[arg(long)]
         dry_run: bool,
@@ -741,8 +749,10 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             snapshot,
             target,
             paths,
-            include,
-            exclude,
+            mut include,
+            include_from,
+            mut exclude,
+            exclude_from,
             dry_run,
             skip_existing,
             delete,
@@ -750,6 +760,19 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             verbose,
             json,
         } => {
+            // Append include/exclude globs read from their respective files.
+            for (files, dest) in [(&include_from, &mut include), (&exclude_from, &mut exclude)] {
+                for file in files {
+                    let contents = std::fs::read_to_string(file)
+                        .map_err(|e| format!("reading {}: {e}", file.display()))?;
+                    for line in contents.lines() {
+                        let line = line.trim();
+                        if !line.is_empty() && !line.starts_with('#') {
+                            dest.push(line.to_string());
+                        }
+                    }
+                }
+            }
             // Mirror deletion considers the whole snapshot, so a partial restore
             // would delete everything outside the selected subset; refuse it.
             if delete && (!paths.is_empty() || !include.is_empty() || !exclude.is_empty()) {

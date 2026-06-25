@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 245 tests across
+machine-readable JSON output, and stable exit codes. Backed by 246 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -122,6 +122,7 @@ sluice restore   ./repo <snapshot> ./out        # full restore (unique id prefix
 sluice restore   ./repo <snapshot> ./out --path docs --path config   # only these paths
 sluice restore   ./repo <snapshot> ./out --include '**/*.pdf'        # only matching files (glob)
 sluice restore   ./repo <snapshot> ./out --exclude '**/*.tmp' --exclude cache   # skip matching paths
+sluice restore   ./repo <snapshot> ./out --include-from restore.globs   # read include/exclude globs from a file
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
 sluice restore   ./repo <snapshot> ./out --delete                    # mirror: also remove extras in ./out
@@ -134,6 +135,9 @@ sluice restore   ./repo <snapshot> ./out --json                      # restore r
 glob against each entry's path relative to the restore root (`**` spans
 directories): with any `--include`, only matching files are written; `--exclude`
 prunes a matching entry, and a matching directory along with its whole subtree.
+`--include-from`/`--exclude-from` read those globs from a file (one per line, `#`
+comments and blank lines ignored), so a reusable selective-restore set lives in a
+file rather than a long command line.
 `--skip-existing` makes a restore idempotent and resumable: an entry already
 present and matching (for files, same size and mtime) is left untouched, so
 re-running after an interruption only fills the gaps. `--delete` turns a restore
@@ -399,7 +403,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 245 tests
+cargo test     # 246 tests
 ```
 
 ## Caveats

@@ -1466,6 +1466,64 @@ fn backup_compression_override() {
 }
 
 #[test]
+fn restore_include_exclude_from_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::create_dir_all(src.join("logs")).unwrap();
+    std::fs::write(src.join("docs/a.pdf"), b"pdf").unwrap();
+    std::fs::write(src.join("docs/b.txt"), b"txt").unwrap();
+    std::fs::write(src.join("logs/c.log"), b"log").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // --include-from: only the matching files are written.
+    let inc = dir.path().join("inc.txt");
+    std::fs::write(&inc, "# only pdfs\n**/*.pdf\n").unwrap();
+    let out1 = dir.path().join("out1");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out1)
+        .arg("--include-from")
+        .arg(&inc)
+        .assert()
+        .success();
+    assert!(out1.join("docs/a.pdf").exists());
+    assert!(!out1.join("docs/b.txt").exists());
+    assert!(!out1.join("logs/c.log").exists());
+
+    // --exclude-from: matching files are skipped, the rest restored.
+    let exc = dir.path().join("exc.txt");
+    std::fs::write(&exc, "**/*.log\n").unwrap();
+    let out2 = dir.path().join("out2");
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out2)
+        .arg("--exclude-from")
+        .arg(&exc)
+        .assert()
+        .success();
+    assert!(out2.join("docs/a.pdf").exists());
+    assert!(out2.join("docs/b.txt").exists());
+    assert!(!out2.join("logs/c.log").exists());
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
