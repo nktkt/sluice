@@ -5320,6 +5320,69 @@ mod tests {
         }
     }
 
+    /// Like the model test, but the safety property is about `copy`: after a
+    /// random sequence of backups, forgets and prunes leaves a "lived-in"
+    /// repository (whose blobs have been repacked), copying every surviving
+    /// snapshot into a fresh repository still restores it byte-identically. This
+    /// exercises copy's re-encryption of blobs that have moved between packs.
+    #[tokio::test]
+    async fn copy_after_random_prune_restores_identically() {
+        use std::collections::BTreeMap;
+
+        for seed in [7u64, 101] {
+            let src = tempfile::tempdir().unwrap();
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+                .await
+                .unwrap();
+            let mut s = seed;
+            let mut expected: BTreeMap<Id, BTreeMap<PathBuf, Vec<u8>>> = BTreeMap::new();
+
+            // Build a repository that has been pruned and repacked several times.
+            for _round in 0..10 {
+                for _ in 0..(1 + rnd(&mut s) % 4) {
+                    let name = format!("f{}", rnd(&mut s) % 6);
+                    let len = (rnd(&mut s) % 2500) as usize;
+                    let data: Vec<u8> = (0..len).map(|_| (rnd(&mut s) >> 33) as u8).collect();
+                    std::fs::write(src.path().join(name), data).unwrap();
+                }
+                if rnd(&mut s) % 4 == 0 {
+                    let _ = std::fs::remove_file(src.path().join(format!("f{}", rnd(&mut s) % 6)));
+                }
+                let snap = backup(&mut repo, src.path()).await.unwrap();
+                expected.insert(snap, collect_files(src.path()));
+                if expected.len() > 1 && rnd(&mut s) % 3 == 0 {
+                    let victims: Vec<Id> = expected.keys().copied().collect();
+                    let victim = victims[(rnd(&mut s) as usize) % victims.len()];
+                    forget(&repo, &victim).await.unwrap();
+                    expected.remove(&victim);
+                }
+                if rnd(&mut s) % 2 == 0 {
+                    prune(&mut repo, false, 0).await.unwrap();
+                }
+            }
+
+            // Copy each surviving snapshot into one fresh repo and confirm the copy
+            // restores to exactly the state the source snapshot captured.
+            let mut dst = Repository::init(MemoryBackend::new(), b"dst", fast())
+                .await
+                .unwrap();
+            for (id, want) in &expected {
+                let new_id = copy_snapshot(&repo, &mut dst, id).await.unwrap();
+                let out = tempfile::tempdir().unwrap();
+                restore(&dst, &new_id, out.path()).await.unwrap();
+                assert_eq!(
+                    &collect_files(out.path()),
+                    want,
+                    "copy of {id} mismatches after prune at seed {seed}"
+                );
+            }
+            assert!(
+                verify(&dst).await.is_ok(),
+                "copied repo fails verify at seed {seed}"
+            );
+        }
+    }
+
     /// A backend that wraps a shared `MemoryBackend` and fails every `put` of a
     /// chosen `FileType`, to simulate a crash that interrupts a backup before it
     /// commits its snapshot.
