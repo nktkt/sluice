@@ -5464,6 +5464,63 @@ mod tests {
         assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap1]);
     }
 
+    /// Prune is the one operation that *deletes* data, so a crash partway through
+    /// must never lose a blob a live snapshot needs. Build a partially-dead pack
+    /// (a blob shared with a surviving snapshot sits in the same pack as blobs that
+    /// became dead), then "crash" prune while it writes the repacked pack and
+    /// confirm the survivor still restores byte-identically — i.e. prune writes the
+    /// new pack durably before deleting the old one, never the reverse.
+    #[tokio::test]
+    async fn prune_crash_during_repack_preserves_live_data() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"first version of a").unwrap();
+        std::fs::write(src.path().join("b"), b"a blob shared across snapshots").unwrap();
+
+        // snap1's blobs and snap2's shared blob `b` land in one pack; changing `a`
+        // for snap2 supersedes its old blob.
+        let (snap1, snap2) = {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            let snap1 = backup(&mut repo, src.path()).await.unwrap();
+            std::fs::write(src.path().join("a"), b"second version of a").unwrap();
+            let snap2 = backup(&mut repo, src.path()).await.unwrap();
+            (snap1, snap2)
+        };
+        let want = collect_files(src.path()); // the state snap2 captured
+
+        // Forget snap1 so its old blobs go dead, leaving a partial pack to repack.
+        {
+            let repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+            forget(&repo, &snap1).await.unwrap();
+        }
+
+        // Prune on a backend that "crashes" writing the repacked pack.
+        {
+            let fault = FaultBackend {
+                inner: mem.clone(),
+                fail_on: FileType::Pack,
+            };
+            let mut repo = Repository::open(fault, b"pw").await.unwrap();
+            assert!(
+                prune(&mut repo, false, 0).await.is_err(),
+                "prune must fail when the repacked pack cannot be written"
+            );
+        }
+
+        // Reopened cleanly, the survivor still verifies and restores exactly: the
+        // failed prune did not delete the live blob's pack before repacking it.
+        let repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+        assert!(
+            verify(&repo).await.is_ok(),
+            "repo still verifies after a crashed prune"
+        );
+        assert!(repo.list_snapshots().await.unwrap().contains(&snap2));
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap2, out.path()).await.unwrap();
+        assert_eq!(collect_files(out.path()), want);
+    }
+
     /// A backend that flips a byte in reads of a chosen FileType (optionally only
     /// one specific id), to simulate silent on-disk corruption (bit rot).
     struct CorruptBackend {
