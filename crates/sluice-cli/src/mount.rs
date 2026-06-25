@@ -5,8 +5,8 @@
 //!
 //! The whole directory tree is loaded into an in-memory inode table at mount
 //! time (cheap — trees are small); file *contents* are fetched and decrypted
-//! lazily on `read`, with the most-recently-read file cached so a sequential
-//! `cat` does not re-fetch its chunks.
+//! lazily on `read`, streaming one chunk at a time with the current chunk cached,
+//! so reading even a file larger than memory never holds more than one chunk.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -53,9 +53,15 @@ struct SnapshotFs<B: StorageBackend> {
     rt: Runtime,
     repo: Repository<B>,
     inodes: HashMap<u64, Inode>,
-    /// The most-recently-read file `(inode, bytes)`, so sequential reads of one
-    /// file fetch its chunks only once.
-    cached: Option<(u64, Vec<u8>)>,
+    /// Per-file cumulative plaintext chunk offsets, grown lazily as a file is read
+    /// (a chunk's decompressed length is only known once it is decoded, so the
+    /// table is built on demand). `offsets[ino][i]` is the byte at which chunk `i`
+    /// starts; the final element is the size known so far.
+    offsets: HashMap<u64, Vec<u64>>,
+    /// The single most-recently-decoded chunk `(inode, chunk index, bytes)`, so a
+    /// sequential read walks through a chunk without re-fetching it. Bounds peak
+    /// memory to one chunk rather than a whole file.
+    chunk: Option<(u64, usize, Vec<u8>)>,
 }
 
 /// A `SystemTime` from nanoseconds since the Unix epoch (clamped at the epoch).
@@ -277,25 +283,84 @@ impl<B: StorageBackend> Filesystem for SnapshotFs<B> {
                 return;
             }
         };
-        // Reconstruct (and cache) the whole file the first time it is read.
-        if self.cached.as_ref().map(|(c, _)| *c) != Some(ino) {
-            let mut bytes = Vec::new();
-            for id in &ids {
-                match self.rt.block_on(self.repo.load_blob(id)) {
-                    Ok(chunk) => bytes.extend_from_slice(&chunk),
-                    Err(_) => {
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                }
-            }
-            self.cached = Some((ino, bytes));
+        // Take the per-inode offset table and single-chunk cache out of `self`
+        // for the duration of the read (disjoint from the `rt`/`repo` borrows the
+        // helper needs), then put the grown state back.
+        let mut table = self.offsets.remove(&ino).unwrap_or_else(|| vec![0]);
+        let mut cache = match self.chunk.take() {
+            Some((cino, idx, bytes)) if cino == ino => Some((idx, bytes)),
+            _ => None,
+        };
+        let result = read_file_range(
+            &self.rt,
+            &self.repo,
+            &ids,
+            &mut table,
+            &mut cache,
+            offset.max(0) as u64,
+            size as usize,
+        );
+        self.offsets.insert(ino, table);
+        self.chunk = cache.map(|(idx, bytes)| (ino, idx, bytes));
+        match result {
+            Ok(data) => reply.data(&data),
+            Err(_) => reply.error(libc::EIO),
         }
-        let data = &self.cached.as_ref().unwrap().1;
-        let start = (offset.max(0) as usize).min(data.len());
-        let end = start.saturating_add(size as usize).min(data.len());
-        reply.data(&data[start..end]);
     }
+}
+
+/// Read up to `size` bytes at `offset` from the file whose ordered chunks are
+/// `ids`, loading only the chunks that overlap the requested range. `table` is
+/// the file's growing cumulative-offset table (`table[i]` = start of chunk `i`,
+/// last element = size known so far) and `cache` holds the most recently decoded
+/// chunk, so a sequential read fetches each chunk once and never holds more than
+/// one chunk in memory. Reads past end-of-file return the available bytes.
+fn read_file_range<B: StorageBackend>(
+    rt: &Runtime,
+    repo: &Repository<B>,
+    ids: &[Id],
+    table: &mut Vec<u64>,
+    cache: &mut Option<(usize, Vec<u8>)>,
+    offset: u64,
+    size: usize,
+) -> io::Result<Vec<u8>> {
+    let want_end = offset.saturating_add(size as u64);
+    // Grow the offset table until it reaches the end of the request (or the whole
+    // file), decoding one chunk at a time and keeping the last one.
+    while table.len() - 1 < ids.len() && *table.last().unwrap() < want_end {
+        let idx = table.len() - 1;
+        let bytes = rt.block_on(repo.load_blob(&ids[idx])).map_err(to_io)?;
+        let start = *table.last().unwrap();
+        table.push(start + bytes.len() as u64);
+        *cache = Some((idx, bytes));
+    }
+    let total = *table.last().unwrap();
+    let end = want_end.min(total);
+    let mut out = Vec::new();
+    if offset >= end {
+        return Ok(out);
+    }
+    // The first chunk overlapping `offset` is the largest `i` with `table[i] <= offset`.
+    let mut idx = table.partition_point(|&o| o <= offset).saturating_sub(1);
+    while idx < ids.len() {
+        let cstart = table[idx];
+        if cstart >= end {
+            break;
+        }
+        let cend = table[idx + 1];
+        if cend > offset {
+            if cache.as_ref().map(|(i, _)| *i) != Some(idx) {
+                let bytes = rt.block_on(repo.load_blob(&ids[idx])).map_err(to_io)?;
+                *cache = Some((idx, bytes));
+            }
+            let bytes = &cache.as_ref().unwrap().1;
+            let lo = (offset.max(cstart) - cstart) as usize;
+            let hi = (end.min(cend) - cstart) as usize;
+            out.extend_from_slice(&bytes[lo..hi]);
+        }
+        idx += 1;
+    }
+    Ok(out)
 }
 
 /// Mount the snapshot `snap_id` of `repo` read-only at `mountpoint`, blocking
@@ -314,7 +379,8 @@ pub fn run_mount<B: StorageBackend + Send + 'static>(
         rt,
         repo,
         inodes,
-        cached: None,
+        offsets: HashMap::new(),
+        chunk: None,
     };
     let options = [
         MountOption::RO,
@@ -394,5 +460,87 @@ mod tests {
         };
         let (_, b_ino) = dchildren.iter().find(|(n, _)| n == "b.bin").unwrap();
         assert_eq!(inodes.get(b_ino).unwrap().attr.size, 4096);
+    }
+
+    #[test]
+    fn read_file_range_matches_at_any_offset() {
+        let rt = Runtime::new().unwrap();
+        // ~3 MiB of incompressible data, so it spans several chunks.
+        let mut data = vec![0u8; 3 * 1024 * 1024];
+        let mut x = 0x9e37_79b9u32;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("big.bin"), &data).unwrap();
+
+        let (repo, ids) = rt.block_on(async {
+            let kdf = sluice_crypto::KdfParams {
+                m_cost_kib: 16,
+                t_cost: 1,
+                p_cost: 1,
+            };
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", kdf)
+                .await
+                .unwrap();
+            let outcome = backup_sources_with_options(
+                &mut repo,
+                &[src.path().to_path_buf()],
+                &[],
+                &Default::default(),
+                None,
+            )
+            .await
+            .unwrap();
+            let snap = repo
+                .load_snapshot(&outcome.snapshot.unwrap())
+                .await
+                .unwrap();
+            let tree = repo.load_tree(&snap.tree).await.unwrap();
+            let node = tree.nodes.iter().find(|n| n.name == b"big.bin").unwrap();
+            (repo, node.content.clone())
+        });
+        assert!(ids.len() > 1, "the test file must span multiple chunks");
+
+        // A full read reconstructs the file exactly.
+        let mut table = vec![0u64];
+        let mut cache = None;
+        let whole =
+            read_file_range(&rt, &repo, &ids, &mut table, &mut cache, 0, data.len()).unwrap();
+        assert_eq!(whole, data);
+
+        // An arbitrary mid-file range that crosses chunk boundaries (fresh state).
+        let mut t2 = vec![0u64];
+        let mut c2 = None;
+        let mid =
+            read_file_range(&rt, &repo, &ids, &mut t2, &mut c2, 1_000_000, 1_500_000).unwrap();
+        assert_eq!(mid, &data[1_000_000..2_500_000]);
+
+        // Sequential 128 KiB reads reusing the grown table/cache cover the file.
+        let mut t3 = vec![0u64];
+        let mut c3 = None;
+        let step = 128 * 1024;
+        for off in (0..data.len()).step_by(step) {
+            let n = step.min(data.len() - off);
+            let got = read_file_range(&rt, &repo, &ids, &mut t3, &mut c3, off as u64, n).unwrap();
+            assert_eq!(got, &data[off..off + n], "mismatch at offset {off}");
+        }
+
+        // A read past end-of-file yields nothing; a read straddling EOF is clamped.
+        let past =
+            read_file_range(&rt, &repo, &ids, &mut t3, &mut c3, data.len() as u64, 100).unwrap();
+        assert!(past.is_empty());
+        let tail = read_file_range(
+            &rt,
+            &repo,
+            &ids,
+            &mut t3,
+            &mut c3,
+            data.len() as u64 - 10,
+            999,
+        )
+        .unwrap();
+        assert_eq!(tail, &data[data.len() - 10..]);
     }
 }

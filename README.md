@@ -176,7 +176,8 @@ sluice rebuild-index ./repo   # rescan packs to repair a damaged/stale index
 Built with the optional `fuse` feature (`cargo build --features fuse`, which
 links libfuse), `sluice mount` exposes a snapshot as a **read-only** filesystem,
 so you can `ls`, `cat`, and copy individual files without a full restore. File
-contents are fetched and decrypted lazily as you read them.
+contents are streamed and decrypted a chunk at a time as you read, so even a file
+larger than memory copies out without being loaded whole.
 
 ```sh
 sluice mount ./repo <snapshot> /mnt/snap   # then browse /mnt/snap; unmount with:
