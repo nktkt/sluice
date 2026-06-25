@@ -276,14 +276,19 @@ concurrency model, CLI surface, and threat model — lives in
 - **M2** — deduplication (FastCDC) + zstd compression + persisted per-pack index — ✅
 - **M3** — encryption: Argon2id key hierarchy, XChaCha20-Poly1305, keyed BLAKE3 — ✅
 - **M4** — object storage / offsite DR (S3, GCS, Azure, MinIO) — ✅
-- **M5** — integrity (`verify`, `check`), retention (`forget` keep-last/daily/weekly/
-  monthly/yearly, `--dry-run`, `--prune`), and repacking `prune` — ✅
+- **M5** — integrity (`verify`, `verify --sample` spot-checks, `check`), retention
+  (`forget` keep-last/daily/weekly/monthly/yearly, `--dry-run`, `--prune`), and
+  repacking `prune` (`--max-unused`, `--dry-run`) — ✅
 - **M6** — operations: advisory locking (`unlock`), multiple passphrases
-  (`key add`/`list`/`remove`/`passwd`), `rebuild-index` — ✅
+  (`key add`/`list`/`remove`/`passwd`, with active-key marking), `rebuild-index` — ✅
 - **M7** — UX & scripting: multi-source backups, `backup --dry-run`/`--exclude-from`,
-  `find`, `tag`, `--keep-tag`/`--keep-within`/`--group-by`, `prune --max-unused`,
-  `cat`, `copy`, `--json` output, stable exit codes — ✅
-- **M8** — parallel pipeline, special files, FUSE mount, cross-platform polish — planned
+  `find`, `tag`, `--keep-tag`/`--keep-within`/`--group-by`, `cat`, `copy`,
+  `--json` on every result/listing command, stable exit codes — ✅
+- **M8** — streaming & spot-checks: memory-bounded streaming backup/restore with
+  ranged reads, sparse-file skipping, `backup --stdin`, `--exclude-if-present` /
+  `--exclude-caches`, `init --compression`, `verify --sample` — ✅
+- **M9** — *planned*: parallel backup pipeline, on-disk stat cache, FUSE mount,
+  Windows support, optional Reed-Solomon self-heal (`verify --repair`)
 
 ## Building
 
