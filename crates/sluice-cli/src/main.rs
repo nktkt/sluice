@@ -1144,7 +1144,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 snaps.push((id, snap));
             }
             // List chronologically (oldest first); --last keeps the most recent N.
-            snaps.sort_by(|a, b| a.1.time_ns.cmp(&b.1.time_ns));
+            snaps.sort_by_key(|s| s.1.time_ns);
             if let Some(n) = last {
                 let drop = snaps.len().saturating_sub(n);
                 snaps.drain(..drop);

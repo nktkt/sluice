@@ -193,6 +193,7 @@ pub async fn backup_sources<B: StorageBackend>(
 ///
 /// A thin wrapper over [`backup_sources_with_options`]; new walk filters live on
 /// [`BackupOptions`] rather than as ever-more positional parameters here.
+#[allow(clippy::too_many_arguments)]
 pub async fn backup_sources_with_progress<B: StorageBackend>(
     repo: &mut Repository<B>,
     sources: &[PathBuf],
@@ -406,7 +407,7 @@ async fn backup_sources_inner<B: StorageBackend>(
                     link_target: None,
                     dev: 0,
                     ino: 0,
-                    xattrs: read_xattrs(&source),
+                    xattrs: read_xattrs(source),
                     rdev: 0,
                     sparse: false,
                 });
@@ -720,10 +721,7 @@ async fn latest_snapshot<B: StorageBackend>(
     let mut best: Option<(Id, Snapshot)> = None;
     for id in repo.list_snapshots().await? {
         let snap = repo.load_snapshot(&id).await?;
-        if best
-            .as_ref()
-            .map_or(true, |(_, b)| snap.time_ns > b.time_ns)
-        {
+        if best.as_ref().is_none_or(|(_, b)| snap.time_ns > b.time_ns) {
             best = Some((id, snap));
         }
     }
@@ -798,7 +796,7 @@ impl RestoreFilter {
     /// Whether a leaf entry (file, symlink, special) at relative path `rel` is
     /// restored: it matches an include pattern (or there are none) and no exclude.
     fn allows_leaf(&self, rel: &Path) -> bool {
-        self.include.as_ref().map_or(true, |g| g.is_match(rel))
+        self.include.as_ref().is_none_or(|g| g.is_match(rel))
             && !self.exclude.as_ref().is_some_and(|g| g.is_match(rel))
     }
 
@@ -949,15 +947,15 @@ pub async fn restore_filtered<B: StorageBackend>(
                     apply_special_metadata(&dest, &node, &reporter);
                 }
             }
-            EntryKind::CharDevice | EntryKind::BlockDevice => {
-                if !(options.skip_existing && exists(&dest)) {
-                    match make_device(&dest, node.mode, node.kind, node.rdev) {
-                        Ok(()) => apply_special_metadata(&dest, &node, &reporter),
-                        Err(e) => record_warning(
-                            &reporter,
-                            format!("skipped device node {}: {e}", dest.display()),
-                        ),
-                    }
+            EntryKind::CharDevice | EntryKind::BlockDevice
+                if !(options.skip_existing && exists(&dest)) =>
+            {
+                match make_device(&dest, node.mode, node.kind, node.rdev) {
+                    Ok(()) => apply_special_metadata(&dest, &node, &reporter),
+                    Err(e) => record_warning(
+                        &reporter,
+                        format!("skipped device node {}: {e}", dest.display()),
+                    ),
                 }
             }
             _ => {}
@@ -1538,7 +1536,9 @@ fn select_kept(
     }
     // `--keep-hourly`/`daily`/`weekly`/`monthly`/`yearly`: most recent per bucket,
     // last N.
-    let bucketed: [(usize, fn(i64) -> i64); 5] = [
+    // A bucketing fn maps a snapshot time (ns) to its period bucket id.
+    type BucketFn = fn(i64) -> i64;
+    let bucketed: [(usize, BucketFn); 5] = [
         (policy.hourly, hour_bucket),
         (policy.daily, day_bucket),
         (policy.weekly, week_bucket),
@@ -1558,7 +1558,7 @@ fn select_kept(
     // `--keep-within-daily/weekly/monthly/yearly DUR`: most recent per bucket, for
     // snapshots within `DUR` of now. Like the count rules above, but bounded by a
     // time window instead of a number of buckets.
-    let windowed: [(i64, fn(i64) -> i64); 5] = [
+    let windowed: [(i64, BucketFn); 5] = [
         (policy.within_hourly_ns, hour_bucket),
         (policy.within_daily_ns, day_bucket),
         (policy.within_weekly_ns, week_bucket),
@@ -1668,7 +1668,7 @@ pub async fn forget_with_policy<B: StorageBackend>(
         let key = group_key(group_by, &snap);
         snapshots.push((id, snap.time_ns, snap.tags, key));
     }
-    snapshots.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+    snapshots.sort_by_key(|s| std::cmp::Reverse(s.1)); // most recent first
 
     // A single `now` reference for all time-window rules in this run.
     let now = now_ns();
@@ -2248,6 +2248,11 @@ async fn find_node<B: StorageBackend>(
 /// and chunked (unless `dry_run`). Updates `stats`.
 /// Read-only configuration threaded through the recursive backup walk, bundled
 /// to keep [`backup_dir`]/[`backup_file`] signatures small.
+/// Batched stat-cache updates collected during a backup walk, flushed once at
+/// the end. Aliased to keep [`BackupCtx`]'s field type under clippy's
+/// `type_complexity` threshold.
+type CacheUpdates<'a> = Option<&'a Mutex<Vec<(u64, u64, CacheEntry)>>>;
+
 #[derive(Clone, Copy)]
 struct BackupCtx<'a> {
     /// Entry-name globs to skip.
@@ -2269,7 +2274,7 @@ struct BackupCtx<'a> {
     /// On-disk stat cache to reuse unchanged files from, if enabled.
     cache: Option<&'a StatCache>,
     /// Batched cache updates (flushed once after the walk); present iff `cache`.
-    cache_updates: Option<&'a Mutex<Vec<(u64, u64, CacheEntry)>>>,
+    cache_updates: CacheUpdates<'a>,
     /// Per-file progress callback (`--verbose`).
     progress: Option<ProgressFn<'a>>,
 }
@@ -5644,7 +5649,7 @@ mod tests {
 
     impl CorruptBackend {
         fn corrupts(&self, ty: FileType, id: &Id) -> bool {
-            ty == self.corrupt && self.target.map_or(true, |t| t == *id)
+            ty == self.corrupt && self.target.is_none_or(|t| t == *id)
         }
     }
 
