@@ -311,6 +311,77 @@ fn man_pages_are_written_without_a_passphrase() {
 }
 
 #[test]
+fn snapshots_filter_by_host_and_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("x"), b"x").unwrap();
+    std::fs::write(b.join("y"), b"y").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    // Two snapshots: different host names, different source paths.
+    sluice()
+        .env("HOSTNAME", "host-one")
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&a)
+        .assert()
+        .success();
+    sluice()
+        .env("HOSTNAME", "host-two")
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&b)
+        .assert()
+        .success();
+
+    let json = |cmd: assert_cmd::assert::Assert| -> serde_json::Value {
+        serde_json::from_slice(&cmd.get_output().stdout).unwrap()
+    };
+
+    // --host keeps only the matching snapshot.
+    let v = json(
+        sluice()
+            .args(["snapshots"])
+            .arg(&repo)
+            .args(["--host", "host-one", "--json"])
+            .assert()
+            .success(),
+    );
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["hostname"], "host-one");
+
+    // --path keeps only the snapshot that backed up that source path.
+    let v = json(
+        sluice()
+            .args(["snapshots"])
+            .arg(&repo)
+            .arg("--path")
+            .arg(&b)
+            .arg("--json")
+            .assert()
+            .success(),
+    );
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["hostname"], "host-two");
+
+    // A non-matching host yields an empty list.
+    let v = json(
+        sluice()
+            .args(["snapshots"])
+            .arg(&repo)
+            .args(["--host", "nobody", "--json"])
+            .assert()
+            .success(),
+    );
+    assert!(v.as_array().unwrap().is_empty());
+}
+
+#[test]
 fn wrong_password_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

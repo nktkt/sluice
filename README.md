@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 209 tests across
+machine-readable JSON output, and stable exit codes. Backed by 210 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -80,7 +80,7 @@ work factor is tunable with `SLUICE_KDF_MEMORY_KIB` and `SLUICE_KDF_PASSES`.
 ### Inspect and restore
 
 ```sh
-sluice snapshots ./repo [--tag daily] [--last 5]   # chronological; --last keeps the newest N
+sluice snapshots ./repo [--tag daily] [--host laptop] [--path ~/docs] [--last 5]   # filter/list
 sluice ls        ./repo <snapshot> [path]      # list a snapshot's entries (or just a subpath)
 sluice ls -l     ./repo <snapshot>             # long format: mode, owner, size/device, mtime, target
 sluice find      ./repo '**/*.pdf'             # locate a glob across all snapshots
@@ -343,7 +343,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 209 tests
+cargo test     # 210 tests
 ```
 
 ## Caveats

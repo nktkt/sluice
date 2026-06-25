@@ -147,6 +147,12 @@ enum Command {
         /// Only show snapshots with this tag.
         #[arg(long)]
         tag: Option<String>,
+        /// Only show snapshots taken on this host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Only show snapshots that backed up this source path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
         /// Show only the N most recent snapshots.
         #[arg(long, value_name = "N")]
         last: Option<usize>,
@@ -697,6 +703,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         Command::Snapshots {
             repo,
             tag,
+            host,
+            path,
             last,
             json,
         } => {
@@ -706,6 +714,20 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 let snap = repository.load_snapshot(&id).await?;
                 if let Some(tag) = &tag {
                     if !snap.tags.iter().any(|t| t == tag) {
+                        continue;
+                    }
+                }
+                if let Some(host) = &host {
+                    if &snap.hostname != host {
+                        continue;
+                    }
+                }
+                if let Some(path) = &path {
+                    if !snap
+                        .paths
+                        .iter()
+                        .any(|p| String::from_utf8_lossy(p) == *path)
+                    {
                         continue;
                     }
                 }
