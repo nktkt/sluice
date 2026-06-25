@@ -5014,6 +5014,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupted_metadata_is_a_clean_error_not_a_panic() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"data").unwrap();
+        {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap();
+        }
+
+        // A corrupt config or key object makes `open` fail cleanly (it is read and
+        // authenticated up front), rather than panicking on garbage from an
+        // untrusted backend.
+        for ty in [FileType::Config, FileType::Key] {
+            let opened = Repository::open(
+                CorruptBackend {
+                    inner: mem.clone(),
+                    corrupt: ty,
+                },
+                b"pw",
+            )
+            .await;
+            assert!(opened.is_err(), "open with a corrupt {ty:?} must error");
+        }
+
+        // A corrupt snapshot lets `open` succeed (config, keys and index are
+        // intact) but surfaces as a clean error when the snapshot is read, e.g.
+        // by verify.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Snapshot,
+            },
+            b"pw",
+        )
+        .await
+        .unwrap();
+        assert!(
+            verify(&repo).await.is_err(),
+            "verify over a corrupt snapshot must error, not panic"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_subpath_restores_only_a_subtree() {
         let src = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(src.path().join("a/b")).unwrap();
