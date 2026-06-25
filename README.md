@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 219 tests across
+machine-readable JSON output, and stable exit codes. Backed by 220 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -65,7 +65,9 @@ being present in the repository, so a stale or foreign cache falls back to a
 normal read. Changed files are **streamed** through the
 chunker with a bounded buffer, and restored the same way — chunks written as they
 arrive — so a file larger than memory backs up and restores without being loaded
-whole. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
+whole. Within a file the chunks are compressed and encrypted **in parallel**
+across CPU cores (the chunker and pack assembly stay serial), so backups scale
+with the machine — most pronounced at higher compression levels. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
 instead of being read back as zeros, so a mostly-empty disk image is barely
 touched. On an interactive terminal, backup shows a live spinner with the running
 file count and current path; it hides itself when stderr is not a TTY (piped or
@@ -340,8 +342,10 @@ concurrency model, CLI surface, and threat model — lives in
   ranged reads, sparse-file skipping, `backup --stdin`, `--exclude-if-present` /
   `--exclude-caches`, `init --compression`, `verify --sample`, on-disk stat cache
   (`backup --cache`), read-only FUSE mount (`mount`, `fuse` feature) — ✅
-- **M9** — *planned*: parallel backup pipeline, Windows support, optional
-  Reed-Solomon self-heal (`verify --repair`)
+- **M9** — performance & polish: parallel per-chunk compression/encryption,
+  interactive progress spinners on backup/restore/verify/copy/prune — ✅
+- **M10** — *planned*: Windows support, optional Reed-Solomon self-heal
+  (`verify --repair`)
 
 ## Building
 
@@ -353,7 +357,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 219 tests
+cargo test     # 220 tests
 ```
 
 ## Caveats

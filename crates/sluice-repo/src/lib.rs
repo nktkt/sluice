@@ -450,6 +450,11 @@ impl<B: StorageBackend> Repository<B> {
     ) -> Result<(Vec<Id>, u64)> {
         use std::io::ErrorKind;
         const READ_WINDOW: usize = 1 << 20; // 1 MiB
+        // Gather roughly this many plaintext bytes of chunks, then compress and
+        // encrypt the whole batch in parallel. Peak memory stays bounded at
+        // ~2x this regardless of file size, while there is enough work per batch
+        // to keep the cores busy.
+        const BATCH_BYTES: usize = 8 << 20; // 8 MiB
 
         let chunker = self.chunker();
         let max = chunker.max();
@@ -457,6 +462,8 @@ impl<B: StorageBackend> Repository<B> {
         let mut total: u64 = 0;
         let mut buf: Vec<u8> = Vec::with_capacity(max + READ_WINDOW);
         let mut eof = false;
+        let mut batch: Vec<Vec<u8>> = Vec::new();
+        let mut batch_bytes = 0usize;
 
         loop {
             // Fill the buffer to at least `max` bytes (so a cut sees a full
@@ -485,21 +492,71 @@ impl<B: StorageBackend> Repository<B> {
                 let mut off = 0;
                 while off < buf.len() {
                     let n = chunker.cut(&buf[off..]);
-                    ids.push(self.save_blob(BlobKind::Data, &buf[off..off + n]).await?);
                     total += n as u64;
+                    batch_bytes += n;
+                    batch.push(buf[off..off + n].to_vec());
                     off += n;
+                    if batch_bytes >= BATCH_BYTES {
+                        self.save_chunk_batch(std::mem::take(&mut batch), &mut ids)
+                            .await?;
+                        batch_bytes = 0;
+                    }
                 }
                 break;
             }
 
             // `buf.len() >= max`: `cut` returns a real boundary in `[min, max]`.
             let n = chunker.cut(&buf);
-            ids.push(self.save_blob(BlobKind::Data, &buf[..n]).await?);
             total += n as u64;
+            batch_bytes += n;
+            batch.push(buf[..n].to_vec());
             buf.drain(..n);
+            if batch_bytes >= BATCH_BYTES {
+                self.save_chunk_batch(std::mem::take(&mut batch), &mut ids)
+                    .await?;
+                batch_bytes = 0;
+            }
         }
-
+        // Seal and store the final partial batch.
+        if !batch.is_empty() {
+            self.save_chunk_batch(batch, &mut ids).await?;
+        }
         Ok((ids, total))
+    }
+
+    /// Compress, encrypt, deduplicate and append a batch of data chunks in order,
+    /// pushing each chunk's id onto `ids`. The per-chunk compress+encrypt runs in
+    /// parallel (rayon, the CPU bottleneck of a backup); deduplication and pack
+    /// assembly stay serial, so the stored result — ids, dedup, pack boundaries —
+    /// is identical to processing the chunks one at a time.
+    async fn save_chunk_batch(&mut self, batch: Vec<Vec<u8>>, ids: &mut Vec<Id>) -> Result<()> {
+        use rayon::prelude::*;
+        let id_key = self.keys.id_key;
+        let data_key = self.keys.data_key;
+        let compression = self.config.compression;
+        let aad = self.blob_aad(BlobKind::Data);
+        // Parallel CPU work: each chunk's id, plus its compressed-and-sealed bytes.
+        let sealed: Vec<(Id, Vec<u8>)> = batch
+            .into_par_iter()
+            .map(|plaintext| {
+                let id = keyed_hash(&id_key, &plaintext);
+                let frame = compress(&plaintext, compression);
+                (id, seal(&data_key, &aad, &frame))
+            })
+            .collect();
+        // Serial: deduplicate and append, flushing whenever the pack fills.
+        for (id, blob) in sealed {
+            ids.push(id);
+            if self.index.contains_key(&id) || self.pending_index.contains_key(&id) {
+                continue;
+            }
+            let entry = self.pending.add(id, BlobKind::Data, &blob);
+            self.pending_index.insert(id, entry);
+            if self.pending.body_len() as u64 >= self.config.pack_target {
+                self.flush().await?;
+            }
+        }
+        Ok(())
     }
 
     /// Reassemble a file from its ordered chunk ids.

@@ -5349,6 +5349,44 @@ mod tests {
         assert_eq!(collect_files(src.path()), collect_files(out.path()));
     }
 
+    /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
+    /// round-trips byte-identical and re-backs-up reused, exercising the batch-
+    /// boundary logic of the parallel write path.
+    #[tokio::test]
+    async fn large_file_spanning_batches_round_trips() {
+        let mut data = vec![0u8; 9 * 1024 * 1024];
+        let mut x = 0x1234_5678u32;
+        for b in data.iter_mut() {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (x >> 24) as u8;
+        }
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("big.bin"), &data).unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let first =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap();
+        assert_eq!(first.summary.files_new, 1);
+        let snap = first.snapshot.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+        assert_eq!(std::fs::read(dst.path().join("big.bin")).unwrap(), data);
+
+        // Re-backing up the unchanged file reuses it (incremental still works with
+        // the batched write path).
+        let second =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap();
+        assert_eq!(second.summary.files_unmodified, 1);
+    }
+
     /// Like [`build_random_tree`], but also varies file modes and drops in
     /// relative symlinks, for the metadata-fidelity round-trip below.
     #[cfg(unix)]
