@@ -584,14 +584,17 @@ pack サイズ・object count・アクセスタイミング（high-threat ユー
 各マイルストーンは**それ自身でデモ可能**であり、後続が前の不変条件を破らないよう設計する。
 
 > **実装状況（現行を正とするのは README の Roadmap）**: 本節は週見積もり付きの当初計画。
-> M0–M5 は実質的に出荷済み — FastCDC dedup、zstd（skip-if-incompressible、`init --compression`）、
+> M0–M9 は実質的に出荷済み — FastCDC dedup、zstd（skip-if-incompressible、`init --compression`）、
 > Argon2id/XChaCha20-Poly1305、keyed-BLAKE3 id、S3 系オブジェクトストア、`verify`/`verify --sample`/`check`、
-> `forget`/`prune`、複数パスフレーズ。M1 の特殊ファイル（FIFO/デバイス/ハードリンク/sparse）、
+> `forget`（keep-last/daily/weekly/monthly/yearly・`--keep-tag`/`--keep-id`/`--keep-within`・`--group-by`）/`prune`、
+> 複数パスフレーズ。M1 の特殊ファイル（FIFO/デバイス/ハードリンク/sparse/xattr/非 UTF-8 名）、
 > メモリ有界ストリーミング backup/restore、オンディスク stat-cache（`backup --cache`、redb、
 > `(dev,ino)→chunk-ids`、再利用はリポジトリ内 blob 存在で必ずゲート）、読み取り専用 FUSE mount
-> （`sluice mount`、任意 `fuse` feature、libfuse リンク）も完了。**未実装の主項目**:
-> 真の並列バックアップパイプライン（現状 verify/restore の読み出しのみ並列）、
-> Windows メタデータ、Reed-Solomon self-heal（`verify --repair`）、辞書圧縮。
+> （`sluice mount`、任意 `fuse` feature）、restore の include/exclude glob、snapshots の host/path 絞り込み、
+> shell completions・man、**バックアップのチャンク毎 compress+encrypt の rayon 並列化**、
+> backup/restore/verify/copy/prune のインタラクティブ進捗スピナーも完了。**未実装の主項目**:
+> 完全並列パイプライン（チャンク毎 CPU 並列は実装済み；**ファイル間の並行処理と pack アップロードの
+> I/O オーバーラップは未着手**）、Windows メタデータ、Reed-Solomon self-heal（`verify --repair`）、辞書圧縮。
 
 ### M0 — Skeleton（~1-2週）
 - Cargo workspace 構築（§4 のクレート/モジュール骨格）。
