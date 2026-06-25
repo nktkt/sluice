@@ -1199,7 +1199,7 @@ async fn verify_restored_file<B: StorageBackend>(
 }
 
 /// A summary produced by [`verify`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
     /// Number of snapshots checked.
     pub snapshots: usize,
@@ -1211,6 +1211,11 @@ pub struct VerifyReport {
     /// Total number of unique content blobs referenced by the snapshots. Equals
     /// `blobs` for a full verify; for a sampled verify it is the denominator.
     pub total_blobs: usize,
+    /// Files that reference a blob which failed to load or authenticate, when
+    /// scanning with [`VerifyOptions::ignore_errors`] (empty otherwise — a normal
+    /// verify aborts on the first such blob). Each entry's `missing_blobs` counts
+    /// this file's unreadable (missing or corrupt) blobs.
+    pub damaged: Vec<DamagedFile>,
 }
 
 /// Options controlling [`verify_with`].
@@ -1233,6 +1238,11 @@ pub struct VerifyOptions {
     /// rotating schedule at bounded per-run cost. `None` falls back to
     /// `sample_percent`.
     pub subset: Option<(u32, u32)>,
+    /// Scan every selected blob and collect the files affected by any that fail
+    /// (into [`VerifyReport::damaged`]) instead of aborting on the first — a deep
+    /// bit-rot triage that, unlike `check`, also catches a corrupt (not just a
+    /// missing) blob. A normal verify aborts on the first failure.
+    pub ignore_errors: bool,
 }
 
 impl Default for VerifyOptions {
@@ -1241,6 +1251,7 @@ impl Default for VerifyOptions {
             sample_percent: 100,
             only: None,
             subset: None,
+            ignore_errors: false,
         }
     }
 }
@@ -1301,8 +1312,8 @@ pub async fn verify_with_progress<B: StorageBackend>(
         Some(id) => vec![id],
         None => repo.list_snapshots().await?,
     };
-    for snapshot in snapshots {
-        let snap = repo.load_snapshot(&snapshot).await?;
+    for snapshot in &snapshots {
+        let snap = repo.load_snapshot(snapshot).await?;
         report.snapshots += 1;
         collect_verify(repo, snap.tree, &mut report, &mut content).await?;
     }
@@ -1327,16 +1338,96 @@ pub async fn verify_with_progress<B: StorageBackend>(
 
     // Read and authenticate each selected content blob concurrently; load_blob
     // checks the AEAD tag, so any corrupt or missing blob surfaces as an error.
-    futures::stream::iter(to_read.iter().map(|id| repo.load_blob(id)))
-        .buffer_unordered(VERIFY_CONCURRENCY)
-        .try_for_each(|_| async {
-            if let Some(p) = progress {
-                p();
+    if options.ignore_errors {
+        // Deep triage: don't stop at the first bad blob — read them all, gather
+        // the ids that fail to load or authenticate, then map them to the files
+        // affected (so a single verify reports the full extent of bit-rot).
+        let outcomes: Vec<(Id, bool)> = futures::stream::iter(to_read.iter().map(|id| {
+            let id = *id;
+            async move {
+                let ok = repo.load_blob(&id).await.is_ok();
+                if let Some(p) = progress {
+                    p();
+                }
+                (id, ok)
             }
-            Ok(())
-        })
-        .await?;
+        }))
+        .buffer_unordered(VERIFY_CONCURRENCY)
+        .collect()
+        .await;
+        let bad: HashSet<Id> = outcomes
+            .into_iter()
+            .filter_map(|(id, ok)| (!ok).then_some(id))
+            .collect();
+        if !bad.is_empty() {
+            for snapshot in &snapshots {
+                let snap = repo.load_snapshot(snapshot).await?;
+                damaged_tree(
+                    repo,
+                    snap.tree,
+                    *snapshot,
+                    String::new(),
+                    &bad,
+                    &mut report.damaged,
+                )
+                .await?;
+            }
+        }
+    } else {
+        futures::stream::iter(to_read.iter().map(|id| repo.load_blob(id)))
+            .buffer_unordered(VERIFY_CONCURRENCY)
+            .try_for_each(|_| async {
+                if let Some(p) = progress {
+                    p();
+                }
+                Ok(())
+            })
+            .await?;
+    }
     Ok(report)
+}
+
+/// Walk `tree_id` (under `prefix`, within `snapshot`) and record every file that
+/// references a blob in `bad` (one that failed to load/authenticate) as a
+/// [`DamagedFile`]. The triage half of [`verify_with_progress`]'s `ignore_errors`.
+fn damaged_tree<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    snapshot: Id,
+    prefix: String,
+    bad: &'a HashSet<Id>,
+    out: &'a mut Vec<DamagedFile>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        for node in &tree.nodes {
+            let name = String::from_utf8_lossy(&node.name);
+            let path = if prefix.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match node.kind {
+                EntryKind::Dir => {
+                    if let Some(subtree) = node.subtree {
+                        damaged_tree(repo, subtree, snapshot, path, bad, out).await?;
+                    }
+                }
+                EntryKind::File => {
+                    let n = node.content.iter().filter(|id| bad.contains(id)).count();
+                    if n > 0 {
+                        out.push(DamagedFile {
+                            snapshot,
+                            path,
+                            missing_blobs: n,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Select `ceil(len * percent / 100)` ids (at least one when non-empty) from
@@ -6315,6 +6406,62 @@ mod tests {
             "the broken file is left absent, not half-written"
         );
         assert!(report.warnings >= 1, "the skipped file is reported");
+    }
+
+    /// `verify --ignore-errors` scans past a corrupt blob and names the affected
+    /// files — catching bit-rot (a corrupt, not merely missing, blob) that the
+    /// index-only `check` cannot see.
+    #[tokio::test]
+    async fn verify_ignore_errors_reports_corrupt_files() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), vec![1u8; 6000]).unwrap();
+        let p1 = {
+            let mut repo = Repository::init(mem.clone(), b"pw", fast()).await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap();
+            repo.backend().list(FileType::Pack).await.unwrap()[0]
+        };
+        let snap = {
+            std::fs::write(src.path().join("b"), vec![2u8; 6000]).unwrap();
+            let mut repo = Repository::open(mem.clone(), b"pw").await.unwrap();
+            backup(&mut repo, src.path()).await.unwrap()
+        };
+
+        // Corrupt only p1 (file a's content); b and the trees stay readable.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Pack,
+                target: Some(p1),
+            },
+            b"pw",
+        )
+        .await
+        .unwrap();
+
+        // A normal verify of that snapshot aborts on the corrupt blob.
+        let targeted = VerifyOptions {
+            only: Some(snap),
+            ..Default::default()
+        };
+        assert!(verify_with(&repo, targeted).await.is_err());
+
+        // The deep scan reports file a as damaged and does not abort.
+        let report = verify_with(
+            &repo,
+            VerifyOptions {
+                only: Some(snap),
+                ignore_errors: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.damaged.len(), 1, "exactly file a is corrupt");
+        assert_eq!(report.damaged[0].path, "a");
+        assert_eq!(report.damaged[0].snapshot, snap);
+        assert_eq!(report.damaged[0].missing_blobs, 1);
     }
 
     #[tokio::test]

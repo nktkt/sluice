@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 288 tests across
+machine-readable JSON output, and stable exit codes. Backed by 290 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -209,6 +209,7 @@ sluice verify ./repo              # thorough: read & authenticate every blob (re
 sluice verify ./repo <snapshot>   # verify just one snapshot (fast targeted integrity check)
 sluice verify ./repo --sample 10  # spot-check: read & authenticate a random 10% of blobs
 sluice verify ./repo --subset 1/7 # scrub a deterministic 1/7 of blobs (1/7..7/7 = full, once)
+sluice verify ./repo --ignore-errors   # don't stop at the first bad blob; list every affected file
 ```
 
 `check` decrypts only the tree objects and confirms each referenced blob is
@@ -230,7 +231,13 @@ authentication tag — so a scheduled check can alert on a non-zero status. When
 `check` finds missing blobs it also names the **affected files** — which snapshot
 and path each is (in the human output and in `--json`'s `damaged` array) — so you
 can triage exactly what a lost pack cost and which files a `restore
---ignore-errors` would skip, rather than staring at opaque blob ids.
+--ignore-errors` would skip, rather than staring at opaque blob ids. `verify
+--ignore-errors` does the same triage but from a full read-data scan rather than
+the index, so it also catches a **corrupt** (not merely missing) blob — bit-rot
+that `check` cannot see — and reports every affected file in one pass instead of
+aborting at the first. Together: `check` for a cheap "what's missing", `verify
+--ignore-errors` for a thorough "what's actually readable", then `restore
+--ignore-errors` to recover the rest.
 
 ### Retention and pruning
 
@@ -523,7 +530,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 288 tests
+cargo test     # 290 tests
 ```
 
 ## Caveats

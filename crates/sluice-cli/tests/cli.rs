@@ -3230,3 +3230,65 @@ fn check_reports_files_affected_by_a_lost_pack() {
     assert_eq!(damaged[0]["path"], "a");
     assert_eq!(damaged[0]["missing_blobs"], 1);
 }
+
+#[test]
+fn verify_ignore_errors_scans_and_reports_all_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a"), b"AAAA").unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let pack1 = std::fs::read_dir(repo.join("data"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let snaps: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    let snap1 = snaps[0]["id"].as_str().unwrap().to_string();
+    std::fs::write(src.join("b"), b"BBBB").unwrap();
+    sluice()
+        .args(["backup"])
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    sluice()
+        .arg("forget")
+        .arg(&repo)
+        .arg(&snap1)
+        .assert()
+        .success();
+    std::fs::remove_file(&pack1).unwrap();
+    sluice().arg("rebuild-index").arg(&repo).assert().success();
+
+    // A normal verify aborts (exit 13) on the first unreadable blob.
+    sluice().arg("verify").arg(&repo).assert().code(13);
+
+    // The deep scan names the affected file and still exits 13.
+    let o = sluice()
+        .arg("verify")
+        .arg(&repo)
+        .args(["--ignore-errors", "--json"])
+        .assert()
+        .code(13);
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    let damaged = v["damaged"].as_array().unwrap();
+    assert_eq!(damaged.len(), 1);
+    assert_eq!(damaged[0]["path"], "a");
+    assert_eq!(damaged[0]["bad_blobs"], 1);
+}

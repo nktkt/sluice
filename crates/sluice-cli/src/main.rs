@@ -288,6 +288,11 @@ enum Command {
         /// catching cold-storage bit-rot. Conflicts with --sample.
         #[arg(long, value_name = "N/M", conflicts_with = "sample")]
         subset: Option<String>,
+        /// Don't stop at the first bad blob: scan everything and report every
+        /// affected file (deep bit-rot triage that also catches corrupt, not just
+        /// missing, blobs — unlike `check`). Exits 13 if any are found.
+        #[arg(long)]
+        ignore_errors: bool,
         /// Emit the result (counts) as machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1394,6 +1399,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             snapshot,
             sample,
             subset,
+            ignore_errors,
             json,
         } => {
             let sample_percent = match sample {
@@ -1415,6 +1421,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 sample_percent,
                 only,
                 subset,
+                ignore_errors,
             };
             // A live spinner on a terminal (verify can read a lot of data); hidden
             // when piped or with --json.
@@ -1438,17 +1445,47 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 pb.finish_and_clear();
             }
             if json {
+                let damaged: Vec<serde_json::Value> = report
+                    .damaged
+                    .iter()
+                    .map(|d| {
+                        serde_json::json!({
+                            "snapshot": d.snapshot.to_string(),
+                            "path": d.path,
+                            "bad_blobs": d.missing_blobs,
+                        })
+                    })
+                    .collect();
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "ok": true,
+                        "ok": report.damaged.is_empty(),
                         "snapshots": report.snapshots,
                         "trees": report.trees,
                         "blobs": report.blobs,
                         "total_blobs": report.total_blobs,
                         "sampled": report.blobs != report.total_blobs,
+                        "damaged": damaged,
                     }))?
                 );
+                if !report.damaged.is_empty() {
+                    return Ok(13);
+                }
+            } else if !report.damaged.is_empty() {
+                // --ignore-errors scan found bad blobs: name the affected files.
+                eprintln!(
+                    "FAILED: {} file(s) reference a blob that failed to verify:",
+                    report.damaged.len()
+                );
+                for d in &report.damaged {
+                    eprintln!(
+                        "  {} in {} ({} blob(s) bad)",
+                        d.path,
+                        &d.snapshot.to_string()[..16],
+                        d.missing_blobs
+                    );
+                }
+                return Ok(13);
             } else if report.blobs == report.total_blobs {
                 println!(
                     "ok: {} snapshots, {} trees, {} blobs verified",
