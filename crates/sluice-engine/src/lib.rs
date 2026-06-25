@@ -5733,6 +5733,52 @@ mod tests {
         assert_eq!(std::fs::read(dst.path().join("b.bin")).unwrap(), data);
     }
 
+    /// Copy recompresses data into the destination at the destination handle's
+    /// level: copying the same snapshot into a level-1 destination stores more
+    /// than into a level-19 destination, and the copy restores byte-identically.
+    #[tokio::test]
+    async fn copy_recompresses_at_the_destination_level() {
+        let data = compressible_blob();
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("blob.bin"), &data).unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut source = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap =
+            backup_sources_with_options(&mut source, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap();
+
+        // Copy the snapshot into two destinations recompressed at different levels.
+        let mut low_dest = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        low_dest.set_data_compression(Some(1));
+        copy_snapshot(&source, &mut low_dest, &snap).await.unwrap();
+        let low = pack_bytes(&low_dest).await;
+
+        let mut high_dest = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        high_dest.set_data_compression(Some(19));
+        let new = copy_snapshot(&source, &mut high_dest, &snap).await.unwrap();
+        let high = pack_bytes(&high_dest).await;
+
+        assert!(
+            low > high,
+            "copy at level 1 stored {low} should exceed level 19 stored {high}"
+        );
+
+        // The level-19 copy restores to the original bytes.
+        let out = tempfile::tempdir().unwrap();
+        restore(&high_dest, &new, out.path()).await.unwrap();
+        assert_eq!(std::fs::read(out.path().join("blob.bin")).unwrap(), data);
+    }
+
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
     /// round-trips byte-identical and re-backs-up reused, exercising the batch-
     /// boundary logic of the parallel write path.

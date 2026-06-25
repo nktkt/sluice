@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 231 tests across
+machine-readable JSON output, and stable exit codes. Backed by 233 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -228,12 +228,17 @@ fusermount -u /mnt/repo                         # unmount (or Ctrl-C in the moun
 
 `copy` re-encrypts a snapshot under the destination's keys, so the two
 repositories can use different passphrases — useful for migrating or replicating
-to an offsite repo, or rotating keys by re-encryption.
+to an offsite repo, or rotating keys by re-encryption. Because it decrypts and
+re-seals each blob, `--compression <LEVEL>` can recompress the data into the
+destination at a different zstd level than the source — e.g. copy a fast level-3
+working repo into a level-19 cold archive — without affecting the destination's
+deduplication.
 
 ```sh
 sluice copy ./repo s3://my-bucket/backups <snapshot>   # one snapshot
 sluice copy ./repo s3://my-bucket/backups               # every snapshot (idempotent)
 sluice copy ./repo s3://my-bucket/backups --json        # report new destination ids as JSON
+sluice copy ./repo /mnt/cold/archive --compression 19   # recompress into the destination at level 19
 ```
 
 The destination passphrase comes from `SLUICE_DEST_PASSWORD` (defaulting to the
@@ -377,7 +382,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 231 tests
+cargo test     # 233 tests
 ```
 
 ## Caveats

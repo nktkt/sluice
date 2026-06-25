@@ -262,7 +262,12 @@ impl<B: StorageBackend> Repository<B> {
             return Ok(id);
         }
 
-        let frame = compress(plaintext, self.config.compression);
+        // File data honors a per-run level override; metadata (trees) does not.
+        let level = match kind {
+            BlobKind::Data => self.compression_override.unwrap_or(self.config.compression),
+            BlobKind::Tree => self.config.compression,
+        };
+        let frame = compress(plaintext, level);
         let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), &frame);
         let entry = self.pending.add(id, kind, &sealed);
         self.pending_index.insert(id, entry);
@@ -679,12 +684,12 @@ impl<B: StorageBackend> Repository<B> {
         &self.config
     }
 
-    /// Override the zstd level used to compress newly stored **file data** for
-    /// subsequent backups on this handle; `None` restores the repository default
-    /// (`config().compression`). Because a chunk's id is the hash of its
-    /// *plaintext*, the level never affects deduplication or the data read back —
-    /// only the stored size of chunks written from here on. Metadata blobs (trees,
-    /// snapshots, config) always use the repository default.
+    /// Override the zstd level used to compress newly stored **file data** —
+    /// whether written by a backup or a copy into this handle; `None` restores the
+    /// repository default (`config().compression`). Because a chunk's id is the
+    /// hash of its *plaintext*, the level never affects deduplication or the data
+    /// read back — only the stored size of chunks written from here on. Metadata
+    /// blobs (trees, snapshots, config) always use the repository default.
     pub fn set_data_compression(&mut self, level: Option<i32>) {
         self.compression_override = level;
     }

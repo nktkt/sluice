@@ -1021,6 +1021,62 @@ fn copy_emits_json() {
 }
 
 #[test]
+fn copy_compression_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let dest = dir.path().join("dest");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    let data = vec![b'Z'; 80_000];
+    std::fs::write(src.join("f.bin"), &data).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice().arg("init").arg(&dest).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Recompress into the destination at level 19; the copy still restores.
+    let o = sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .arg(&snap[..12])
+        .args(["--compression", "19", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let new_id = v["snapshots"][0].as_str().unwrap().to_string();
+    sluice()
+        .arg("restore")
+        .arg(&dest)
+        .arg(&new_id[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f.bin")).unwrap(), data);
+
+    // Out-of-range levels are rejected.
+    sluice()
+        .arg("copy")
+        .arg(&repo)
+        .arg(&dest)
+        .arg(&snap[..12])
+        .args(["--compression", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in 1..=22"));
+}
+
+#[test]
 fn backup_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

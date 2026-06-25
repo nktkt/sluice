@@ -161,6 +161,11 @@ enum Command {
         dst: String,
         /// Snapshot id to copy (a unique hex prefix); omit to copy every snapshot.
         snapshot: Option<String>,
+        /// Recompress data into the destination at this zstd level (1..22) instead
+        /// of the destination repository's default — e.g. copy to a cold archive
+        /// at level 19. Dedup within the destination is unaffected.
+        #[arg(long, value_name = "LEVEL", value_parser = clap::value_parser!(i32).range(1..=22))]
+        compression: Option<i32>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -876,6 +881,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             src,
             dst,
             snapshot,
+            compression,
             json,
         } => {
             let source = Repository::open(backend(&src, false).await?, pw).await?;
@@ -884,6 +890,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 std::env::var("SLUICE_DEST_PASSWORD").unwrap_or_else(|_| passphrase.clone());
             let mut dest =
                 Repository::open(backend(&dst, false).await?, dest_pass.as_bytes()).await?;
+            // Optionally recompress data into the destination at a chosen level.
+            dest.set_data_compression(compression);
             let target_id = match &snapshot {
                 Some(s) => Some(resolve_snapshot(&source, s).await?),
                 None => None,
