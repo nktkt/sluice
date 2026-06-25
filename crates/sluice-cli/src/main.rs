@@ -860,6 +860,13 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     }
                     println!("{}", serde_json::to_string_pretty(&obj)?);
                 } else {
+                    // With -v, list every file the (possibly filtered) restore
+                    // would write, to stderr — leaving stdout for the summary.
+                    if verbose {
+                        for e in entries.iter().filter(|e| e.kind == EntryKind::File) {
+                            eprintln!("{}", e.path);
+                        }
+                    }
                     println!(
                         "would restore {count} files ({bytes} bytes) into {} (nothing written)",
                         target.display()

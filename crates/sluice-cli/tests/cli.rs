@@ -1925,6 +1925,47 @@ fn restore_multiple_paths() {
 }
 
 #[test]
+fn restore_dry_run_verbose_lists_filtered_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::create_dir_all(src.join("logs")).unwrap();
+    std::fs::write(src.join("docs/a.pdf"), b"a").unwrap();
+    std::fs::write(src.join("docs/b.txt"), b"b").unwrap();
+    std::fs::write(src.join("logs/c.log"), b"c").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // A verbose dry run lists exactly the files the filter selects (on stderr),
+    // and the summary (on stdout) — writing nothing.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .args(["--dry-run", "-v", "--include", "**/*.pdf"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would restore 1 files"))
+        .stderr(predicate::str::contains("docs/a.pdf"))
+        .stderr(predicate::str::contains("b.txt").not())
+        .stderr(predicate::str::contains("c.log").not());
+    assert!(!out.exists(), "a dry run writes nothing");
+}
+
+#[test]
 fn restore_dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
