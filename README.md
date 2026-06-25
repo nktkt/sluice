@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 278 tests across
+machine-readable JSON output, and stable exit codes. Backed by 279 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -72,7 +72,9 @@ sluice backup ./repo ~/documents --json          # outcome as JSON (snapshot id,
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
 stored chunks without being re-read. By default that reuse is decided against the
-previous snapshot's trees; pass `--cache <PATH>` to instead keep an on-disk stat
+trees of the previous snapshot **of the same source paths** (a backup of different
+sources is never used as the basis, so a same-named file can't alias another's
+content); pass `--cache <PATH>` to instead keep an on-disk stat
 cache keyed by each file's `(device, inode)`, so a re-backup neither re-reads
 unchanged files nor loads the old trees at all (a per-directory round trip on an
 object-store backend), and a moved or renamed file is recognized too. The cache
@@ -495,7 +497,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 278 tests
+cargo test     # 279 tests
 ```
 
 ## Caveats

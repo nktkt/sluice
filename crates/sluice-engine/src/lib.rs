@@ -289,7 +289,13 @@ async fn backup_sources_inner<B: StorageBackend>(
     // With a stat cache, reuse is driven entirely by it; skip loading the parent
     // snapshot's trees (the expensive part on a high-latency backend).
     let use_parent_trees = cache.is_none();
-    let parent = latest_snapshot(repo).await?;
+    // The incremental parent must be a prior backup of these same sources (see
+    // `latest_snapshot`); a different path set is not a sound reuse basis.
+    let want_paths: Vec<Vec<u8>> = sources
+        .iter()
+        .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
+        .collect();
+    let parent = latest_snapshot(repo, &want_paths).await?;
     let mut summary = SnapshotStats::default();
     // Track how much this backup actually writes (deduplicated blobs add nothing).
     let bytes_stored_before = repo.bytes_stored();
@@ -523,7 +529,10 @@ async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
     name: &[u8],
     tags: &[String],
 ) -> Result<BackupOutcome> {
-    let parent = latest_snapshot(repo).await?;
+    // Match the parent to this stdin file's recorded path (its name), for the
+    // same reason as a directory backup (see `latest_snapshot`).
+    let want_paths = [name.to_vec()];
+    let parent = latest_snapshot(repo, &want_paths).await?;
     let bytes_stored_before = repo.bytes_stored();
     let (content, size) = repo.save_file_reader(reader).await?;
     let now = now_ns();
@@ -736,18 +745,40 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
         .map_err(|e| EngineError::Pattern(e.to_string()))
 }
 
-/// Find the most recent snapshot (by timestamp), if any.
+/// Find the most recent snapshot that backed up exactly `want_paths`, if any.
+///
+/// Scoping the incremental parent to the *same* source paths is a correctness
+/// guard, not an optimization: tree-based reuse matches a file to the parent by
+/// its name within the tree, so a snapshot of *different* sources could alias an
+/// unrelated file that happens to share a name, size and mtime and reuse its
+/// stale content. A differing path set yields no parent, so every file is read.
 async fn latest_snapshot<B: StorageBackend>(
     repo: &Repository<B>,
+    want_paths: &[Vec<u8>],
 ) -> Result<Option<(Id, Snapshot)>> {
     let mut best: Option<(Id, Snapshot)> = None;
     for id in repo.list_snapshots().await? {
         let snap = repo.load_snapshot(&id).await?;
+        if !same_path_set(&snap.paths, want_paths) {
+            continue;
+        }
         if best.as_ref().is_none_or(|(_, b)| snap.time_ns > b.time_ns) {
             best = Some((id, snap));
         }
     }
     Ok(best)
+}
+
+/// Whether two source-path lists denote the same set (order-insensitive).
+fn same_path_set(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&[u8]> = a.iter().map(Vec::as_slice).collect();
+    let mut b: Vec<&[u8]> = b.iter().map(Vec::as_slice).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    a == b
 }
 
 /// Best-effort metadata a restore could not fully apply: ownership it could not
@@ -7010,6 +7041,37 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         restore(&dst, &new_ids[0], out.path()).await.unwrap();
         assert_eq!(std::fs::read(out.path().join("one")).unwrap(), b"first");
+    }
+
+    #[tokio::test]
+    async fn backup_of_a_different_source_does_not_alias_a_same_named_file() {
+        // Two distinct source directories, each with a file named "f" of equal
+        // size but different content, and — the dangerous part — an identical
+        // mtime. A path-blind incremental parent would match the second "f" to
+        // the first by name+size+mtime and silently reuse the first's content.
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("f"), b"AAA").unwrap();
+        std::fs::write(dir_b.path().join("f"), b"BBB").unwrap();
+        let t = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(dir_a.path().join("f"), t).unwrap();
+        filetime::set_file_mtime(dir_b.path().join("f"), t).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let _a = backup(&mut repo, dir_a.path()).await.unwrap();
+        let snap_b = backup(&mut repo, dir_b.path()).await.unwrap();
+
+        // The second snapshot must restore its own content, not the first's:
+        // the parent is scoped to matching source paths, so "f" is read fresh.
+        let out = tempfile::tempdir().unwrap();
+        restore(&repo, &snap_b, out.path()).await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("f")).unwrap(),
+            b"BBB",
+            "a different source must not reuse a same-named file's stale content"
+        );
     }
 
     #[tokio::test]
