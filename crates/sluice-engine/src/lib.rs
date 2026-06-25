@@ -4922,11 +4922,12 @@ mod tests {
         assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap1]);
     }
 
-    /// A backend that flips a byte in every read of a chosen FileType, to
-    /// simulate silent on-disk corruption (bit rot) of a pack.
+    /// A backend that flips a byte in reads of a chosen FileType (optionally only
+    /// one specific id), to simulate silent on-disk corruption (bit rot).
     struct CorruptBackend {
         inner: std::sync::Arc<MemoryBackend>,
         corrupt: FileType,
+        target: Option<Id>,
     }
 
     fn flip_middle(mut v: Vec<u8>) -> bytes::Bytes {
@@ -4937,11 +4938,17 @@ mod tests {
         v.into()
     }
 
+    impl CorruptBackend {
+        fn corrupts(&self, ty: FileType, id: &Id) -> bool {
+            ty == self.corrupt && self.target.map_or(true, |t| t == *id)
+        }
+    }
+
     #[async_trait::async_trait]
     impl StorageBackend for CorruptBackend {
         async fn get(&self, ty: FileType, id: &Id) -> sluice_store::Result<bytes::Bytes> {
             let bytes = self.inner.get(ty, id).await?;
-            Ok(if ty == self.corrupt {
+            Ok(if self.corrupts(ty, id) {
                 flip_middle(bytes.to_vec())
             } else {
                 bytes
@@ -4955,7 +4962,7 @@ mod tests {
             len: u64,
         ) -> sluice_store::Result<bytes::Bytes> {
             let bytes = self.inner.get_range(ty, id, offset, len).await?;
-            Ok(if ty == self.corrupt {
+            Ok(if self.corrupts(ty, id) {
                 flip_middle(bytes.to_vec())
             } else {
                 bytes
@@ -5002,6 +5009,7 @@ mod tests {
             CorruptBackend {
                 inner: mem.clone(),
                 corrupt: FileType::Pack,
+                target: None,
             },
             b"pw",
         )
@@ -5032,6 +5040,7 @@ mod tests {
                 CorruptBackend {
                     inner: mem.clone(),
                     corrupt: ty,
+                    target: None,
                 },
                 b"pw",
             )
@@ -5046,6 +5055,7 @@ mod tests {
             CorruptBackend {
                 inner: mem.clone(),
                 corrupt: FileType::Snapshot,
+                target: None,
             },
             b"pw",
         )
@@ -5054,6 +5064,54 @@ mod tests {
         assert!(
             verify(&repo).await.is_err(),
             "verify over a corrupt snapshot must error, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_key_does_not_lock_out_a_second_passphrase() {
+        use std::sync::Arc;
+        let mem = Arc::new(MemoryBackend::new());
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a"), b"keep me").unwrap();
+        // Back up under "first", note its key id, then add a second passphrase.
+        let (snap, first_key) = {
+            let mut repo = Repository::init(mem.clone(), b"first", fast())
+                .await
+                .unwrap();
+            let snap = backup(&mut repo, src.path()).await.unwrap();
+            let first_key = repo.list_keys().await.unwrap()[0];
+            repo.add_key(b"second", fast()).await.unwrap();
+            (snap, first_key)
+        };
+
+        // Corrupt the first key object. Opening with "second" still works — the
+        // unreadable key is skipped — so the repository stays accessible and intact.
+        let repo = Repository::open(
+            CorruptBackend {
+                inner: mem.clone(),
+                corrupt: FileType::Key,
+                target: Some(first_key),
+            },
+            b"second",
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.list_snapshots().await.unwrap(), vec![snap]);
+        assert!(verify(&repo).await.is_ok());
+
+        // The corrupted key's own passphrase no longer opens it, but a surviving
+        // passphrase means you are not locked out.
+        assert!(
+            Repository::open(
+                CorruptBackend {
+                    inner: mem.clone(),
+                    corrupt: FileType::Key,
+                    target: Some(first_key),
+                },
+                b"first",
+            )
+            .await
+            .is_err()
         );
     }
 
