@@ -169,6 +169,10 @@ enum Command {
         /// Leave entries already present and matching in place (resume a restore).
         #[arg(long)]
         skip_existing: bool,
+        /// Don't overwrite a target file that is newer than the snapshot's version
+        /// (by mtime) — keep locally-updated files when restoring an older backup.
+        #[arg(long)]
+        skip_newer: bool,
         /// After restoring, delete entries under the target that the snapshot does
         /// not contain, making it an exact mirror. Cannot be combined with
         /// --path/--include/--exclude. Pair with --dry-run to preview deletions.
@@ -796,6 +800,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude_from,
             dry_run,
             skip_existing,
+            skip_newer,
             delete,
             verify,
             verbose,
@@ -897,6 +902,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             } else {
                 let options = RestoreOptions {
                     skip_existing,
+                    skip_newer,
                     verify,
                 };
                 // With --verbose, print each file as it is restored (to stderr,

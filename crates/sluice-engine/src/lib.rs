@@ -744,6 +744,10 @@ pub struct RestoreOptions {
     /// snapshot's size and mtime. Makes a restore idempotent and resumable: a
     /// re-run after an interruption leaves finished entries untouched.
     pub skip_existing: bool,
+    /// Skip a file whose target already exists and is *newer* than the snapshot's
+    /// version (by mtime), so restoring an older backup over a live tree keeps
+    /// locally-updated files instead of clobbering them with stale data.
+    pub skip_newer: bool,
     /// After writing each file, re-read it and confirm its contents match the
     /// snapshot, failing with [`EngineError::VerifyFailed`] if not.
     pub verify: bool,
@@ -1071,6 +1075,12 @@ fn file_matches(path: &Path, node: &Node) -> bool {
     }
 }
 
+/// Whether something already at `path` is newer (by mtime) than the snapshot's
+/// version — the check used by skip-newer to protect locally-updated files.
+fn target_is_newer(path: &Path, node: &Node) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| mtime_ns(&m) > node.mtime_ns)
+}
+
 /// Restore one regular file's content and metadata, honoring skip-existing and
 /// (post-write) verify. Used by the full restore, the hardlink path, and subpath.
 async fn restore_file<B: StorageBackend>(
@@ -1082,6 +1092,9 @@ async fn restore_file<B: StorageBackend>(
     progress: Option<RestoreProgressFn<'_>>,
 ) -> Result<()> {
     if options.skip_existing && file_matches(path, node) {
+        return Ok(());
+    }
+    if options.skip_newer && target_is_newer(path, node) {
         return Ok(());
     }
     restore_file_streaming(repo, path, &node.content, node.sparse).await?;
@@ -4764,6 +4777,7 @@ mod tests {
         let report2 = |_: &Path| *again.lock().unwrap() += 1;
         let opts = RestoreOptions {
             skip_existing: true,
+            skip_newer: false,
             verify: false,
         };
         restore_with(&repo, &snap, None, out.path(), opts, Some(&report2))
@@ -4800,6 +4814,7 @@ mod tests {
         // skip-existing keeps the matching file untouched...
         let opts = RestoreOptions {
             skip_existing: true,
+            skip_newer: false,
             verify: false,
         };
         restore_with(&repo, &snap, None, out.path(), opts, None)
@@ -6518,6 +6533,66 @@ mod tests {
             .unwrap();
         assert!(dup.snapshot.is_some());
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+    }
+
+    /// `--skip-newer` keeps a target file that is newer than the snapshot's version
+    /// (protecting a local edit) but overwrites one that is older.
+    #[tokio::test]
+    async fn skip_newer_keeps_locally_newer_files() {
+        use std::time::{Duration, SystemTime};
+        let src = tempfile::tempdir().unwrap();
+        let sf = src.path().join("f");
+        std::fs::write(&sf, b"snapshot").unwrap();
+        // Date the source an hour ago, so the snapshot's mtime is fixed.
+        let base = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&sf)
+            .unwrap()
+            .set_modified(base)
+            .unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup(&mut repo, src.path()).await.unwrap();
+
+        let dst = tempfile::tempdir().unwrap();
+        let df = dst.path().join("f");
+        let opts = RestoreOptions {
+            skip_newer: true,
+            ..Default::default()
+        };
+
+        // A locally-newer file (mtime after the snapshot's) is preserved.
+        std::fs::write(&df, b"local newer").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&df)
+            .unwrap()
+            .set_modified(base + Duration::from_secs(7200))
+            .unwrap();
+        restore_with(&repo, &snap, None, dst.path(), opts, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&df).unwrap(), b"local newer", "newer kept");
+
+        // A locally-older file (mtime before the snapshot's) is overwritten.
+        std::fs::write(&df, b"local older").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&df)
+            .unwrap()
+            .set_modified(base - Duration::from_secs(7200))
+            .unwrap();
+        restore_with(&repo, &snap, None, dst.path(), opts, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&df).unwrap(),
+            b"snapshot",
+            "older overwritten"
+        );
     }
 
     /// A snapshot-time override stamps the committed snapshot with the given time

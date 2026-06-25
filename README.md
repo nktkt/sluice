@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 264 tests across
+machine-readable JSON output, and stable exit codes. Backed by 266 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -139,6 +139,7 @@ sluice restore   ./repo <snapshot> ./out --include-from restore.globs   # read i
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 sluice restore   ./repo <snapshot> ./out --dry-run -v --include '**/*.pdf'   # list the files a filter selects
 sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
+sluice restore   ./repo <snapshot> ./out --skip-newer                # keep target files newer than the snapshot
 sluice restore   ./repo <snapshot> ./out --delete                    # mirror: also remove extras in ./out
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
 sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
@@ -154,7 +155,10 @@ comments and blank lines ignored), so a reusable selective-restore set lives in 
 file rather than a long command line.
 `--skip-existing` makes a restore idempotent and resumable: an entry already
 present and matching (for files, same size and mtime) is left untouched, so
-re-running after an interruption only fills the gaps. `--delete` turns a restore
+re-running after an interruption only fills the gaps. `--skip-newer` instead
+leaves a target file in place when it is *newer* than the snapshot's version (by
+mtime), so restoring an older backup over a live tree keeps your local edits
+rather than clobbering them with stale data. `--delete` turns a restore
 into an exact mirror: after writing the snapshot, anything under the target the
 snapshot does not contain is removed (an extra directory with its whole subtree),
 so the target ends up matching the snapshot byte-for-byte and entry-for-entry —
@@ -427,7 +431,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 264 tests
+cargo test     # 266 tests
 ```
 
 ## Caveats

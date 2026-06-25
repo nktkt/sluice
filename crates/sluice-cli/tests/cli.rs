@@ -2085,6 +2085,58 @@ fn restore_dry_run_verbose_lists_filtered_files() {
 }
 
 #[test]
+fn restore_skip_newer_protects_local_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"snapshot version").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+
+    // Edit the restored file; rewriting it now makes its mtime newer than the
+    // snapshot's (taken earlier).
+    std::fs::write(out.join("f"), b"local newer edit").unwrap();
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .arg("--skip-newer")
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f")).unwrap(), b"local newer edit");
+
+    // Without the flag, the snapshot version overwrites it.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(out.join("f")).unwrap(), b"snapshot version");
+}
+
+#[test]
 fn restore_dry_run_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
