@@ -14,9 +14,9 @@ use clap::{Parser, Subcommand};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
-    DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport, RetentionPolicy,
-    VerifyOptions, backup_sources_with_progress, backup_stdin, check, copy_all, copy_snapshot,
-    diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
+    BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreOptions, RestoreReport,
+    RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin, check, copy_all,
+    copy_snapshot, diff, dump, find, forget, forget_tagged, forget_with_policy, list_files, prune,
     prune_excluding, rebuild_index, restore_with, retag, verify_with,
 };
 use sluice_repo::{RepoError, Repository};
@@ -73,6 +73,14 @@ enum Command {
         /// different filesystem than their source root (e.g. mount points).
         #[arg(long)]
         one_file_system: bool,
+        /// Skip any subdirectory that contains this marker file (repeatable),
+        /// e.g. --exclude-if-present .nobackup.
+        #[arg(long = "exclude-if-present", value_name = "FILE")]
+        exclude_if_present: Vec<String>,
+        /// Skip subdirectories holding a CACHEDIR.TAG with the standard cache
+        /// signature (build caches, browser caches, ...).
+        #[arg(long = "exclude-caches")]
+        exclude_caches: bool,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -432,6 +440,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             tags,
             exclude_larger_than,
             one_file_system,
+            exclude_if_present,
+            exclude_caches,
             dry_run,
             verbose,
             json,
@@ -461,17 +471,16 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 let reader = std::io::stdin().lock();
                 backup_stdin(&mut repository, reader, stdin_filename.as_bytes(), &tags).await?
             } else {
-                backup_sources_with_progress(
-                    &mut repository,
-                    &sources,
-                    &excludes,
-                    &tags,
-                    dry_run,
-                    max_size,
+                let options = BackupOptions {
+                    exclude_globs: excludes,
+                    max_file_size: max_size,
                     one_file_system,
-                    progress,
-                )
-                .await?
+                    exclude_if_present,
+                    exclude_caches,
+                    dry_run,
+                };
+                backup_sources_with_options(&mut repository, &sources, &tags, &options, progress)
+                    .await?
             };
             let s = outcome.summary;
             if json {

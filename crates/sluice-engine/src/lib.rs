@@ -117,6 +117,28 @@ pub enum FileStatus {
 /// [`backup_sources_with_progress`].
 pub type ProgressFn<'a> = &'a dyn Fn(&Path, FileStatus);
 
+/// Filters applied to a backup walk. Construct with `..Default::default()` and
+/// set only the fields you need; an all-default value backs up everything.
+#[derive(Clone, Default)]
+pub struct BackupOptions {
+    /// Skip entries whose name matches one of these globs.
+    pub exclude_globs: Vec<String>,
+    /// Skip a regular file discovered during a directory walk that is larger than
+    /// this many bytes (explicitly named single-file sources are always kept).
+    pub max_file_size: Option<u64>,
+    /// Do not descend into a subdirectory on a different filesystem than its
+    /// source root (e.g. a mount point).
+    pub one_file_system: bool,
+    /// Skip a subdirectory that contains any of these marker filenames (e.g.
+    /// `.nobackup`); the directory and everything under it is excluded.
+    pub exclude_if_present: Vec<String>,
+    /// Skip a subdirectory holding a `CACHEDIR.TAG` that carries the standard
+    /// cache signature (the convention used by build tools and browsers).
+    pub exclude_caches: bool,
+    /// Preview only — walk and count, but write nothing; the snapshot is `None`.
+    pub dry_run: bool,
+}
+
 /// Back up one or more `sources` into a single snapshot, skipping entries whose
 /// name matches one of `exclude_globs`. A single source becomes the snapshot
 /// root directly (backward-compatible); multiple sources are placed under a
@@ -149,6 +171,9 @@ pub async fn backup_sources<B: StorageBackend>(
 /// (explicitly named single-file sources are always backed up); and with
 /// `one_file_system`, the walk does not descend into subdirectories on a
 /// different filesystem than their source root.
+///
+/// A thin wrapper over [`backup_sources_with_options`]; new walk filters live on
+/// [`BackupOptions`] rather than as ever-more positional parameters here.
 pub async fn backup_sources_with_progress<B: StorageBackend>(
     repo: &mut Repository<B>,
     sources: &[PathBuf],
@@ -157,6 +182,26 @@ pub async fn backup_sources_with_progress<B: StorageBackend>(
     dry_run: bool,
     max_file_size: Option<u64>,
     one_file_system: bool,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<BackupOutcome> {
+    let options = BackupOptions {
+        exclude_globs: exclude_globs.to_vec(),
+        max_file_size,
+        one_file_system,
+        dry_run,
+        ..Default::default()
+    };
+    backup_sources_with_options(repo, sources, tags, &options, progress).await
+}
+
+/// Back up `sources` into one snapshot under the filters in `options`, invoking
+/// `progress` (if any) once per regular file. This is the full entry point; the
+/// other `backup_sources*` functions are conveniences over it.
+pub async fn backup_sources_with_options<B: StorageBackend>(
+    repo: &mut Repository<B>,
+    sources: &[PathBuf],
+    tags: &[String],
+    options: &BackupOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
     if sources.is_empty() {
@@ -169,47 +214,39 @@ pub async fn backup_sources_with_progress<B: StorageBackend>(
     }
     // A real backup holds a shared lock (it blocks a concurrent prune from
     // deleting data this snapshot references); a dry run only reads, so takes none.
-    let lock = if dry_run {
+    let lock = if options.dry_run {
         None
     } else {
         Some(repo.acquire_lock(false).await?)
     };
-    let result = backup_sources_inner(
-        repo,
-        sources,
-        exclude_globs,
-        tags,
-        dry_run,
-        max_file_size,
-        one_file_system,
-        progress,
-    )
-    .await;
+    let result = backup_sources_inner(repo, sources, tags, options, progress).await;
     if let Some(lock) = lock {
         let _ = repo.release_lock(&lock).await;
     }
     result
 }
 
-/// The body of [`backup_sources`], run while holding the shared lock (if any).
+/// The body of [`backup_sources_with_options`], run while holding the shared lock
+/// (if any).
 async fn backup_sources_inner<B: StorageBackend>(
     repo: &mut Repository<B>,
     sources: &[PathBuf],
-    exclude_globs: &[String],
     tags: &[String],
-    dry_run: bool,
-    max_file_size: Option<u64>,
-    one_file_system: bool,
+    options: &BackupOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<BackupOutcome> {
-    let excludes = build_globset(exclude_globs)?;
+    let excludes = build_globset(&options.exclude_globs)?;
     let base_ctx = BackupCtx {
         excludes: &excludes,
-        dry_run,
-        max_file_size,
+        dry_run: options.dry_run,
+        max_file_size: options.max_file_size,
         root_dev: None,
+        exclude_if_present: &options.exclude_if_present,
+        exclude_caches: options.exclude_caches,
         progress,
     };
+    let dry_run = options.dry_run;
+    let one_file_system = options.one_file_system;
     // The device of a directory source, for --one-file-system.
     let root_dev = |dir: &Path| -> Option<u64> {
         one_file_system.then(|| {
@@ -1738,8 +1775,32 @@ struct BackupCtx<'a> {
     /// With `--one-file-system`, the device of the source root; a subdirectory on
     /// a different device is not descended into.
     root_dev: Option<u64>,
+    /// Marker filenames whose presence in a subdirectory excludes it.
+    exclude_if_present: &'a [String],
+    /// Whether a subdirectory bearing a signed `CACHEDIR.TAG` is excluded.
+    exclude_caches: bool,
     /// Per-file progress callback (`--verbose`).
     progress: Option<ProgressFn<'a>>,
+}
+
+/// The standard `CACHEDIR.TAG` signature (the Bryce/Pearce cache-directory
+/// convention); a directory whose `CACHEDIR.TAG` begins with these bytes is a
+/// cache and is skipped under `--exclude-caches`.
+const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether directory `dir` should be skipped: it holds one of the
+/// `--exclude-if-present` marker files, or (with `--exclude-caches`) a
+/// `CACHEDIR.TAG` carrying the standard cache signature.
+fn dir_has_exclude_marker(dir: &Path, ctx: &BackupCtx<'_>) -> bool {
+    if ctx.exclude_if_present.iter().any(|m| dir.join(m).exists()) {
+        return true;
+    }
+    if ctx.exclude_caches {
+        if let Ok(bytes) = std::fs::read(dir.join("CACHEDIR.TAG")) {
+            return bytes.starts_with(CACHEDIR_SIGNATURE);
+        }
+    }
+    false
 }
 
 async fn backup_file<B: StorageBackend>(
@@ -1862,6 +1923,11 @@ fn backup_dir<'a, B: StorageBackend>(
                 if kind.is_dir() && dev_of(&meta) != root_dev {
                     continue;
                 }
+            }
+            // Skip a subdirectory marked for exclusion (--exclude-if-present /
+            // --exclude-caches): the directory and all its contents are omitted.
+            if kind.is_dir() && dir_has_exclude_marker(&path, &ctx) {
+                continue;
             }
 
             let node = if kind.is_dir() {
@@ -3083,6 +3149,104 @@ mod tests {
         assert!(
             !names.iter().any(|p| p == "mnt"),
             "the mount-point directory is not descended into"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclude_if_present_skips_marked_subdirectories() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"keep me").unwrap();
+        // A subdirectory carrying the marker is skipped wholesale.
+        let cache = src.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(cache.join(".nobackup"), b"").unwrap();
+        std::fs::write(cache.join("junk.bin"), vec![7u8; 4096]).unwrap();
+        // A subdirectory without the marker is backed up normally.
+        let data = src.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("real.txt"), b"important").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let options = BackupOptions {
+            exclude_if_present: vec![".nobackup".to_string()],
+            ..Default::default()
+        };
+        let snap = backup_sources_with_options(
+            &mut repo,
+            &[src.path().to_path_buf()],
+            &[],
+            &options,
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        let paths: Vec<String> = list_files(&repo, &snap)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(paths.iter().any(|p| p == "keep.txt"));
+        assert!(paths.iter().any(|p| p == "data/real.txt"));
+        assert!(
+            !paths.iter().any(|p| p.starts_with("cache")),
+            "the marked directory and its contents are omitted: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exclude_caches_skips_only_signed_cachedir_tags() {
+        let src = tempfile::tempdir().unwrap();
+        // A real cache: a CACHEDIR.TAG bearing the standard signature -> skipped.
+        let cache = src.path().join("buildcache");
+        std::fs::create_dir(&cache).unwrap();
+        std::fs::write(
+            cache.join("CACHEDIR.TAG"),
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# generated by the build tool",
+        )
+        .unwrap();
+        std::fs::write(cache.join("artifact.o"), vec![1u8; 2048]).unwrap();
+        // A decoy: a CACHEDIR.TAG without the signature is not a cache -> kept.
+        let decoy = src.path().join("notcache");
+        std::fs::create_dir(&decoy).unwrap();
+        std::fs::write(decoy.join("CACHEDIR.TAG"), b"just a coincidence").unwrap();
+        std::fs::write(decoy.join("keep.txt"), b"keep").unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let options = BackupOptions {
+            exclude_caches: true,
+            ..Default::default()
+        };
+        let snap = backup_sources_with_options(
+            &mut repo,
+            &[src.path().to_path_buf()],
+            &[],
+            &options,
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        let paths: Vec<String> = list_files(&repo, &snap)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert!(
+            !paths.iter().any(|p| p.starts_with("buildcache")),
+            "a signed cache directory is skipped: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == "notcache/keep.txt"),
+            "a directory whose CACHEDIR.TAG lacks the signature is kept: {paths:?}"
         );
     }
 
