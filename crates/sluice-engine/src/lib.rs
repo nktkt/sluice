@@ -4734,6 +4734,69 @@ mod tests {
         );
     }
 
+    /// Model-based data-safety test (`DESIGN.md` §11): drive a random sequence of
+    /// backup / forget / prune operations and, after every step, assert the two
+    /// invariants that matter for a backup tool — `verify` passes, and *every*
+    /// surviving snapshot still restores byte-identical to the source state it
+    /// captured. In other words, prune never removes data a live snapshot needs.
+    #[tokio::test]
+    async fn model_random_ops_keep_every_surviving_snapshot_intact() {
+        use std::collections::BTreeMap;
+
+        for seed in [7u64, 101, 31_337] {
+            let src = tempfile::tempdir().unwrap();
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+                .await
+                .unwrap();
+            let mut s = seed;
+            // Each surviving snapshot id -> the exact file tree it should restore to.
+            let mut expected: BTreeMap<Id, BTreeMap<PathBuf, Vec<u8>>> = BTreeMap::new();
+
+            for round in 0..12 {
+                // Mutate the source: rewrite a few files (from a small name pool, so
+                // chunks are shared and superseded across snapshots), sometimes delete.
+                for _ in 0..(1 + rnd(&mut s) % 4) {
+                    let name = format!("f{}", rnd(&mut s) % 6);
+                    let len = (rnd(&mut s) % 2500) as usize;
+                    let data: Vec<u8> = (0..len).map(|_| (rnd(&mut s) >> 33) as u8).collect();
+                    std::fs::write(src.path().join(name), data).unwrap();
+                }
+                if rnd(&mut s) % 4 == 0 {
+                    let _ = std::fs::remove_file(src.path().join(format!("f{}", rnd(&mut s) % 6)));
+                }
+
+                let snap = backup(&mut repo, src.path()).await.unwrap();
+                expected.insert(snap, collect_files(src.path()));
+
+                // Sometimes forget a random surviving snapshot.
+                if expected.len() > 1 && rnd(&mut s) % 3 == 0 {
+                    let victims: Vec<Id> = expected.keys().copied().collect();
+                    let victim = victims[(rnd(&mut s) as usize) % victims.len()];
+                    forget(&repo, &victim).await.unwrap();
+                    expected.remove(&victim);
+                }
+                // Sometimes reclaim space; this is where a bug could delete live data.
+                if rnd(&mut s) % 2 == 0 {
+                    prune(&mut repo, false, 0).await.unwrap();
+                }
+
+                assert!(
+                    verify(&repo).await.is_ok(),
+                    "verify failed at round {round}, seed {seed}"
+                );
+                for (id, want) in &expected {
+                    let out = tempfile::tempdir().unwrap();
+                    restore(&repo, id, out.path()).await.unwrap();
+                    assert_eq!(
+                        &collect_files(out.path()),
+                        want,
+                        "snapshot {id} no longer restores at round {round}, seed {seed}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn restore_subpath_restores_only_a_subtree() {
         let src = tempfile::tempdir().unwrap();
