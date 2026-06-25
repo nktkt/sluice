@@ -2798,15 +2798,18 @@ fn special_kind(_kind: &std::fs::FileType) -> Option<EntryKind> {
 /// Recreate a FIFO at `path` with the given mode bits.
 #[cfg(unix)]
 fn make_fifo(path: &Path, mode: u32) -> Result<()> {
-    use rustix::fs::{CWD, FileType, Mode, mknodat};
-    mknodat(
-        CWD,
-        path,
-        FileType::Fifo,
-        Mode::from_raw_mode((mode & 0o7777) as _),
-        0,
-    )
-    .map_err(|e| io_err(path, e.into()))
+    use std::os::unix::ffi::OsStrExt;
+    // `libc::mkfifo` is the portable POSIX call (rustix's `mknodat` isn't
+    // exposed on Apple targets, so this keeps macOS building alongside Linux).
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io_err(path, std::io::ErrorKind::InvalidInput.into()))?;
+    // SAFETY: `c` is a valid NUL-terminated path that outlives the call, which
+    // only reads it; `mode_t` carries the low permission bits.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+    if rc != 0 {
+        return Err(io_err(path, std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -2815,26 +2818,34 @@ fn make_fifo(_path: &Path, _mode: u32) -> Result<()> {
 }
 
 /// Recreate a character or block device node at `path`. `rdev` is the device
-/// number in the same encoding `stat` reported it (rustix's `Dev` matches the C
-/// library's), so it round-trips for any major/minor. Returns `Err` if `mknod`
-/// fails — notably `EPERM` when unprivileged — so the caller can skip rather
-/// than abort the whole restore.
+/// number in the same encoding `stat` reported it (the C library's `dev_t`), so
+/// it round-trips for any major/minor. Returns `Err` if `mknod` fails — notably
+/// `EPERM` when unprivileged — so the caller can skip rather than abort the
+/// whole restore.
 #[cfg(unix)]
 fn make_device(path: &Path, mode: u32, kind: EntryKind, rdev: u64) -> Result<()> {
-    use rustix::fs::{CWD, FileType, Mode, mknodat};
-    let file_type = match kind {
-        EntryKind::CharDevice => FileType::CharacterDevice,
-        EntryKind::BlockDevice => FileType::BlockDevice,
+    use std::os::unix::ffi::OsStrExt;
+    let ifmt = match kind {
+        EntryKind::CharDevice => libc::S_IFCHR,
+        EntryKind::BlockDevice => libc::S_IFBLK,
         _ => return Ok(()),
     };
-    mknodat(
-        CWD,
-        path,
-        file_type,
-        Mode::from_raw_mode((mode & 0o7777) as _),
-        rdev,
-    )
-    .map_err(|e| io_err(path, e.into()))
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io_err(path, std::io::ErrorKind::InvalidInput.into()))?;
+    // SAFETY: `c` is a valid NUL-terminated path outliving the call; `mode`/`rdev`
+    // are plain scalars. `libc::mknod` is portable across unix (incl. Apple),
+    // unlike rustix's Linux/BSD-only `mknodat`.
+    let rc = unsafe {
+        libc::mknod(
+            c.as_ptr(),
+            ifmt | (mode & 0o7777) as libc::mode_t,
+            rdev as libc::dev_t,
+        )
+    };
+    if rc != 0 {
+        return Err(io_err(path, std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -6866,6 +6877,7 @@ mod tests {
     /// only varies *file* modes, so a non-default *directory* mode (0700) here
     /// proves restore replays the stored mode rather than defaulting to 0755 —
     /// restoring a private directory as world-readable would be a security bug.
+    #[cfg(unix)]
     #[tokio::test]
     async fn restore_replays_directory_mode_and_mtime() {
         use std::os::unix::fs::PermissionsExt;
@@ -6906,6 +6918,7 @@ mod tests {
     /// replica: restoring from the copy reproduces the source's structure,
     /// content, mode, mtime and link targets exactly. Exercises copy across all
     /// the entry kinds build_random_tree_meta produces, not just a single file.
+    #[cfg(unix)]
     #[tokio::test]
     async fn copy_of_a_random_tree_is_a_faithful_replica() {
         for seed in [3u64, 71, 5_000] {
