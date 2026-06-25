@@ -2253,6 +2253,60 @@ fn ls_lists_a_subpath() {
 }
 
 #[test]
+fn diff_human_output_ends_with_a_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    sluice().arg("init").arg(&repo).assert().success();
+
+    std::fs::write(src.join("a"), b"1").unwrap();
+    std::fs::write(src.join("b"), b"2").unwrap();
+    let s1 = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    std::fs::write(src.join("a"), b"changed").unwrap(); // modified
+    std::fs::remove_file(src.join("b")).unwrap(); // removed
+    std::fs::write(src.join("c"), b"3").unwrap(); // added
+    let s2 = String::from_utf8(
+        sluice()
+            .arg("backup")
+            .arg(&repo)
+            .arg(&src)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    // The human diff lists each change and ends with a one/some/none summary.
+    sluice()
+        .arg("diff")
+        .arg(&repo)
+        .arg(&s1[..12])
+        .arg(&s2[..12])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 added, 1 removed, 1 modified"));
+}
+
+#[test]
 fn diff_emits_json() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

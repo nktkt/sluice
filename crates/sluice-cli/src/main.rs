@@ -1718,15 +1718,24 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr)?);
             } else {
+                let (mut added, mut removed, mut modified) = (0u64, 0u64, 0u64);
                 for change in &changes {
                     match change.change {
-                        DiffKind::Added => println!("+ {}", change.path),
-                        DiffKind::Removed => println!("- {}", change.path),
+                        DiffKind::Added => {
+                            added += 1;
+                            println!("+ {}", change.path);
+                        }
+                        DiffKind::Removed => {
+                            removed += 1;
+                            println!("- {}", change.path);
+                        }
                         DiffKind::Modified => {
+                            modified += 1;
                             println!("M {} ({})", change.path, change.detail.labels().join(", "))
                         }
                     }
                 }
+                println!("{added} added, {removed} removed, {modified} modified");
             }
         }
         Command::Dump {
