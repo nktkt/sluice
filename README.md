@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 261 tests across
+machine-readable JSON output, and stable exit codes. Backed by 263 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -64,6 +64,7 @@ sluice backup ./repo ~/documents --force         # re-read every file (catch mti
 sluice backup ./repo ~/old --time 1577836800     # date the snapshot (Unix epoch s, e.g. via `date +%s`)
 sluice backup ./repo /mnt/nfs/alice --host alice  # attribute the snapshot to another host
 pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a piped stream
+sluice backup ./repo ~/documents --skip-if-unchanged   # make no snapshot if nothing changed
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
 sluice backup ./repo ~/documents --json          # outcome (snapshot id + counts) as JSON
@@ -86,7 +87,9 @@ tool with original dates preserved, or reproducible snapshots; retention rules
 (`forget --keep-*`) bucket by this recorded time. `--host <NAME>` records an
 explicit hostname instead of the local one — for a central server backing up
 another machine's mounts — and pairs with the `snapshots --host` filter and
-`forget --group-by host`. Changed files are **streamed** through the
+`forget --group-by host`. `--skip-if-unchanged` makes no snapshot at all when the
+tree is identical to the previous one, so a frequent (e.g. hourly) cron backup
+doesn't pile up identical snapshots on idle data. Changed files are **streamed** through the
 chunker with a bounded buffer, and restored the same way — chunks written as they
 arrive — so a file larger than memory backs up and restores without being loaded
 whole. Within a file the chunks are compressed and encrypted **in parallel**
@@ -424,7 +427,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 261 tests
+cargo test     # 263 tests
 ```
 
 ## Caveats

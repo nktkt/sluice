@@ -122,6 +122,10 @@ enum Command {
         /// `snapshots --host` and grouped by `forget --group-by host`.
         #[arg(long, value_name = "NAME")]
         host: Option<String>,
+        /// Don't create a snapshot if nothing changed since the last one — avoids
+        /// piling up identical snapshots from frequent no-op (e.g. hourly) backups.
+        #[arg(long = "skip-if-unchanged")]
+        skip_if_unchanged: bool,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -633,6 +637,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             force,
             time,
             host,
+            skip_if_unchanged,
             dry_run,
             verbose,
             json,
@@ -725,6 +730,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     force,
                     cache_path: cache,
                     dry_run,
+                    skip_if_unchanged,
                 };
                 backup_sources_with_options(&mut repository, &sources, &tags, &options, progress)
                     .await?
@@ -738,7 +744,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "snapshot": outcome.snapshot.map(|id| id.to_string()),
-                        "dry_run": outcome.snapshot.is_none(),
+                        "dry_run": dry_run,
+                        "skipped": outcome.snapshot.is_none() && !dry_run,
                         "files_new": s.files_new,
                         "files_changed": s.files_changed,
                         "files_unmodified": s.files_unmodified,
@@ -759,7 +766,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                             s.bytes_processed
                         );
                     }
-                    None => {
+                    None if dry_run => {
                         println!(
                             "dry run: {} new, {} changed, {} unmodified, {} dirs, {} bytes (nothing written)",
                             s.files_new,
@@ -767,6 +774,12 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                             s.files_unmodified,
                             s.dirs,
                             s.bytes_processed
+                        );
+                    }
+                    None => {
+                        println!(
+                            "no changes since the last snapshot; skipped ({} files unchanged)",
+                            s.files_unmodified
                         );
                     }
                 }

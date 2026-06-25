@@ -152,6 +152,10 @@ pub struct BackupOptions {
     pub cache_path: Option<PathBuf>,
     /// Preview only — walk and count, but write nothing; the snapshot is `None`.
     pub dry_run: bool,
+    /// Don't create a snapshot if nothing changed since the parent (its tree is
+    /// identical). Avoids piling up identical snapshots from frequent no-op
+    /// backups; the outcome's snapshot is `None`.
+    pub skip_if_unchanged: bool,
 }
 
 /// Back up one or more `sources` into a single snapshot, skipping entries whose
@@ -425,6 +429,19 @@ async fn backup_sources_inner<B: StorageBackend>(
     }
 
     if dry_run {
+        return Ok(BackupOutcome {
+            snapshot: None,
+            summary,
+        });
+    }
+    // With --skip-if-unchanged, don't commit a duplicate snapshot when the tree is
+    // identical to the parent's (every file was reused, so no new blob was stored
+    // and the deduplicated tree id matches). The pending pack is empty here.
+    if options.skip_if_unchanged
+        && parent
+            .as_ref()
+            .is_some_and(|(_, snap)| snap.tree == root_tree)
+    {
         return Ok(BackupOutcome {
             snapshot: None,
             summary,
@@ -6411,6 +6428,51 @@ mod tests {
             b"bravo222",
             "--force captured the new content"
         );
+    }
+
+    /// `--skip-if-unchanged` suppresses a snapshot when the tree is identical to
+    /// the parent's, but still captures a real change and (without the flag) lets
+    /// an identical re-backup create a duplicate.
+    #[tokio::test]
+    async fn skip_if_unchanged_suppresses_duplicate_snapshots() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        let sources = [src.path().to_path_buf()];
+        let opts = BackupOptions {
+            skip_if_unchanged: true,
+            ..Default::default()
+        };
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        // First backup creates a snapshot.
+        let first = backup_sources_with_options(&mut repo, &sources, &[], &opts, None)
+            .await
+            .unwrap();
+        assert!(first.snapshot.is_some());
+
+        // An unchanged re-backup is skipped.
+        let second = backup_sources_with_options(&mut repo, &sources, &[], &opts, None)
+            .await
+            .unwrap();
+        assert!(second.snapshot.is_none(), "unchanged backup is skipped");
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+
+        // A real change is still captured.
+        std::fs::write(src.path().join("f"), b"data changed").unwrap();
+        let third = backup_sources_with_options(&mut repo, &sources, &[], &opts, None)
+            .await
+            .unwrap();
+        assert!(third.snapshot.is_some(), "a change is captured");
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 2);
+
+        // Without the flag, an unchanged re-backup still creates a duplicate.
+        let dup = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap();
+        assert!(dup.snapshot.is_some());
+        assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
     }
 
     /// A snapshot-time override stamps the committed snapshot with the given time

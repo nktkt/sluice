@@ -1363,6 +1363,69 @@ fn key_add_remove_passwd_emit_json() {
 }
 
 #[test]
+fn backup_skip_if_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f"), b"v1").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .arg("--skip-if-unchanged")
+        .assert()
+        .success();
+
+    // A second, unchanged backup is skipped (no new snapshot), reported as JSON.
+    let o = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--skip-if-unchanged", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert!(v["snapshot"].is_null());
+    assert_eq!(v["skipped"], true);
+    assert_eq!(v["dry_run"], false);
+
+    // Still only one snapshot.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 1);
+
+    // A real change is captured.
+    std::fs::write(src.join("f"), b"v2 is different").unwrap();
+    let o = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--skip-if-unchanged", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert!(v["snapshot"].as_str().is_some());
+    assert_eq!(v["skipped"], false);
+
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v.as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn backup_force_rereads_unchanged_files() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
