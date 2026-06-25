@@ -319,14 +319,16 @@ enum Command {
         #[command(subcommand)]
         object: CatObject,
     },
-    /// Mount a snapshot as a read-only filesystem (needs the `fuse` build feature).
+    /// Mount snapshots as a read-only filesystem (needs the `fuse` build feature).
     Mount {
         /// Repository path or object-store URL.
         repo: String,
-        /// Snapshot id (a unique hex prefix is accepted).
-        snapshot: String,
-        /// An existing empty directory to mount the snapshot at.
+        /// An existing empty directory to mount at.
         mountpoint: PathBuf,
+        /// Mount only this snapshot at the root (a unique hex prefix); omit to
+        /// mount every snapshot, each under a directory named by its short id.
+        #[arg(long)]
+        snapshot: Option<String>,
     },
     /// Print a shell completion script to stdout (bash, zsh, fish, ...).
     Completions {
@@ -1326,15 +1328,23 @@ async fn run() -> Result<i32, Box<dyn Error>> {
         }
         Command::Mount {
             repo,
-            snapshot,
             mountpoint,
+            snapshot,
         } => {
             #[cfg(feature = "fuse")]
             {
                 let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-                let snap_id = resolve_snapshot(&repository, &snapshot).await?;
+                let target = match &snapshot {
+                    Some(s) => {
+                        mount::MountTarget::Snapshot(resolve_snapshot(&repository, s).await?)
+                    }
+                    None => mount::MountTarget::All,
+                };
                 eprintln!(
-                    "mounting snapshot at {} — unmount with `fusermount -u {}` or Ctrl-C",
+                    "mounting {} at {} — unmount with `fusermount -u {}` or Ctrl-C",
+                    snapshot
+                        .as_deref()
+                        .map_or_else(|| "all snapshots".to_string(), |s| format!("snapshot {s}")),
                     mountpoint.display(),
                     mountpoint.display()
                 );
@@ -1342,7 +1352,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 // a thread with no ambient Tokio runtime; wait for unmount off the
                 // async worker via spawn_blocking.
                 let session =
-                    std::thread::spawn(move || mount::run_mount(repository, snap_id, &mountpoint));
+                    std::thread::spawn(move || mount::run_mount(repository, target, &mountpoint));
                 tokio::task::spawn_blocking(move || session.join())
                     .await
                     .map_err(|e| format!("mount supervisor failed: {e}"))?

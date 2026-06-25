@@ -171,17 +171,21 @@ sluice unlock        ./repo   # clear advisory locks left by an interrupted run
 sluice rebuild-index ./repo   # rescan packs to repair a damaged/stale index
 ```
 
-### Browse a snapshot (FUSE mount)
+### Browse snapshots (FUSE mount)
 
 Built with the optional `fuse` feature (`cargo build --features fuse`, which
-links libfuse), `sluice mount` exposes a snapshot as a **read-only** filesystem,
-so you can `ls`, `cat`, and copy individual files without a full restore. File
-contents are streamed and decrypted a chunk at a time as you read, so even a file
-larger than memory copies out without being loaded whole.
+links libfuse), `sluice mount` exposes the repository as a **read-only**
+filesystem, so you can `ls`, `cat`, and copy individual files without a full
+restore. By default every snapshot appears under its own `<short-id>/` directory,
+so you can compare versions of a file across snapshots side by side; `--snapshot`
+mounts just one at the root. File contents are streamed and decrypted a chunk at
+a time as you read, so even a file larger than memory copies out without being
+loaded whole.
 
 ```sh
-sluice mount ./repo <snapshot> /mnt/snap   # then browse /mnt/snap; unmount with:
-fusermount -u /mnt/snap                     # (or Ctrl-C in the mount terminal)
+sluice mount ./repo /mnt/repo                  # all snapshots, each under <short-id>/
+sluice mount ./repo /mnt/snap --snapshot <id>  # just one snapshot, at the root
+fusermount -u /mnt/repo                         # unmount (or Ctrl-C in the mount terminal)
 ```
 
 ### Replicate to another repository

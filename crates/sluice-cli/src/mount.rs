@@ -112,9 +112,38 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Walk the snapshot's trees, assigning a FUSE inode to every node and returning
-/// the resulting inode table (root at [`ROOT`]).
-fn build_inodes<B: StorageBackend>(
+/// What a mount exposes.
+pub enum MountTarget {
+    /// A single snapshot, at the filesystem root.
+    Snapshot(Id),
+    /// Every snapshot, each under a top-level directory named by its short id.
+    All,
+}
+
+/// A `FileAttr` for a synthesized read-only directory (the mount root or a
+/// per-snapshot directory) that has no stored `Node`.
+fn synthetic_dir_attr(ino: u64, time_ns: i64, uid: u32, gid: u32) -> FileAttr {
+    FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        atime: systime(time_ns),
+        mtime: systime(time_ns),
+        ctime: systime(time_ns),
+        crtime: UNIX_EPOCH,
+        kind: FileType::Directory,
+        perm: 0o555,
+        nlink: 2,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 512,
+        flags: 0,
+    }
+}
+
+/// Build the inode table for a single snapshot mounted at the root.
+fn build_inodes_single<B: StorageBackend>(
     rt: &Runtime,
     repo: &Repository<B>,
     snap_id: Id,
@@ -125,28 +154,49 @@ fn build_inodes<B: StorageBackend>(
     inodes.insert(
         ROOT,
         Inode {
-            attr: FileAttr {
-                ino: ROOT,
-                size: 0,
-                blocks: 0,
-                atime: systime(snap.time_ns),
-                mtime: systime(snap.time_ns),
-                ctime: systime(snap.time_ns),
-                crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
-                perm: 0o555,
-                nlink: 2,
-                uid: snap.uid,
-                gid: snap.gid,
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            },
+            attr: synthetic_dir_attr(ROOT, snap.time_ns, snap.uid, snap.gid),
             body: Body::Dir(Vec::new()),
         },
     );
     let mut next = ROOT + 1;
     add_dir(rt, repo, snap.tree, ROOT, &mut inodes, &mut next)?;
+    Ok(inodes)
+}
+
+/// Build the inode table for the whole repository: the root lists every snapshot
+/// as a directory named by its short id, each holding that snapshot's tree.
+fn build_inodes_all<B: StorageBackend>(
+    rt: &Runtime,
+    repo: &Repository<B>,
+) -> io::Result<HashMap<u64, Inode>> {
+    let snaps = rt.block_on(repo.list_snapshots()).map_err(to_io)?;
+    let mut inodes = HashMap::new();
+    inodes.insert(
+        ROOT,
+        Inode {
+            attr: synthetic_dir_attr(ROOT, 0, 0, 0),
+            body: Body::Dir(Vec::new()),
+        },
+    );
+    let mut next = ROOT + 1;
+    let mut children = Vec::with_capacity(snaps.len());
+    for id in &snaps {
+        let snap = rt.block_on(repo.load_snapshot(id)).map_err(to_io)?;
+        let dir_ino = next;
+        next += 1;
+        children.push((id.to_string()[..12].into(), dir_ino));
+        inodes.insert(
+            dir_ino,
+            Inode {
+                attr: synthetic_dir_attr(dir_ino, snap.time_ns, snap.uid, snap.gid),
+                body: Body::Dir(Vec::new()),
+            },
+        );
+        add_dir(rt, repo, snap.tree, dir_ino, &mut inodes, &mut next)?;
+    }
+    if let Some(root) = inodes.get_mut(&ROOT) {
+        root.body = Body::Dir(children);
+    }
     Ok(inodes)
 }
 
@@ -363,18 +413,21 @@ fn read_file_range<B: StorageBackend>(
     Ok(out)
 }
 
-/// Mount the snapshot `snap_id` of `repo` read-only at `mountpoint`, blocking
-/// until the filesystem is unmounted. Builds its own Tokio runtime, so it must
-/// be called from a thread with no ambient runtime.
+/// Mount `target` from `repo` read-only at `mountpoint`, blocking until the
+/// filesystem is unmounted. Builds its own Tokio runtime, so it must be called
+/// from a thread with no ambient runtime.
 pub fn run_mount<B: StorageBackend + Send + 'static>(
     repo: Repository<B>,
-    snap_id: Id,
+    target: MountTarget,
     mountpoint: &Path,
 ) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let inodes = build_inodes(&rt, &repo, snap_id)?;
+    let inodes = match target {
+        MountTarget::Snapshot(id) => build_inodes_single(&rt, &repo, id)?,
+        MountTarget::All => build_inodes_all(&rt, &repo)?,
+    };
     let fs = SnapshotFs {
         rt,
         repo,
@@ -427,7 +480,7 @@ mod tests {
             (repo, outcome.snapshot.unwrap())
         });
 
-        let inodes = build_inodes(&rt, &repo, snap).unwrap();
+        let inodes = build_inodes_single(&rt, &repo, snap).unwrap();
 
         // The root is a directory listing a.txt, d, and link.
         let root = inodes.get(&ROOT).unwrap();
@@ -542,5 +595,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tail, &data[data.len() - 10..]);
+    }
+
+    #[test]
+    fn whole_repo_mount_lists_each_snapshot() {
+        let rt = Runtime::new().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let (repo, s1, s2) = rt.block_on(async {
+            let kdf = sluice_crypto::KdfParams {
+                m_cost_kib: 16,
+                t_cost: 1,
+                p_cost: 1,
+            };
+            let mut repo = Repository::init(MemoryBackend::new(), b"pw", kdf)
+                .await
+                .unwrap();
+            let sources = [src.path().to_path_buf()];
+            std::fs::write(src.path().join("first.txt"), b"one").unwrap();
+            let s1 =
+                backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                    .await
+                    .unwrap()
+                    .snapshot
+                    .unwrap();
+            std::fs::write(src.path().join("second.txt"), b"two").unwrap();
+            let s2 =
+                backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                    .await
+                    .unwrap()
+                    .snapshot
+                    .unwrap();
+            (repo, s1, s2)
+        });
+
+        let inodes = build_inodes_all(&rt, &repo).unwrap();
+        let Body::Dir(top) = &inodes.get(&ROOT).unwrap().body else {
+            panic!("the repo root must be a directory");
+        };
+        assert_eq!(top.len(), 2, "one top-level directory per snapshot");
+
+        // Each snapshot directory is named by its short id and holds that
+        // snapshot's files — first.txt in both, second.txt only in the later one.
+        for (sid, has_second) in [(s1, false), (s2, true)] {
+            let short = sid.to_string()[..12].to_string();
+            let (_, dir_ino) = top
+                .iter()
+                .find(|(n, _)| n.to_str().unwrap() == short.as_str())
+                .unwrap_or_else(|| panic!("snapshot dir {short} is listed"));
+            let Body::Dir(kids) = &inodes.get(dir_ino).unwrap().body else {
+                panic!("snapshot entry must be a directory");
+            };
+            let names: Vec<&str> = kids.iter().map(|(n, _)| n.to_str().unwrap()).collect();
+            assert!(names.contains(&"first.txt"), "{short} has first.txt");
+            assert_eq!(
+                names.contains(&"second.txt"),
+                has_second,
+                "second.txt presence in {short}"
+            );
+        }
     }
 }
