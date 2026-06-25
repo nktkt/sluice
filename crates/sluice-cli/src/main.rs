@@ -1862,11 +1862,11 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             for id in &snapshots {
                 logical += repository.load_snapshot(id).await?.summary.bytes_processed;
             }
-            let saved = if logical > 0 && stored < logical {
-                (logical - stored) * 100 / logical
-            } else {
-                0
-            };
+            // Saving %: 0 when nothing is stored beyond the logical size, or the
+            // repository is empty (checked_div guards the divide-by-zero).
+            let saved = (logical.saturating_sub(stored) * 100)
+                .checked_div(logical)
+                .unwrap_or(0);
             if json {
                 println!(
                     "{}",

@@ -368,11 +368,9 @@ impl<B: StorageBackend> Repository<B> {
                     .filter(|e| !live.contains(&e.id))
                     .map(|e| u64::from(e.length))
                     .sum();
-                let dead_pct = if total_bytes == 0 {
-                    0
-                } else {
-                    dead_bytes * 100 / total_bytes
-                };
+                // `checked_div` yields the percentage, or `None` (→ 0) for an
+                // empty pack, sidestepping a manual divide-by-zero guard.
+                let dead_pct = (dead_bytes * 100).checked_div(total_bytes).unwrap_or(0);
                 // max_unused == 0 means "repack any partially-dead pack"; a
                 // positive threshold leaves packs at or below it alone.
                 if max_unused > 0 && dead_pct <= u64::from(max_unused) {
