@@ -22,7 +22,7 @@ use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
     check, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
-    forget_tagged, forget_with_policy, list_files, prune, prune_excluding,
+    forget_tagged, forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
     prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
     verify_with_progress,
 };
@@ -133,6 +133,11 @@ enum Command {
         /// Leave entries already present and matching in place (resume a restore).
         #[arg(long)]
         skip_existing: bool,
+        /// After restoring, delete entries under the target that the snapshot does
+        /// not contain, making it an exact mirror. Cannot be combined with
+        /// --path/--include/--exclude. Pair with --dry-run to preview deletions.
+        #[arg(long)]
+        delete: bool,
         /// After writing each file, re-read it and verify it matches the snapshot.
         #[arg(long)]
         verify: bool,
@@ -662,9 +667,19 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             exclude,
             dry_run,
             skip_existing,
+            delete,
             verify,
             verbose,
         } => {
+            // Mirror deletion considers the whole snapshot, so a partial restore
+            // would delete everything outside the selected subset; refuse it.
+            if delete && (!paths.is_empty() || !include.is_empty() || !exclude.is_empty()) {
+                return Err(
+                    "--delete cannot be combined with --path/--include/--exclude; it mirrors \
+                     the entire snapshot"
+                        .into(),
+                );
+            }
             let filter = RestoreFilter::new(&include, &exclude)?;
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
             let id = resolve_snapshot(&repository, &snapshot).await?;
@@ -695,6 +710,16 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     "would restore {count} files ({bytes} bytes) into {} (nothing written)",
                     target.display()
                 );
+                if delete {
+                    let extras = mirror_delete(&repository, &id, &target, true).await?;
+                    println!("would delete {} extra entr(ies):", extras.len());
+                    for p in extras.iter().take(20) {
+                        println!("  {}", p.display());
+                    }
+                    if extras.len() > 20 {
+                        println!("  ... and {} more", extras.len() - 20);
+                    }
+                }
             } else {
                 let options = RestoreOptions {
                     skip_existing,
@@ -756,6 +781,17 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 }
                 if let Some(pb) = &spinner {
                     pb.finish_and_clear();
+                }
+                // Mirror mode: after writing the snapshot, remove anything under
+                // the target the snapshot does not contain.
+                if delete {
+                    let removed = mirror_delete(&repository, &id, &target, false).await?;
+                    if verbose {
+                        for p in &removed {
+                            eprintln!("- {}", p.display());
+                        }
+                    }
+                    println!("deleted {} extra entr(ies)", removed.len());
                 }
                 println!("restored {id} into {}", target.display());
                 if report.warnings > 0 {

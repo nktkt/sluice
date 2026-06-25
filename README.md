@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 224 tests across
+machine-readable JSON output, and stable exit codes. Backed by 226 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -106,6 +106,7 @@ sluice restore   ./repo <snapshot> ./out --include '**/*.pdf'        # only matc
 sluice restore   ./repo <snapshot> ./out --exclude '**/*.tmp' --exclude cache   # skip matching paths
 sluice restore   ./repo <snapshot> ./out --dry-run                   # preview file/byte counts
 sluice restore   ./repo <snapshot> ./out --skip-existing             # resume: keep matching entries
+sluice restore   ./repo <snapshot> ./out --delete                    # mirror: also remove extras in ./out
 sluice restore   ./repo <snapshot> ./out --verify                    # re-read each file and check it
 sluice restore   ./repo <snapshot> ./out -v                          # print each file as it's restored
 ```
@@ -116,7 +117,14 @@ directories): with any `--include`, only matching files are written; `--exclude`
 prunes a matching entry, and a matching directory along with its whole subtree.
 `--skip-existing` makes a restore idempotent and resumable: an entry already
 present and matching (for files, same size and mtime) is left untouched, so
-re-running after an interruption only fills the gaps. `--verify` re-reads each
+re-running after an interruption only fills the gaps. `--delete` turns a restore
+into an exact mirror: after writing the snapshot, anything under the target the
+snapshot does not contain is removed (an extra directory with its whole subtree),
+so the target ends up matching the snapshot byte-for-byte and entry-for-entry —
+useful for disaster recovery to a known-good state. It refuses to combine with
+`--path`/`--include`/`--exclude` (which would scope the mirror to a subset and
+delete everything else), never follows a symlink out of the target, and pairs
+with `--dry-run` to preview the deletions first. `--verify` re-reads each
 file after writing and fails if its contents do not match the snapshot. Like
 backup, restore shows a live spinner on a terminal (hidden when piped), while
 `-v` prints each restored file.
@@ -362,7 +370,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 224 tests
+cargo test     # 226 tests
 ```
 
 ## Caveats

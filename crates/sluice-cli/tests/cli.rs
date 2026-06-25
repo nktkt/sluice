@@ -832,6 +832,79 @@ fn backup_reads_sources_from_files_from() {
 }
 
 #[test]
+fn restore_delete_mirrors_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    let out = dir.path().join("out");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(src.join("sub/b.txt"), b"bravo").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .assert()
+        .success();
+    let snap = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Restore, then litter the target with extras the snapshot does not contain.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .assert()
+        .success();
+    std::fs::write(out.join("stray.txt"), b"junk").unwrap();
+    std::fs::create_dir(out.join("staledir")).unwrap();
+    std::fs::write(out.join("staledir/x"), b"junk").unwrap();
+
+    // --delete cannot be combined with a path/glob filter.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .args(["--delete", "--include", "**/*.txt"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--delete cannot be combined"));
+
+    // A dry run previews deletions without removing anything.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .args(["--delete", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would delete 2 extra"));
+    assert!(out.join("stray.txt").exists(), "dry run kept the extra");
+
+    // The real mirror removes exactly the extras and keeps the snapshot content.
+    sluice()
+        .arg("restore")
+        .arg(&repo)
+        .arg(&snap[..12])
+        .arg(&out)
+        .arg("--delete")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("deleted 2 extra"));
+    assert!(!out.join("stray.txt").exists());
+    assert!(!out.join("staledir").exists());
+    assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(out.join("sub/b.txt")).unwrap(), b"bravo");
+}
+
+#[test]
 fn backup_exclude_from_file() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");

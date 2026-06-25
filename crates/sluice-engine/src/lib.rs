@@ -941,6 +941,93 @@ pub async fn restore_filtered<B: StorageBackend>(
     Ok(reporter.into_inner().expect("restore reporter poisoned"))
 }
 
+/// Make `target` an exact mirror of `snapshot` by removing every entry under it
+/// that the snapshot does not contain — the second half of `restore --delete`,
+/// run after the restore writes the snapshot's entries. Returns the removed paths
+/// (sorted); with `dry_run`, that list is computed but nothing is removed. An
+/// extra directory is removed with its whole subtree. Comparison is by raw bytes,
+/// so non-UTF-8 names mirror correctly; symlinks are never traversed (an extra
+/// link is unlinked, not followed), so the deletion can never escape `target`,
+/// and `target` itself is never removed.
+pub async fn mirror_delete<B: StorageBackend>(
+    repo: &Repository<B>,
+    snapshot: &Id,
+    target: &Path,
+    dry_run: bool,
+) -> Result<Vec<PathBuf>> {
+    let snap = repo.load_snapshot(snapshot).await?;
+    let mut keep: HashSet<PathBuf> = HashSet::new();
+    collect_paths(repo, snap.tree, PathBuf::new(), &mut keep).await?;
+    let mut removed = Vec::new();
+    mirror_walk(target, target, &keep, dry_run, &mut removed)?;
+    removed.sort();
+    Ok(removed)
+}
+
+/// Collect every entry's path (relative to the restore root, raw bytes preserved)
+/// from tree `tree_id` into `keep`, recursing into directories. Directory paths
+/// are included too, so a kept directory is not mistaken for an extra.
+fn collect_paths<'a, B: StorageBackend>(
+    repo: &'a Repository<B>,
+    tree_id: Id,
+    prefix: PathBuf,
+    keep: &'a mut HashSet<PathBuf>,
+) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+    Box::pin(async move {
+        let tree = repo.load_tree(&tree_id).await?;
+        for node in &tree.nodes {
+            let mut path = prefix.clone();
+            path.push(osstring_from_bytes(&node.name));
+            if let (EntryKind::Dir, Some(subtree)) = (node.kind, node.subtree) {
+                collect_paths(repo, subtree, path.clone(), keep).await?;
+            }
+            keep.insert(path);
+        }
+        Ok(())
+    })
+}
+
+/// Recursively remove entries under `dir` whose path relative to `root` is absent
+/// from `keep`. A kept directory is descended into; an extra directory is removed
+/// whole and not descended. Every removed path is appended to `removed`.
+fn mirror_walk(
+    root: &Path,
+    dir: &Path,
+    keep: &HashSet<PathBuf>,
+    dry_run: bool,
+    removed: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // A missing or unreadable directory has nothing to mirror.
+        Err(_) => return Ok(()),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root).unwrap_or(path.as_path());
+        // file_type does not follow symlinks, so a symlink (even to a directory)
+        // reports false here and is unlinked rather than traversed.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if keep.contains(rel) {
+            if is_dir {
+                mirror_walk(root, &path, keep, dry_run, removed)?;
+            }
+        } else {
+            if !dry_run {
+                let r = if is_dir {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+                r.map_err(|e| io_err(&path, e))?;
+            }
+            removed.push(path);
+        }
+    }
+    Ok(())
+}
+
 /// Whether anything exists at `path` (a final symlink counts, not its target).
 fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
@@ -5470,6 +5557,66 @@ mod tests {
             stats.raw_bytes,
             stats.restore_bytes
         );
+    }
+
+    /// `mirror_delete` removes exactly the entries the snapshot lacks — including
+    /// an extra file inside a kept directory and an entire extra directory (listed
+    /// once, not descended) — while leaving the snapshot's own entries intact; a
+    /// dry run reports the same set but touches nothing.
+    #[tokio::test]
+    async fn mirror_delete_removes_only_extras() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(src.path().join("sub/inner.txt"), b"inner").unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+
+        // Restore, then litter the target with three extras: a file at the root,
+        // a file inside a kept directory, and a whole new directory.
+        let dst = tempfile::tempdir().unwrap();
+        restore(&repo, &snap, dst.path()).await.unwrap();
+        std::fs::write(dst.path().join("extra.txt"), b"x").unwrap();
+        std::fs::write(dst.path().join("sub/extra_inner.txt"), b"x").unwrap();
+        std::fs::create_dir(dst.path().join("newdir")).unwrap();
+        std::fs::write(dst.path().join("newdir/x.txt"), b"x").unwrap();
+
+        // A dry run lists the three extras (the extra directory once, not its
+        // child) and removes nothing.
+        let preview = mirror_delete(&repo, &snap, dst.path(), true).await.unwrap();
+        assert_eq!(preview.len(), 3, "extra.txt, newdir, sub/extra_inner.txt");
+        assert!(preview.contains(&dst.path().join("newdir")));
+        assert!(!preview.contains(&dst.path().join("newdir/x.txt")));
+        assert!(dst.path().join("extra.txt").exists(), "dry run kept it");
+        assert!(dst.path().join("newdir/x.txt").exists());
+
+        // The real run removes exactly the extras and keeps the snapshot's entries.
+        let removed = mirror_delete(&repo, &snap, dst.path(), false)
+            .await
+            .unwrap();
+        assert_eq!(removed.len(), 3);
+        assert!(!dst.path().join("extra.txt").exists());
+        assert!(!dst.path().join("newdir").exists());
+        assert!(!dst.path().join("sub/extra_inner.txt").exists());
+        assert_eq!(std::fs::read(dst.path().join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read(dst.path().join("sub/inner.txt")).unwrap(),
+            b"inner"
+        );
+
+        // Idempotent: a second mirror finds nothing to remove.
+        let again = mirror_delete(&repo, &snap, dst.path(), false)
+            .await
+            .unwrap();
+        assert!(again.is_empty());
     }
 
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)
