@@ -116,6 +116,11 @@ enum Command {
         /// when importing history. Retention rules bucket by this time.
         #[arg(long, value_name = "EPOCH_SECONDS")]
         time: Option<i64>,
+        /// Record this hostname on the snapshot instead of the local host — e.g.
+        /// when a central server backs up another machine's data. Matched by
+        /// `snapshots --host` and grouped by `forget --group-by host`.
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
         /// Report what would be backed up without writing anything.
         #[arg(long)]
         dry_run: bool,
@@ -581,6 +586,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             compression,
             force,
             time,
+            host,
             dry_run,
             verbose,
             json,
@@ -622,6 +628,8 @@ async fn run() -> Result<i32, Box<dyn Error>> {
             repository.set_data_compression(compression);
             // Optionally stamp the snapshot with an explicit time (epoch seconds).
             repository.set_snapshot_time(time.map(|s| s * 1_000_000_000));
+            // Optionally record an explicit hostname on the snapshot.
+            repository.set_snapshot_host(host);
             // With --verbose, print each new/changed file as it is processed.
             let report = |path: &std::path::Path, status: FileStatus| match status {
                 FileStatus::New => eprintln!("+ {}", path.display()),

@@ -440,7 +440,10 @@ async fn backup_sources_inner<B: StorageBackend>(
             .iter()
             .map(|p| p.as_os_str().as_encoded_bytes().to_vec())
             .collect(),
-        hostname: env_or("HOSTNAME", "localhost"),
+        hostname: repo
+            .snapshot_host()
+            .map(str::to_owned)
+            .unwrap_or_else(|| env_or("HOSTNAME", "localhost")),
         username: env_or("USER", "unknown"),
         uid: snapshot_uid,
         gid: snapshot_gid,
@@ -537,7 +540,10 @@ async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
         time_ns: repo.snapshot_time().unwrap_or(now),
         tree: root_tree,
         paths: vec![name.to_vec()],
-        hostname: env_or("HOSTNAME", "localhost"),
+        hostname: repo
+            .snapshot_host()
+            .map(str::to_owned)
+            .unwrap_or_else(|| env_or("HOSTNAME", "localhost")),
         username: env_or("USER", "unknown"),
         uid,
         gid,
@@ -5898,6 +5904,43 @@ mod tests {
                 .snapshot
                 .unwrap();
         assert!(repo.load_snapshot(&snap2).await.unwrap().time_ns > when);
+    }
+
+    /// A snapshot-host override stamps the committed snapshot with the given
+    /// hostname instead of the host environment; clearing it returns to default.
+    #[tokio::test]
+    async fn snapshot_host_override_is_recorded() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"x").unwrap();
+        let sources = [src.path().to_path_buf()];
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        repo.set_snapshot_host(Some("fileserver01".into()));
+        let snap = backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+            .await
+            .unwrap()
+            .snapshot
+            .unwrap();
+        assert_eq!(
+            repo.load_snapshot(&snap).await.unwrap().hostname,
+            "fileserver01"
+        );
+
+        std::fs::write(src.path().join("g"), b"y").unwrap();
+        repo.set_snapshot_host(None);
+        let snap2 =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap();
+        assert_ne!(
+            repo.load_snapshot(&snap2).await.unwrap().hostname,
+            "fileserver01",
+            "clearing the override returns to the host default"
+        );
     }
 
     /// A file larger than one parallel-seal batch (each ~8 MiB of plaintext)

@@ -132,6 +132,9 @@ pub struct Repository<B> {
     /// nanoseconds since the Unix epoch; `None` ⇒ the current time. Set by
     /// [`set_snapshot_time`](Self::set_snapshot_time).
     snapshot_time_override: Option<i64>,
+    /// Per-run override for the hostname recorded on a committed snapshot; `None`
+    /// ⇒ the host environment. Set by [`set_snapshot_host`](Self::set_snapshot_host).
+    snapshot_host_override: Option<String>,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -198,6 +201,7 @@ impl<B: StorageBackend> Repository<B> {
             pending_index: HashMap::new(),
             compression_override: None,
             snapshot_time_override: None,
+            snapshot_host_override: None,
         })
     }
 
@@ -254,6 +258,7 @@ impl<B: StorageBackend> Repository<B> {
             pending_index: HashMap::new(),
             compression_override: None,
             snapshot_time_override: None,
+            snapshot_host_override: None,
         })
     }
 
@@ -715,6 +720,21 @@ impl<B: StorageBackend> Repository<B> {
     #[must_use]
     pub fn snapshot_time(&self) -> Option<i64> {
         self.snapshot_time_override
+    }
+
+    /// Override the hostname recorded on the next committed snapshot, or `None` to
+    /// use the host environment. Lets a snapshot be attributed to the machine the
+    /// data belongs to — e.g. a central server backing up several hosts' mounts.
+    pub fn set_snapshot_host(&mut self, host: Option<String>) {
+        self.snapshot_host_override = host;
+    }
+
+    /// The overriding snapshot hostname set by [`set_snapshot_host`], if any.
+    ///
+    /// [`set_snapshot_host`]: Self::set_snapshot_host
+    #[must_use]
+    pub fn snapshot_host(&self) -> Option<&str> {
+        self.snapshot_host_override.as_deref()
     }
 
     /// Id of the key object whose passphrase unlocked this handle. This is the

@@ -1219,6 +1219,60 @@ fn backup_time_override_dates_the_snapshot() {
 }
 
 #[test]
+fn backup_host_override_attributes_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"hi").unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--host", "fileserver01"])
+        .assert()
+        .success();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&src)
+        .args(["--host", "laptop", "--force"])
+        .assert()
+        .success();
+
+    // --json reports the recorded hostname.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let hosts: Vec<&str> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["hostname"].as_str().unwrap())
+        .collect();
+    assert!(hosts.contains(&"fileserver01"));
+    assert!(hosts.contains(&"laptop"));
+
+    // --host filters the listing to a single host.
+    let o = sluice()
+        .arg("snapshots")
+        .arg(&repo)
+        .args(["--host", "fileserver01", "--json"])
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["hostname"], "fileserver01");
+}
+
+#[test]
 fn backup_compression_override() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
