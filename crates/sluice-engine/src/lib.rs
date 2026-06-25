@@ -6037,7 +6037,11 @@ mod tests {
     /// Linux filenames are arbitrary byte sequences (anything but `/` and NUL),
     /// not necessarily valid UTF-8. The tool stores names as raw `OsStr` bytes, so
     /// such names — and a non-UTF-8 directory — must round-trip byte-for-byte.
-    #[cfg(unix)]
+    ///
+    /// Gated off Apple targets: APFS rejects filenames that aren't valid UTF-8,
+    /// so the test's setup can't even create them there. The capability under
+    /// test is the tool's, not the OS's, so any non-Apple unix exercises it.
+    #[cfg(all(unix, not(target_vendor = "apple")))]
     #[tokio::test]
     async fn non_utf8_filenames_round_trip() {
         use std::os::unix::ffi::OsStrExt;
