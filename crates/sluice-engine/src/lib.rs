@@ -1309,8 +1309,22 @@ pub struct CheckReport {
 /// cheaper than [`verify`], which authenticates all data; use it for routine
 /// integrity checks. Missing blobs are collected in [`CheckReport::missing`].
 pub async fn check<B: StorageBackend>(repo: &Repository<B>) -> Result<CheckReport> {
+    check_only(repo, None).await
+}
+
+/// Like [`check`], but limited to a single snapshot when `only` is `Some` — a
+/// cheap structural check of one important backup without walking the whole
+/// repository. `None` checks every snapshot.
+pub async fn check_only<B: StorageBackend>(
+    repo: &Repository<B>,
+    only: Option<Id>,
+) -> Result<CheckReport> {
     let mut report = CheckReport::default();
-    for snapshot in repo.list_snapshots().await? {
+    let snapshots = match only {
+        Some(id) => vec![id],
+        None => repo.list_snapshots().await?,
+    };
+    for snapshot in snapshots {
         let snap = repo.load_snapshot(&snapshot).await?;
         report.snapshots += 1;
         check_tree(repo, snap.tree, &mut report).await?;
@@ -3413,6 +3427,49 @@ mod tests {
         assert_eq!(one.snapshots, 1);
         assert_eq!(one.total_blobs, 1);
         assert_eq!(one.blobs, 1);
+    }
+
+    /// Targeting a snapshot structurally checks only that snapshot's trees and
+    /// referenced blobs, not the whole repository's.
+    #[tokio::test]
+    async fn check_targets_a_single_snapshot() {
+        let s1 = tempfile::tempdir().unwrap();
+        std::fs::write(s1.path().join("a"), vec![1u8; 5000]).unwrap();
+        let s2 = tempfile::tempdir().unwrap();
+        std::fs::write(s2.path().join("b"), vec![2u8; 5000]).unwrap();
+
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+        let snap1 = backup_sources_with_options(
+            &mut repo,
+            &[s1.path().to_path_buf()],
+            &[],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap();
+        backup_sources_with_options(
+            &mut repo,
+            &[s2.path().to_path_buf()],
+            &[],
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let whole = check(&repo).await.unwrap();
+        assert_eq!(whole.snapshots, 2);
+        assert_eq!(whole.blobs, 2);
+
+        let one = check_only(&repo, Some(snap1)).await.unwrap();
+        assert_eq!(one.snapshots, 1);
+        assert_eq!(one.blobs, 1);
+        assert!(one.missing.is_empty());
     }
 
     #[tokio::test]

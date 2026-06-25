@@ -21,7 +21,7 @@ use sluice_crypto::KdfParams;
 use sluice_engine::{
     BackupOptions, DiffKind, EngineError, FileStatus, GroupBy, RestoreFilter, RestoreOptions,
     RestoreReport, RetentionPolicy, VerifyOptions, backup_sources_with_options, backup_stdin,
-    check, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
+    check_only, copy_all_with_progress, copy_snapshot_with_progress, diff, dump, find, forget,
     forget_tagged, forget_with_policy, list_files, mirror_delete, prune, prune_excluding,
     prune_excluding_with_progress, rebuild_index, restore_filtered, retag, snapshot_stats,
     verify_with_progress,
@@ -247,6 +247,9 @@ enum Command {
     Check {
         /// Repository path or object-store URL.
         repo: String,
+        /// Check only this snapshot (a unique hex prefix); omit to check every
+        /// snapshot in the repository.
+        snapshot: Option<String>,
         /// Emit the result (counts and any missing blobs) as machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -1244,9 +1247,18 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 );
             }
         }
-        Command::Check { repo, json } => {
+        Command::Check {
+            repo,
+            snapshot,
+            json,
+        } => {
             let repository = Repository::open(backend(&repo, false).await?, pw).await?;
-            let report = check(&repository).await?;
+            // Resolve an optional snapshot prefix to check just that one.
+            let only = match &snapshot {
+                Some(s) => Some(resolve_snapshot(&repository, s).await?),
+                None => None,
+            };
+            let report = check_only(&repository, only).await?;
             if json {
                 let missing: Vec<String> = report.missing.iter().map(|id| id.to_string()).collect();
                 println!(

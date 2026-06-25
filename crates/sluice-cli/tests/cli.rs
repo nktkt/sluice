@@ -1219,6 +1219,58 @@ fn backup_time_override_dates_the_snapshot() {
 }
 
 #[test]
+fn check_targets_one_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    let s1 = dir.path().join("s1");
+    let s2 = dir.path().join("s2");
+    std::fs::create_dir_all(&s1).unwrap();
+    std::fs::create_dir_all(&s2).unwrap();
+    std::fs::write(s1.join("a.bin"), vec![1u8; 5000]).unwrap();
+    std::fs::write(s2.join("b.bin"), vec![2u8; 5000]).unwrap();
+
+    sluice().arg("init").arg(&repo).assert().success();
+    let assert = sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&s1)
+        .assert()
+        .success();
+    let snap1 = String::from_utf8(assert.get_output().stdout.clone())
+        .unwrap()
+        .trim()
+        .to_string();
+    sluice()
+        .arg("backup")
+        .arg(&repo)
+        .arg(&s2)
+        .assert()
+        .success();
+
+    // Whole-repo check sees both snapshots.
+    let o = sluice()
+        .arg("check")
+        .arg(&repo)
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["snapshots"], 2);
+
+    // Targeting snap1 checks only it.
+    let o = sluice()
+        .arg("check")
+        .arg(&repo)
+        .arg(&snap1[..12])
+        .arg("--json")
+        .assert()
+        .success();
+    let v: serde_json::Value = serde_json::from_slice(&o.get_output().stdout).expect("valid JSON");
+    assert_eq!(v["snapshots"], 1);
+    assert_eq!(v["ok"], true);
+}
+
+#[test]
 fn verify_targets_one_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
