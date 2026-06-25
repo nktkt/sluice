@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::error::Error;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use std::sync::Arc;
 mod mount;
 
 use clap::{CommandFactory, Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use sluice_core::{EntryKind, Id};
 use sluice_crypto::KdfParams;
 use sluice_engine::{
@@ -526,8 +528,36 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 FileStatus::Changed => eprintln!("M {}", path.display()),
                 FileStatus::Unmodified => {}
             };
-            let progress: Option<sluice_engine::ProgressFn> =
-                if verbose { Some(&report) } else { None };
+            // Otherwise, on an interactive terminal, show a live spinner with the
+            // running file count and current path. It hides itself when stderr is
+            // not a TTY (a pipe or cron job), so scripts stay quiet.
+            let spinner = (!verbose
+                && !json
+                && !dry_run
+                && !stdin
+                && std::io::stderr().is_terminal())
+            .then(|| {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::with_template("{spinner:.green} {pos} files  {wide_msg}")
+                        .unwrap(),
+                );
+                pb.enable_steady_tick(std::time::Duration::from_millis(120));
+                pb
+            });
+            let tick = |path: &std::path::Path, _status: FileStatus| {
+                if let Some(pb) = &spinner {
+                    pb.inc(1);
+                    pb.set_message(path.display().to_string());
+                }
+            };
+            let progress: Option<sluice_engine::ProgressFn> = if verbose {
+                Some(&report)
+            } else if spinner.is_some() {
+                Some(&tick)
+            } else {
+                None
+            };
             let outcome = if stdin {
                 let reader = std::io::stdin().lock();
                 backup_stdin(&mut repository, reader, stdin_filename.as_bytes(), &tags).await?
@@ -544,6 +574,9 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                 backup_sources_with_options(&mut repository, &sources, &tags, &options, progress)
                     .await?
             };
+            if let Some(pb) = &spinner {
+                pb.finish_and_clear();
+            }
             let s = outcome.summary;
             if json {
                 println!(

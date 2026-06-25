@@ -67,7 +67,10 @@ chunker with a bounded buffer, and restored the same way — chunks written as t
 arrive — so a file larger than memory backs up and restores without being loaded
 whole. A **sparse** file's holes are skipped on read (via `SEEK_DATA`/`SEEK_HOLE`)
 instead of being read back as zeros, so a mostly-empty disk image is barely
-touched. `--exclude` (glob, by entry name) and `--tag`
+touched. On an interactive terminal, backup shows a live spinner with the running
+file count and current path; it hides itself when stderr is not a TTY (piped or
+run from cron), so scripts stay quiet, while `-v` instead prints every new (+) and
+changed (M) file. `--exclude` (glob, by entry name) and `--tag`
 are repeatable, and `--exclude-from` reads exclude globs from a file (one per
 line; `#` comments and blank lines ignored). `--exclude-if-present <FILE>` skips
 any subdirectory containing the named marker (e.g. `.nobackup`), and
