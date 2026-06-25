@@ -290,6 +290,8 @@ async fn backup_sources_inner<B: StorageBackend>(
     let use_parent_trees = cache.is_none();
     let parent = latest_snapshot(repo).await?;
     let mut summary = SnapshotStats::default();
+    // Track how much this backup actually writes (deduplicated blobs add nothing).
+    let bytes_stored_before = repo.bytes_stored();
 
     let root_tree = if let [source] = sources {
         if source.is_file() {
@@ -448,6 +450,7 @@ async fn backup_sources_inner<B: StorageBackend>(
         });
     }
     repo.flush().await?;
+    summary.bytes_added = repo.bytes_stored().saturating_sub(bytes_stored_before);
     let (snapshot_uid, snapshot_gid) = process_owner();
     let snapshot = Snapshot {
         version: SNAPSHOT_VERSION,
@@ -520,6 +523,7 @@ async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
     tags: &[String],
 ) -> Result<BackupOutcome> {
     let parent = latest_snapshot(repo).await?;
+    let bytes_stored_before = repo.bytes_stored();
     let (content, size) = repo.save_file_reader(reader).await?;
     let now = now_ns();
     let (uid, gid) = process_owner();
@@ -550,6 +554,7 @@ async fn backup_stdin_inner<B: StorageBackend, R: std::io::Read>(
     let summary = SnapshotStats {
         files_new: 1,
         bytes_processed: size,
+        bytes_added: repo.bytes_stored().saturating_sub(bytes_stored_before),
         ..Default::default()
     };
     let snapshot = Snapshot {
@@ -6533,6 +6538,53 @@ mod tests {
             .unwrap();
         assert!(dup.snapshot.is_some());
         assert_eq!(repo.list_snapshots().await.unwrap().len(), 3);
+    }
+
+    /// A backup's `bytes_added` counts only blobs newly written: compressible data
+    /// stores less than its logical size, a deduplicated re-backup stores nothing,
+    /// and fresh content stores again.
+    #[tokio::test]
+    async fn bytes_added_counts_only_newly_stored_data() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), vec![1u8; 30_000]).unwrap(); // compressible
+        let sources = [src.path().to_path_buf()];
+        let mut repo = Repository::init(MemoryBackend::new(), b"pw", fast())
+            .await
+            .unwrap();
+
+        let first =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap();
+        assert!(first.summary.bytes_added > 0);
+        assert!(
+            first.summary.bytes_added < 30_000,
+            "compressible data stores less than its logical size"
+        );
+
+        // Re-backup with --force: every blob deduplicates, so nothing is written.
+        let forced = BackupOptions {
+            force: true,
+            ..Default::default()
+        };
+        let second = backup_sources_with_options(&mut repo, &sources, &[], &forced, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.summary.bytes_added, 0,
+            "a deduplicated re-backup adds no storage"
+        );
+
+        // A new, distinct file stores again.
+        std::fs::write(src.path().join("g"), vec![2u8; 20_000]).unwrap();
+        let third =
+            backup_sources_with_options(&mut repo, &sources, &[], &Default::default(), None)
+                .await
+                .unwrap();
+        assert!(
+            third.summary.bytes_added > 0,
+            "new content adds storage again"
+        );
     }
 
     /// `--skip-newer` keeps a target file that is newer than the snapshot's version

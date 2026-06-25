@@ -768,6 +768,7 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                         "files_unmodified": s.files_unmodified,
                         "dirs": s.dirs,
                         "bytes": s.bytes_processed,
+                        "bytes_added": s.bytes_added,
                     }))?
                 );
             } else {
@@ -775,12 +776,13 @@ async fn run() -> Result<i32, Box<dyn Error>> {
                     Some(id) => {
                         println!("{id}");
                         eprintln!(
-                            "  {} new, {} changed, {} unmodified, {} dirs, {} bytes",
+                            "  {} new, {} changed, {} unmodified, {} dirs, {} bytes ({} stored)",
                             s.files_new,
                             s.files_changed,
                             s.files_unmodified,
                             s.dirs,
-                            s.bytes_processed
+                            s.bytes_processed,
+                            format_bytes(s.bytes_added),
                         );
                     }
                     None if dry_run => {

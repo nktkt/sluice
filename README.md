@@ -13,7 +13,7 @@ checking, restic-style retention with space-reclaiming prune, tag editing and
 cross-snapshot search, cross-repository copy (re-encrypting under the target's
 keys), advisory locking for safe concurrent use, multiple passphrases, a
 persisted index for fast repository open, concurrent verify and restore,
-machine-readable JSON output, and stable exit codes. Backed by 271 tests across
+machine-readable JSON output, and stable exit codes. Backed by 272 tests across
 the workspace. The full architecture is in [`DESIGN.md`](./DESIGN.md). **The
 on-disk format is not yet frozen; do not use it for data you cannot afford to
 lose.**
@@ -67,7 +67,7 @@ pg_dump db | sluice backup ./repo --stdin --stdin-filename db.sql   # back up a 
 sluice backup ./repo ~/documents --skip-if-unchanged   # make no snapshot if nothing changed
 sluice backup ./repo ~/documents --dry-run       # preview, writing nothing
 sluice backup ./repo ~/documents -v              # print each new (+) / changed (M) file
-sluice backup ./repo ~/documents --json          # outcome (snapshot id + counts) as JSON
+sluice backup ./repo ~/documents --json          # outcome as JSON (snapshot id, counts, bytes_added)
 ```
 
 Backups are **incremental**: a file whose size and mtime are unchanged reuses its
@@ -103,7 +103,10 @@ instead of being read back as zeros, so a mostly-empty disk image is barely
 touched. On an interactive terminal, backup shows a live spinner with the running
 file count and current path; it hides itself when stderr is not a TTY (piped or
 run from cron), so scripts stay quiet, while `-v` instead prints every new (+) and
-changed (M) file. `--exclude` (glob, by entry name) and `--tag`
+changed (M) file. The completion summary (and `--json`'s `bytes_added`) reports
+how many bytes the backup *actually stored* after deduplication and compression —
+distinct from the logical bytes processed — so a monitor can watch real growth per
+run. `--exclude` (glob, by entry name) and `--tag`
 are repeatable, and `--exclude-from` reads exclude globs from a file (one per
 line; `#` comments and blank lines ignored). `--exclude-if-present <FILE>` skips
 any subdirectory containing the named marker (e.g. `.nobackup`), and
@@ -477,7 +480,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 271 tests
+cargo test     # 272 tests
 ```
 
 ## Caveats

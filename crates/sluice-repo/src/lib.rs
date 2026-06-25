@@ -135,6 +135,10 @@ pub struct Repository<B> {
     /// Per-run override for the hostname recorded on a committed snapshot; `None`
     /// ⇒ the host environment. Set by [`set_snapshot_host`](Self::set_snapshot_host).
     snapshot_host_override: Option<String>,
+    /// Cumulative sealed bytes of *newly stored* blobs over this handle's life
+    /// (deduplicated blobs add nothing). Read via [`bytes_stored`](Self::bytes_stored)
+    /// to measure how much an operation actually wrote.
+    bytes_stored: u64,
 }
 
 impl<B: StorageBackend> Repository<B> {
@@ -202,6 +206,7 @@ impl<B: StorageBackend> Repository<B> {
             compression_override: None,
             snapshot_time_override: None,
             snapshot_host_override: None,
+            bytes_stored: 0,
         })
     }
 
@@ -259,6 +264,7 @@ impl<B: StorageBackend> Repository<B> {
             compression_override: None,
             snapshot_time_override: None,
             snapshot_host_override: None,
+            bytes_stored: 0,
         })
     }
 
@@ -280,6 +286,7 @@ impl<B: StorageBackend> Repository<B> {
         };
         let frame = compress(plaintext, level);
         let sealed = seal(&self.keys.data_key, &self.blob_aad(kind), &frame);
+        self.bytes_stored += sealed.len() as u64;
         let entry = self.pending.add(id, kind, &sealed);
         self.pending_index.insert(id, entry);
 
@@ -573,6 +580,7 @@ impl<B: StorageBackend> Repository<B> {
             if self.index.contains_key(&id) || self.pending_index.contains_key(&id) {
                 continue;
             }
+            self.bytes_stored += blob.len() as u64;
             let entry = self.pending.add(id, BlobKind::Data, &blob);
             self.pending_index.insert(id, entry);
             if self.pending.body_len() as u64 >= self.config.pack_target {
@@ -693,6 +701,14 @@ impl<B: StorageBackend> Repository<B> {
     #[must_use]
     pub fn config(&self) -> &RepoConfig {
         &self.config
+    }
+
+    /// Cumulative sealed (compressed + encrypted) bytes of blobs *newly stored* by
+    /// this handle — deduplicated blobs contribute nothing. Take the difference
+    /// across an operation to learn how much it actually wrote.
+    #[must_use]
+    pub fn bytes_stored(&self) -> u64 {
+        self.bytes_stored
     }
 
     /// Override the zstd level used to compress newly stored **file data** —

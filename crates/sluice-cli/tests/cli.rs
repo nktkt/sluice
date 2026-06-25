@@ -88,6 +88,10 @@ fn backup_emits_json() {
     assert_eq!(v["files_new"], 2);
     assert_eq!(v["dry_run"], false);
     assert_eq!(v["bytes"], 6);
+    assert!(
+        v["bytes_added"].as_u64().unwrap() > 0,
+        "the first backup writes some storage"
+    );
     assert_eq!(v["snapshot"].as_str().unwrap().len(), 64);
 
     // A dry-run reports a null snapshot, and the unchanged files as unmodified.
