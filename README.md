@@ -536,7 +536,7 @@ off by default.
 
 ```sh
 cargo build
-cargo test     # 292 tests
+cargo test    # 292 tests
 ```
 
 ## Caveats
